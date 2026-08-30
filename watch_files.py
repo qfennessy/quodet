@@ -223,6 +223,15 @@ KNOWN_SECRET_PATTERNS = (
 HIGH_ENTROPY_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])"
 )
+CONFIG_SECRET_FIELD_RE = re.compile(
+    r"(?i)(?:^|[_-])(?:"
+    r"api[_-]?key|secret(?:[_-]?key)?|access[_-]?key|private[_-]?key|"
+    r"client[_-]?secret|signing[_-]?key|encryption[_-]?key|"
+    r"auth(?:entication)?[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"token|password|passwd|credential(?:s)?|connection[_-]?string|database[_-]?url"
+    r")(?:$|[_-])"
+)
+LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -349,19 +358,38 @@ def positive_int(value: str) -> int:
 def validate_model_run_config_privacy(config: ModelRunConfig) -> None:
     values: dict[str, object] = {
         "model": config.model,
+        "model_artifact": config.model_artifact,
         "provider": config.provider,
         "runtime": config.runtime,
         "runtime_version": config.runtime_version,
         "quantization": config.quantization,
         "pricing_source": config.pricing.source,
-        **{f"model_option_{key}": value for key, value in config.model_options.items()},
-        **{f"hardware_{key}": value for key, value in config.hardware.items()},
     }
-    unsafe = []
+    unsafe: list[str] = []
     for name, value in values.items():
-        _, redactions = redact_sensitive_values(f"{name}={value}")
+        _, redactions = redact_sensitive_values(str(value))
         if redactions:
             unsafe.append(name)
+
+    for collection_name, collection in (
+        ("model_option", config.model_options),
+        ("hardware", config.hardware),
+    ):
+        for key, value in collection.items():
+            name = f"{collection_name}_{key}"
+            if CONFIG_SECRET_FIELD_RE.search(key):
+                unsafe.append(name)
+                continue
+            if collection_name == "hardware" and key == "runtime_artifact_sha256":
+                if not isinstance(value, str) or LOWERCASE_SHA256_RE.fullmatch(
+                    value
+                ) is None:
+                    unsafe.append(name)
+                continue
+            if isinstance(value, str):
+                _, redactions = redact_sensitive_values(value)
+                if redactions:
+                    unsafe.append(name)
     if unsafe:
         raise ValueError(
             "model run config contains potential secrets in "

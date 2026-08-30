@@ -13,10 +13,77 @@ from pathlib import Path
 from unittest import mock
 
 import watch_files
-from model_runner import ModelRunResult
+from model_runner import ModelRunConfig, ModelRunResult, Pricing
+
+
+def privacy_config(
+    *,
+    model_options: dict[str, str | int | float | bool] | None = None,
+    hardware: dict[str, str | int | float | bool] | None = None,
+) -> ModelRunConfig:
+    return ModelRunConfig(
+        candidate_id="fixture",
+        model="qwen-eval",
+        model_artifact="Qwen/Qwen3.5-35B-A3B",
+        model_revision="a" * 40,
+        provider="local",
+        runtime="llm-ollama",
+        runtime_version="1.0",
+        locality="local",
+        quantization="bfloat16",
+        model_options=(
+            {"temperature": 0} if model_options is None else model_options
+        ),
+        context_limit=262144,
+        pricing=Pricing(None, None, "not-applicable", "not-applicable"),
+        hardware={
+            "amortized_hourly_cost_usd": 1.0,
+            "model_load_ms": 1,
+            "peak_memory_bytes": 1024,
+            "runtime_model_id": "qwen3.5:35b-a3b",
+            "runtime_artifact_sha256": (
+                "9f86d081884c7d659a2feaa0c55ad015"
+                "a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            ),
+        } if hardware is None else hardware,
+    )
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_model_config_privacy_allows_costs_and_valid_artifact_digest(self) -> None:
+        watch_files.validate_model_run_config_privacy(privacy_config())
+
+    def test_model_config_privacy_rejects_secrets_in_metadata_and_options(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        configs = (
+            privacy_config(model_options={"temperature": 0, "note": secret}),
+            privacy_config(hardware={"device_note": secret}),
+            privacy_config(model_options={"api_key": "short-but-still-secret"}),
+        )
+        for config in configs:
+            with self.subTest(config=config), self.assertRaisesRegex(
+                ValueError, "potential secrets"
+            ):
+                watch_files.validate_model_run_config_privacy(config)
+
+    def test_model_config_privacy_rejects_malformed_artifact_digests(self) -> None:
+        for digest in ("a" * 63, "G" * 64, 1234):
+            with self.subTest(digest=digest):
+                config = privacy_config(hardware={
+                    "runtime_artifact_sha256": digest,
+                })
+                with self.assertRaisesRegex(
+                    ValueError, "hardware_runtime_artifact_sha256"
+                ):
+                    watch_files.validate_model_run_config_privacy(config)
+
+    def test_model_config_privacy_rejects_unlabelled_high_entropy_metadata(self) -> None:
+        config = privacy_config(hardware={
+            "opaque_note": "vF8xP2mQ7zL4kN9cR6tY3wB5jH1sD0aE",
+        })
+        with self.assertRaisesRegex(ValueError, "hardware_opaque_note"):
+            watch_files.validate_model_run_config_privacy(config)
+
     def test_model_listing_parser_matches_only_exact_ids_and_aliases(self) -> None:
         output = (
             "Local Runtime: qwen-large (aliases: qwen-local, qwen)\n"
