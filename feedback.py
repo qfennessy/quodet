@@ -35,6 +35,8 @@ MAX_TITLE_LENGTH = 300
 MAX_EXPLANATION_LENGTH = 8_000
 MAX_FIX_LENGTH = 2_000
 DEFAULT_ROUND_RESET_SECONDS = 900
+DEFAULT_FLUSH_HINT_TTL_SECONDS = 30.0
+MAX_IN_FLIGHT_SECONDS = 3_600.0
 UNTRUSTED_NOTICE = (
     "Untrusted automated review suggestions follow. Independently verify every "
     "finding against the current code before editing."
@@ -76,6 +78,10 @@ class ReviewBatch:
     provider_ms: float = 0.0
     first_observed_at: float = 0.0
     session_generation: int | None = None
+    batch_flushed_at: float = 0.0
+    provider_started_at: float = 0.0
+    provider_completed_at: float = 0.0
+    published_at: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -83,6 +89,16 @@ class ReviewBatch:
 
 class FeedbackSink(Protocol):
     def publish(self, batch: ReviewBatch) -> bool: ...
+
+
+@dataclass(frozen=True)
+class FlushHint:
+    """One authenticated logical edit boundary from an agent hook."""
+
+    agent_session_id: str
+    created_at: float
+    path: Path
+    reviewed_files: tuple[ReviewedFile, ...]
 
 
 def read_bounded_beneath_root(
@@ -170,6 +186,9 @@ def parse_review_output(
     provider_ms: float = 0.0,
     first_observed_at: float | None = None,
     session_generation: int | None = None,
+    batch_flushed_at: float | None = None,
+    provider_started_at: float | None = None,
+    provider_completed_at: float | None = None,
 ) -> ReviewBatch:
     """Parse and strictly validate one provider response."""
     if len(output.encode("utf-8")) > MAX_PROVIDER_OUTPUT_BYTES:
@@ -222,6 +241,9 @@ def parse_review_output(
     observed_at = first_observed_at
     if observed_at is None:
         observed_at = created_at - (debounce_ms + provider_ms) / 1_000
+    completed_at = provider_completed_at or created_at
+    started_at = provider_started_at or completed_at - provider_ms / 1_000
+    flushed_at = batch_flushed_at or started_at
     return ReviewBatch(
         batch_id=str(uuid.uuid4()),
         root=os.fspath(root),
@@ -237,6 +259,9 @@ def parse_review_output(
             0 if session_id is not None and session_generation is None
             else session_generation
         ),
+        batch_flushed_at=flushed_at,
+        provider_started_at=started_at,
+        provider_completed_at=completed_at,
     )
 
 
@@ -399,6 +424,424 @@ def _atomic_private_json(path: Path, value: dict[str, object]) -> None:
             pass
 
 
+def _load_bounded_object(path: Path, *, maximum: int = 262_144) -> dict[str, object] | None:
+    try:
+        if path.stat().st_size > maximum:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _session_lease_path(directory: Path, root: Path, session_id: str) -> Path:
+    identity = f"{root.resolve()}\0{session_id}".encode()
+    spool = directory.expanduser().resolve()
+    return spool / "sessions" / f"{hashlib.sha256(identity).hexdigest()}.json"
+
+
+def _producer_is_active(root: Path) -> bool:
+    if fcntl is None:
+        return False
+    lease = _global_root_lease_directory() / (
+        f"{hashlib.sha256(os.fspath(root.resolve()).encode()).hexdigest()}.lock"
+    )
+    if not lease.exists():
+        return False
+    stream = lease.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        stream.close()
+
+
+def _session_is_owned(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    agent_session_id: str,
+) -> bool:
+    with session_route_lock(
+        directory,
+        root=root,
+        configured_session_id=session_id,
+        exclusive=False,
+    ):
+        state = read_session_state(
+            directory, root=root, configured_session_id=session_id
+        )
+        try:
+            route_state, _ = _state_generation(
+                state, root=root, configured_session_id=session_id
+            )
+        except ValueError:
+            return False
+        return (
+            route_state == "bound"
+            and state is not None
+            and state.get("codex_session_id") == agent_session_id
+        )
+
+
+def _reviewed_files_are_current(root: Path, reviewed_files: Sequence[ReviewedFile]) -> bool:
+    if not reviewed_files:
+        return False
+    for item in reviewed_files:
+        try:
+            raw = read_bounded_beneath_root(
+                root.resolve(), Path(item.path), max_bytes=item.size
+            )
+        except OSError:
+            return False
+        if len(raw) != item.size or hashlib.sha256(raw).hexdigest() != item.sha256:
+            return False
+    return True
+
+
+def _raw_hint_files_are_current(root: Path, value: object) -> bool:
+    if not isinstance(value, list) or not 0 < len(value) <= MAX_REVIEWED_FILES:
+        return False
+    reviewed: list[ReviewedFile] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256", "size"}
+            or not isinstance(item["path"], str)
+            or not isinstance(item["sha256"], str)
+            or len(item["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef" for character in item["sha256"]
+            )
+            or isinstance(item["size"], bool)
+            or not isinstance(item["size"], int)
+            or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
+        ):
+            return False
+        try:
+            path = _normalize_finding_path(
+                item["path"], root.resolve(), {item["path"]}
+            )
+        except ReviewValidationError:
+            return False
+        reviewed.append(ReviewedFile(path, item["sha256"], item["size"]))
+    return _reviewed_files_are_current(root, reviewed)
+
+
+def publish_flush_hint(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    agent_session_id: str,
+    ttl_seconds: float = DEFAULT_FLUSH_HINT_TTL_SECONDS,
+    reviewed_files: Sequence[ReviewedFile] = (),
+) -> Path:
+    """Publish a bounded, session-owned request to flush the current edit batch."""
+    if (
+        not 0 < ttl_seconds <= 300
+        or not _producer_is_active(root)
+        or not _session_is_owned(
+            directory,
+            root=root,
+            session_id=session_id,
+            agent_session_id=agent_session_id,
+        )
+    ):
+        raise ValueError("flush hint does not match an active watcher and agent session")
+    hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
+    if not reviewed_files or len(reviewed_files) > MAX_REVIEWED_FILES:
+        raise ValueError("flush hint requires bounded reviewed file metadata")
+    normalized_files: list[ReviewedFile] = []
+    for item in reviewed_files:
+        path = _normalize_finding_path(item.path, root.resolve(), {item.path})
+        if (
+            len(item.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in item.sha256)
+            or not 0 <= item.size <= MAX_REVIEWED_FILE_BYTES
+        ):
+            raise ValueError("flush hint contains invalid reviewed file metadata")
+        normalized_files.append(ReviewedFile(path, item.sha256, item.size))
+    created_at = time.time()
+    destination = hints / f"{time.time_ns()}-{uuid.uuid4()}.json"
+    _atomic_private_json(
+        destination,
+        {
+            "version": 1,
+            "root": os.fspath(root.resolve()),
+            "session_id": session_id,
+            "agent_session_id": agent_session_id,
+            "created_at": created_at,
+            "expires_at": created_at + ttl_seconds,
+            "reviewed_files": [asdict(item) for item in normalized_files],
+        },
+    )
+    return destination
+
+
+def consume_flush_hint(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    changed_paths: Sequence[Path] | None = None,
+) -> FlushHint | None:
+    """Consume the oldest valid hint for this exact route and real agent session."""
+    hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
+    expected_root = os.fspath(root.resolve())
+    changed_relative: set[str] | None = None
+    if changed_paths is not None:
+        changed_relative = set()
+        for changed_path in changed_paths:
+            try:
+                changed_relative.add(
+                    changed_path.resolve(strict=False)
+                    .relative_to(root.resolve())
+                    .as_posix()
+                )
+            except ValueError:
+                continue
+    now = time.time()
+    candidates: list[tuple[float, Path]] = []
+    for path in hints.glob("*.json"):
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    for _, path in sorted(candidates):
+        value = _load_bounded_object(path)
+        valid_shape = value is not None and set(value) == {
+            "version",
+            "root",
+            "session_id",
+            "agent_session_id",
+            "created_at",
+            "expires_at",
+            "reviewed_files",
+        }
+        if not valid_shape:
+            path.unlink(missing_ok=True)
+            continue
+        assert value is not None
+        agent_session_id = value["agent_session_id"]
+        created_at = value["created_at"]
+        expires_at = value["expires_at"]
+        raw_reviewed_files = value["reviewed_files"]
+        if (
+            not isinstance(raw_reviewed_files, list)
+            or not raw_reviewed_files
+            or len(raw_reviewed_files) > MAX_REVIEWED_FILES
+        ):
+            path.unlink(missing_ok=True)
+            continue
+        reviewed_files: list[ReviewedFile] = []
+        for item in raw_reviewed_files:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"path", "sha256", "size"}
+                or not isinstance(item["path"], str)
+                or not isinstance(item["sha256"], str)
+                or isinstance(item["size"], bool)
+                or not isinstance(item["size"], int)
+            ):
+                reviewed_files = []
+                break
+            try:
+                normalized_path = _normalize_finding_path(
+                    item["path"], root.resolve(), {item["path"]}
+                )
+            except ReviewValidationError:
+                reviewed_files = []
+                break
+            if (
+                len(item["sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in item["sha256"]
+                )
+                or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
+            ):
+                reviewed_files = []
+                break
+            reviewed_files.append(
+                ReviewedFile(normalized_path, item["sha256"], item["size"])
+            )
+        valid = (
+            value["version"] == 1
+            and value["root"] == expected_root
+            and value["session_id"] == session_id
+            and isinstance(agent_session_id, str)
+            and bool(agent_session_id)
+            and isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(created_at) <= now < float(expires_at)
+            and float(expires_at) - float(created_at) <= 300
+            and len(reviewed_files) == len(raw_reviewed_files)
+            and _session_is_owned(
+                directory,
+                root=root,
+                session_id=session_id,
+                agent_session_id=agent_session_id,
+            )
+        )
+        if (
+            valid
+            and reviewed_files
+            and changed_relative is not None
+            and changed_relative.isdisjoint(item.path for item in reviewed_files)
+        ):
+            continue
+        if valid and not _reviewed_files_are_current(root, reviewed_files):
+            valid = False
+        if valid:
+            return FlushHint(
+                agent_session_id,
+                float(created_at),
+                path,
+                tuple(reviewed_files),
+            )
+        path.unlink(missing_ok=True)
+    return None
+
+
+def matching_review_in_flight(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    agent_session_id: str,
+    validate_hint_files: bool = True,
+) -> bool:
+    """Return whether this real agent owns a live review, pruning stale markers."""
+    in_flight = _ensure_private_directory(directory.expanduser().resolve() / "in-flight")
+    expected_root = os.fspath(root.resolve())
+    now = time.time()
+    matched = False
+    for path in in_flight.glob("*.json"):
+        value = _load_bounded_object(path)
+        if value is None or set(value) != {
+            "version",
+            "review_id",
+            "root",
+            "session_id",
+            "agent_session_id",
+            "started_at",
+            "expires_at",
+        }:
+            path.unlink(missing_ok=True)
+            continue
+        expires_at = value["expires_at"]
+        started_at = value["started_at"]
+        live = (
+            value["version"] == 1
+            and isinstance(value["review_id"], str)
+            and isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(started_at) <= now < float(expires_at)
+            and 0 < float(expires_at) - float(started_at) <= MAX_IN_FLIGHT_SECONDS
+        )
+        if not live:
+            path.unlink(missing_ok=True)
+            continue
+        if (
+            value["root"] == expected_root
+            and value["session_id"] == session_id
+            and value["agent_session_id"] == agent_session_id
+            and _session_is_owned(
+                directory,
+                root=root,
+                session_id=session_id,
+                agent_session_id=agent_session_id,
+            )
+        ):
+            matched = True
+    if matched:
+        return True
+    hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
+    for path in hints.glob("*.json"):
+        value = _load_bounded_object(path)
+        if value is None or set(value) != {
+            "version",
+            "root",
+            "session_id",
+            "agent_session_id",
+            "created_at",
+            "expires_at",
+            "reviewed_files",
+        }:
+            path.unlink(missing_ok=True)
+            continue
+        created_at = value.get("created_at")
+        expires_at = value.get("expires_at")
+        reviewed_files = value.get("reviewed_files")
+        live = (
+            value.get("version") == 1
+            and value.get("root") == expected_root
+            and value.get("session_id") == session_id
+            and value.get("agent_session_id") == agent_session_id
+            and isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(created_at) <= now < float(expires_at)
+            and float(expires_at) - float(created_at) <= 300
+            and isinstance(reviewed_files, list)
+            and 0 < len(reviewed_files) <= MAX_REVIEWED_FILES
+            and (
+                not validate_hint_files
+                or _raw_hint_files_are_current(root, reviewed_files)
+            )
+            and _session_is_owned(
+                directory,
+                root=root,
+                session_id=session_id,
+                agent_session_id=agent_session_id,
+            )
+        )
+        if live:
+            return True
+        path.unlink(missing_ok=True)
+    return False
+
+
+def retire_reviewed_flush_hints(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    reviewed_files: Sequence[ReviewedFile],
+) -> None:
+    """Remove late hints whose post-edit digests were included in a review."""
+    reviewed = {(item.path, item.sha256, item.size) for item in reviewed_files}
+    hints = directory.expanduser().resolve() / "flush-hints"
+    for path in hints.glob("*.json"):
+        value = _load_bounded_object(path)
+        if value is None or value.get("root") != os.fspath(root.resolve()):
+            continue
+        if value.get("session_id") != session_id:
+            continue
+        raw_files = value.get("reviewed_files")
+        if not isinstance(raw_files, list) or not raw_files:
+            continue
+        hinted: set[tuple[object, object, object]] = set()
+        for item in raw_files:
+            if not isinstance(item, dict):
+                hinted.clear()
+                break
+            hinted.add((item.get("path"), item.get("sha256"), item.get("size")))
+        if hinted and hinted.issubset(reviewed):
+            path.unlink(missing_ok=True)
+
+
 class SpoolSink:
     """Publish batches atomically to an explicitly owned agent session."""
 
@@ -428,6 +871,8 @@ class SpoolSink:
         _ensure_private_directory(self.directory / "acknowledged")
         _ensure_private_directory(self.directory / "dedupe")
         _ensure_private_directory(self.directory / "sessions")
+        _ensure_private_directory(self.directory / "flush-hints")
+        _ensure_private_directory(self.directory / "in-flight")
         if fcntl is None:
             raise RuntimeError("spool delivery requires process-exclusive file locks")
         active_roots = _global_root_lease_directory()
@@ -562,6 +1007,65 @@ class SpoolSink:
         encoded = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
 
+    def consume_flush_hint(
+        self, changed_paths: Sequence[Path] | None = None
+    ) -> FlushHint | None:
+        return consume_flush_hint(
+            self.directory,
+            root=self.root,
+            session_id=self.session_id,
+            changed_paths=changed_paths,
+        )
+
+    def begin_review(
+        self,
+        *,
+        agent_session_id: str | None,
+        review_timeout: float,
+        flush_hint: FlushHint | None = None,
+    ) -> Path | None:
+        """Publish an expiring marker before a provider review starts."""
+        if agent_session_id is None or not _session_is_owned(
+            self.directory,
+            root=self.root,
+            session_id=self.session_id,
+            agent_session_id=agent_session_id,
+        ):
+            return None
+        started_at = time.time()
+        lifetime = min(MAX_IN_FLIGHT_SECONDS, max(5.0, review_timeout + 5.0))
+        review_id = str(uuid.uuid4())
+        marker = self.directory / "in-flight" / f"{review_id}.json"
+        _atomic_private_json(
+            marker,
+            {
+                "version": 1,
+                "review_id": review_id,
+                "root": os.fspath(self.root),
+                "session_id": self.session_id,
+                "agent_session_id": agent_session_id,
+                "started_at": started_at,
+                "expires_at": started_at + lifetime,
+            },
+        )
+        if flush_hint is not None and flush_hint.path.parent == self.directory / "flush-hints":
+            flush_hint.path.unlink(missing_ok=True)
+        return marker
+
+    def finish_review(self, marker: Path | None) -> None:
+        if marker is not None and marker.parent == self.directory / "in-flight":
+            marker.unlink(missing_ok=True)
+
+    def retire_reviewed_flush_hints(
+        self, reviewed_files: Sequence[ReviewedFile]
+    ) -> None:
+        retire_reviewed_flush_hints(
+            self.directory,
+            root=self.root,
+            session_id=self.session_id,
+            reviewed_files=reviewed_files,
+        )
+
     def publish(self, batch: ReviewBatch) -> bool:
         if batch.session_id != self.session_id or Path(batch.root).resolve() != self.root:
             raise ValueError("batch ownership does not match this spool")
@@ -581,12 +1085,14 @@ class SpoolSink:
             )
             if route_state == "closed" or batch.session_generation != generation:
                 return False
+            self.retire_reviewed_flush_hints(batch.reviewed_files)
             batch = fresh_findings(batch)
             if not batch.findings:
                 return False
             batch = self._apply_round_policy(batch)
             if not batch.findings:
                 return False
+            batch = replace(batch, published_at=time.time())
             payload = batch.to_dict()
             payload["notice"] = UNTRUSTED_NOTICE
             encoded_payload = json.dumps(payload, separators=(",", ":")).encode()
@@ -626,7 +1132,7 @@ def validate_spooled_payload(
     payload: dict[str, object], *, root: Path, session_id: str
 ) -> dict[str, object]:
     """Independently validate a durable record at the consumer boundary."""
-    expected_fields = {
+    base_fields = {
         "batch_id",
         "root",
         "created_at",
@@ -637,15 +1143,46 @@ def validate_spooled_payload(
         "debounce_ms",
         "provider_ms",
         "first_observed_at",
-        "session_generation",
         "notice",
     }
-    legacy_fields = expected_fields - {"session_generation"}
-    if set(payload) == legacy_fields:
-        payload = payload.copy()
-        payload["session_generation"] = 0
-    elif set(payload) != expected_fields:
+    generation_fields = {"session_generation"}
+    lifecycle_fields = {
+        "batch_flushed_at",
+        "provider_started_at",
+        "provider_completed_at",
+        "published_at",
+    }
+    accepted_fields = (
+        base_fields,
+        base_fields | generation_fields,
+        base_fields | lifecycle_fields,
+        base_fields | generation_fields | lifecycle_fields,
+    )
+    if set(payload) not in accepted_fields:
         raise ReviewValidationError("spooled batch has unexpected or missing fields")
+    payload = payload.copy()
+    payload.setdefault("session_generation", 0)
+    if not lifecycle_fields.issubset(payload):
+        legacy_created_at = payload["created_at"]
+        legacy_provider_ms = payload["provider_ms"]
+        if (
+            isinstance(legacy_created_at, bool)
+            or not isinstance(legacy_created_at, (int, float))
+            or isinstance(legacy_provider_ms, bool)
+            or not isinstance(legacy_provider_ms, (int, float))
+        ):
+            raise ReviewValidationError("invalid legacy review lifecycle timestamps")
+        created_at = float(legacy_created_at)
+        provider_ms = float(legacy_provider_ms)
+        provider_started_at = created_at - provider_ms / 1_000
+        payload.update(
+            {
+                "batch_flushed_at": provider_started_at,
+                "provider_started_at": provider_started_at,
+                "provider_completed_at": created_at,
+                "published_at": created_at,
+            }
+        )
     if payload["root"] != os.fspath(root.resolve()) or payload["session_id"] != session_id:
         raise ReviewValidationError("spooled batch ownership does not match")
     try:
@@ -680,6 +1217,22 @@ def validate_spooled_payload(
         or session_generation < 0
     ):
         raise ReviewValidationError("invalid session generation")
+    timestamps = [
+        payload["first_observed_at"],
+        payload["batch_flushed_at"],
+        payload["provider_started_at"],
+        payload["provider_completed_at"],
+        payload["created_at"],
+        payload["published_at"],
+    ]
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in timestamps
+    ) or any(
+        float(left) > float(right)
+        for left, right in zip(timestamps, timestamps[1:])
+    ):
+        raise ReviewValidationError("invalid review lifecycle timestamps")
     raw_reviewed = payload["reviewed_files"]
     if not isinstance(raw_reviewed, list) or len(raw_reviewed) > MAX_REVIEWED_FILES:
         raise ReviewValidationError("invalid reviewed file collection")
@@ -715,6 +1268,9 @@ def validate_spooled_payload(
         provider_ms=float(payload["provider_ms"]),
         first_observed_at=float(payload["first_observed_at"]),
         session_generation=session_generation,
+        batch_flushed_at=float(payload["batch_flushed_at"]),
+        provider_started_at=float(payload["provider_started_at"]),
+        provider_completed_at=float(payload["provider_completed_at"]),
     )
     result = payload.copy()
     result["findings"] = [asdict(item) for item in normalized.findings]
