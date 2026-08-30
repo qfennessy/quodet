@@ -215,17 +215,25 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                 self.assertEqual(result["status"], "grounded")
 
     def test_explicit_test_word_rejects_unknown_spec_symbol(self) -> None:
-        result = scoring.evaluate_recommendation(
-            "Extend known_spec and missing_spec test cases.",
-            supplied_files=["tests/cache.py"],
-            supplied_test_symbols=["known_spec"],
-        )
+        for recommendation, visible_symbol in (
+            ("Extend known_spec and missing_spec test cases.", "known_spec"),
+            (
+                "Extend known_test and missing_spec with boundary assertions.",
+                "known_test",
+            ),
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["tests/cache.py"],
+                    supplied_test_symbols=[visible_symbol],
+                )
 
-        self.assertEqual(result["status"], "failure")
-        self.assertEqual(
-            result["violations"][0]["code"],
-            "unsupported-test-mutation",
-        )
+                self.assertEqual(result["status"], "failure")
+                self.assertEqual(
+                    result["violations"][0]["code"],
+                    "unsupported-test-mutation",
+                )
 
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (

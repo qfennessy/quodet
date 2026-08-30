@@ -109,7 +109,7 @@ def _mutates_unsupplied_test(
         if _path_is_proposed(clause, match.start())
     ]
     test_matches = list(_TEST_WORD.finditer(clause))
-    if any(match.group(0).lower() in {"test", "tests"} for match in test_matches):
+    if test_matches:
         test_matches.extend(_SPEC_SYMBOL.finditer(clause))
         test_matches.sort(key=lambda match: match.start())
     for test_match in test_matches:
