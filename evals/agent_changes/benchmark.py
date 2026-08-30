@@ -124,8 +124,12 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
                     f"local candidate {candidate_id} requires llm-ollama binding"
                 )
             if runtime_artifact["status"] == "unregistered" and (
-                runtime_artifact.get("runtime_model_id") is not None
+                runtime_artifact.get("runtime_version") is not None
+                or runtime_artifact.get("model") is not None
+                or runtime_artifact.get("runtime_model_id") is not None
                 or runtime_artifact.get("runtime_artifact_sha256") is not None
+                or runtime_artifact.get("quantization") is not None
+                or runtime_artifact.get("max_output_tokens_option") is not None
             ):
                 raise ValueError(
                     f"local candidate {candidate_id} has a partial runtime binding"
@@ -134,6 +138,16 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
                 runtime_model_id = runtime_artifact.get("runtime_model_id")
                 runtime_digest = runtime_artifact.get("runtime_artifact_sha256")
                 source_binding = runtime_artifact.get("source_binding")
+                for key in (
+                    "runtime_version", "model", "quantization",
+                    "max_output_tokens_option",
+                ):
+                    if not isinstance(runtime_artifact.get(key), str) or not (
+                        runtime_artifact[key]
+                    ):
+                        raise ValueError(
+                            f"local candidate {candidate_id} approved {key} is invalid"
+                        )
                 if not isinstance(runtime_model_id, str) or not runtime_model_id:
                     raise ValueError(
                         f"local candidate {candidate_id} approved model ID is invalid"
@@ -177,6 +191,7 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
             hosted_identity_keys = (
                 "provider", "runtime", "runtime_version", "model",
                 "provider_model_revision", "quantization",
+                "max_output_tokens_option",
             )
             if runtime_artifact["status"] == "unregistered" and any(
                 runtime_artifact.get(key) is not None for key in hosted_identity_keys
@@ -253,8 +268,8 @@ def prepare_run_config(
         raise ValueError("candidate output-token cap differs from frozen contract")
     if max_output_bytes != execution["max_output_bytes"]:
         raise ValueError("candidate output-byte cap differs from frozen contract")
-    if model_options.get("temperature") != execution["temperature"]:
-        raise ValueError("candidate temperature differs from frozen execution contract")
+    if dict(model_options) != {"temperature": execution["temperature"]}:
+        raise ValueError("candidate model options differ from frozen execution contract")
     if locality == "hosted" and not external_upload_consent:
         raise ValueError("hosted candidate requires explicit external-upload consent")
     if locality == "hosted" and max_cost_usd is None:
@@ -315,9 +330,14 @@ def prepare_run_config(
             )
         if (
             runtime != runtime_artifact["runtime"]
+            or runtime_version != runtime_artifact["runtime_version"]
+            or model != runtime_artifact["model"]
             or runtime_model_id != runtime_artifact["runtime_model_id"]
             or runtime_artifact_sha256
             != runtime_artifact["runtime_artifact_sha256"]
+            or quantization != runtime_artifact["quantization"]
+            or max_output_tokens_option
+            != runtime_artifact["max_output_tokens_option"]
         ):
             raise ValueError(
                 "local runtime identity differs from the candidate binding "
@@ -331,6 +351,7 @@ def prepare_run_config(
             "model": model,
             "quantization": quantization,
             "provider_model_revision": hardware.get("provider_model_revision"),
+            "max_output_tokens_option": max_output_tokens_option,
         }
         if any(
             configured_hosted_identity[key] != runtime_artifact[key]
@@ -363,6 +384,42 @@ def prepare_run_config(
     )
 
 
+def validate_model_run_config_against_plan(
+    plan: Mapping[str, Any], config: ModelRunConfig,
+) -> str:
+    """Validate the complete frozen binding before any model invocation."""
+    expected = prepare_run_config(
+        plan,
+        candidate_id=config.candidate_id,
+        model=config.model,
+        provider=config.provider,
+        runtime=config.runtime,
+        runtime_version=config.runtime_version,
+        quantization=config.quantization,
+        model_options=config.model_options,
+        timeout_seconds=config.timeout_seconds,
+        max_output_tokens=config.max_output_tokens,
+        max_output_tokens_option=config.max_output_tokens_option,
+        max_output_bytes=config.max_output_bytes,
+        pricing=config.pricing,
+        max_cost_usd=config.max_cost_usd,
+        external_upload_consent=config.external_upload_consent,
+        hardware=config.hardware,
+    )
+    actual_values = config.to_dict()
+    expected_values = expected.to_dict()
+    differing = sorted(
+        key for key in set(actual_values) | set(expected_values)
+        if actual_values.get(key) != expected_values.get(key)
+    )
+    if differing:
+        raise ValueError(
+            "model run config differs from the complete frozen benchmark binding "
+            f"in {differing}"
+        )
+    return config.candidate_id
+
+
 def validate_run_against_plan(
     plan: Mapping[str, Any], run: Mapping[str, Any]
 ) -> str:
@@ -383,10 +440,10 @@ def validate_run_against_plan(
     ):
         if model_config.get(key) != expected:
             raise ValueError(f"run model config {key} differs from frozen contract")
-    if model_config.get("model_options", {}).get("temperature") != execution[
-        "temperature"
-    ]:
-        raise ValueError("run model temperature differs from frozen contract")
+    if model_config.get("model_options") != {
+        "temperature": execution["temperature"]
+    }:
+        raise ValueError("run model options differ from frozen contract")
     for key in ("model_artifact", "model_revision", "locality"):
         expected = candidate[
             "required_locality" if key == "locality" else key
@@ -396,11 +453,18 @@ def validate_run_against_plan(
     if model_config.get("locality") == "local":
         runtime_artifact = candidate.get("runtime_artifact", {})
         if runtime_artifact.get("status") != "approved" or (
-            model_config.get("runtime") != runtime_artifact.get("runtime")
+            model_config.get("model") != runtime_artifact.get("model")
+            or model_config.get("runtime_version")
+            != runtime_artifact.get("runtime_version")
+            or model_config.get("runtime") != runtime_artifact.get("runtime")
             or model_config.get("hardware", {}).get("runtime_model_id")
             != runtime_artifact.get("runtime_model_id")
             or model_config.get("hardware", {}).get("runtime_artifact_sha256")
             != runtime_artifact.get("runtime_artifact_sha256")
+            or model_config.get("quantization")
+            != runtime_artifact.get("quantization")
+            or model_config.get("max_output_tokens_option")
+            != runtime_artifact.get("max_output_tokens_option")
         ):
             raise ValueError(
                 "run local-model identity differs from the frozen candidate binding"
@@ -415,6 +479,9 @@ def validate_run_against_plan(
             "quantization": model_config.get("quantization"),
             "provider_model_revision": model_config.get("hardware", {}).get(
                 "provider_model_revision"
+            ),
+            "max_output_tokens_option": model_config.get(
+                "max_output_tokens_option"
             ),
         }
         if runtime_artifact.get("status") != "approved" or any(

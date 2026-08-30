@@ -40,6 +40,7 @@ from model_runner import (
     ModelRunConfig,
     ModelRunRequest,
     load_model_run_config,
+    model_run_config_sha256,
     run_model,
 )
 
@@ -326,6 +327,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-run-config",
         type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--model-run-config-sha256",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -1300,12 +1305,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return agent_main(raw_argv)
     args = parse_args(raw_argv)
+    if args.model_run_config_sha256 is not None and args.model_run_config is None:
+        raise SystemExit(
+            "--model-run-config-sha256 requires --model-run-config"
+        )
     model_run_config = (
         load_model_run_config(args.model_run_config)
         if args.model_run_config is not None
         else None
     )
     if model_run_config is not None:
+        if (
+            args.model_run_config_sha256 is not None
+            and model_run_config_sha256(model_run_config)
+            != args.model_run_config_sha256
+        ):
+            raise SystemExit(
+                "model run config changed after benchmark approval; refusing to run"
+            )
         try:
             validate_model_run_config_privacy(model_run_config)
         except ValueError as error:

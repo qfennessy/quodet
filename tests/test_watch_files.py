@@ -50,6 +50,31 @@ def privacy_config(
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_watcher_rejects_config_changed_after_parent_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_path = root / "model-run-config.json"
+            config_path.write_text(
+                json.dumps(privacy_config().to_dict()), encoding="utf-8",
+            )
+            with (
+                mock.patch("watch_files.validate_runtime") as runtime_validation,
+                mock.patch(
+                    "watch_files.validate_model_run_config_privacy"
+                ) as privacy_validation,
+                self.assertRaisesRegex(
+                    SystemExit, "changed after benchmark approval"
+                ),
+            ):
+                watch_files.main([
+                    str(root),
+                    "--model-run-config", str(config_path),
+                    "--model-run-config-sha256", "0" * 64,
+                ])
+
+        privacy_validation.assert_not_called()
+        runtime_validation.assert_not_called()
+
     def test_model_config_privacy_allows_costs_and_valid_artifact_digest(self) -> None:
         watch_files.validate_model_run_config_privacy(privacy_config())
 
