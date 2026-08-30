@@ -1,19 +1,29 @@
 {
-  "fixture_revision": 1,
-  "input_file": "expired_cache.py",
-  "known_defect": "Cache.get() removes an expired entry but still returns its stale value",
-  "expected_finding": {
-    "file": "expired_cache.py",
-    "line": 24,
-    "severity": "medium",
-    "confidence": 0.99,
-    "title": "Expired cache entries remain visible",
-    "explanation": "When expires_at is at or before the injected clock value, Cache.get() removes the entry but then falls through and returns entry.value, so the triggering caller still receives stale data.",
-    "suggested_fix": "In Cache.get(), return None immediately after removing an entry whose expires_at is at or before the injected clock value, before returning entry.value. This prevents the expired-entry branch from exposing stale data. Add a regression test that advances the injected clock past expires_at and asserts get() returns None and removes the entry."
-  },
-  "recommendation_expectations": {
-    "code_elements": ["Cache.get()", "entry.value"],
-    "failure_terms": ["expired-entry branch", "stale data"],
-    "validation_terms": ["regression test", "clock", "returns None"]
-  }
+  "fixture_revision": 2,
+  "cases": [
+    {
+      "id": "no-supplied-test",
+      "supplied_files": ["expired_cache.py"],
+      "candidates": [
+        {
+          "id": "add-test",
+          "suggested_fix": "In Cache.get(), return None immediately after removing the expired entry. Add a regression test that advances the injected clock past expires_at and asserts get() returns None."
+        },
+        {
+          "id": "invent-existing-test",
+          "suggested_fix": "Return None after removing the expired entry while preserving the existing empty-input test."
+        }
+      ]
+    },
+    {
+      "id": "supplied-test",
+      "supplied_files": ["expired_cache.py", "test_expired_cache.py"],
+      "candidates": [
+        {
+          "id": "extend-supplied-test",
+          "suggested_fix": "Return None after removing the expired entry, then extend test_expired_cache.py with a case that advances the injected clock and asserts the expired value is hidden."
+        }
+      ]
+    }
+  ]
 }

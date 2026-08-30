@@ -285,6 +285,11 @@ class WatchFilesTests(unittest.TestCase):
         self.assertIn("only negative findings", prompt)
         self.assertIn("at least 0.95 confident", prompt)
         self.assertIn("concrete execution path", prompt)
+        self.assertIn("trigger is reachable", prompt)
+        self.assertIn("concrete implementations", prompt)
+        self.assertIn("do not assume a hypothetical subclass", prompt)
+        self.assertIn("discard schedules contradicted", prompt)
+        self.assertIn("self-reported threshold claim, not evidence", prompt)
         self.assertIn("each supplied file as a separate file", prompt)
         self.assertIn("mutually consistent", prompt)
         self.assertIn("calibrate severity only from demonstrated impact", prompt)
@@ -310,6 +315,11 @@ class WatchFilesTests(unittest.TestCase):
             "why it fixes the cited execution path",
             "narrow regression test or validation step",
             "identify the exact missing evidence",
+            "never claim that a test, function, contract, safeguard",
+            "unless it appears in the supplied files",
+            "when no test file was supplied",
+            "recommend adding a test",
+            "name its supplied relative path or a test symbol",
             "unrelated refactors",
             "destructive commands",
             "permission bypasses",

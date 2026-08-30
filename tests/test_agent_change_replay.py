@@ -512,6 +512,38 @@ class AgentChangeReplayTests(unittest.TestCase):
         metrics = scoring.score_run(run, adjudication)
         self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (0, 1, 1))
 
+    def test_recommendation_grounding_scores_separately_from_detection(self) -> None:
+        case = replay.case_by_id(replay.load_manifest(), "01_obvious_runtime")
+        finding = provider_finding(
+            "calculator.py", "The undefined name raises for non-empty input."
+        )
+        finding["suggested_fix"] = (
+            "Use values and preserve the existing non-empty regression test."
+        )
+        provider = live_eval.ProviderOutcome(
+            status="schema-valid",
+            latency_ms=12,
+            transcript="",
+            raw_response="{}",
+            parsed_response={"findings": [finding]},
+            error=None,
+        )
+
+        outcome = live_eval.case_outcome(case, provider)
+        grounding = outcome["diagnostics"]["recommendation_grounding"]
+        self.assertEqual(grounding["failures"], 1)
+        self.assertEqual(
+            grounding["results"][0]["violations"][0]["code"],
+            "unsupported-existing-test-claim",
+        )
+
+        metrics = scoring.score_run(raw_run([outcome]), None)
+        self.assertEqual(
+            metrics["recommendation_grounding"],
+            {"evaluated": 1, "grounded": 0, "failures": 1, "grounded_rate": 0.0},
+        )
+        self.assertIsNone(metrics["tp"])
+
     def test_adjudicated_metrics_include_splits_families_schema_and_control_rate(self) -> None:
         defect = {
             "case_id": "defect", "evaluation_split": "holdout",

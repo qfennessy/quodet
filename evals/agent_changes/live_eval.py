@@ -20,6 +20,7 @@ from typing import Any, Sequence, TextIO
 
 import watch_files
 from evals.agent_changes import artifacts, benchmark, replay, scoring
+from evals.recommended_fixes import scoring as recommendation_scoring
 from model_runner import (
     ModelDocument,
     ModelRunConfig,
@@ -327,6 +328,15 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         for finding in (provider.parsed_response or {}).get("findings", [])
         if isinstance(finding, dict)
     )
+    provider_findings = [
+        finding
+        for finding in (provider.parsed_response or {}).get("findings", [])
+        if isinstance(finding, dict)
+    ]
+    recommendation_grounding = recommendation_scoring.evaluate_findings(
+        provider_findings,
+        supplied_files=case["files"],
+    )
     return {
         "case_id": case["id"],
         "evaluation_split": case["evaluation_split"],
@@ -356,6 +366,7 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
             "reported_files": reported_files,
             "filename_match": reported_files == expected_files,
             "note": "Filename equality is diagnostic only, never a true-positive decision.",
+            "recommendation_grounding": recommendation_grounding,
         },
     }
 

@@ -22,6 +22,8 @@ from typing import Protocol, Sequence, TextIO
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_review
 from redaction import RedactionSummary, redaction_summary_from_document, redact_text
 
+from recommendation_grounding import evaluate_recommendation
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows lacks flock.
@@ -239,6 +241,24 @@ def parse_review_output(
             raise ReviewValidationError("confidence must be between 0.95 and 1.0")
         if severity not in {"critical", "high", "medium", "low"}:
             raise ReviewValidationError("severity is invalid")
+        suggested_fix = _bounded_string(
+            raw["suggested_fix"], "suggested_fix", MAX_FIX_LENGTH
+        )
+        grounding = evaluate_recommendation(
+            suggested_fix,
+            supplied_files=tuple(reviewed),
+        )
+        if grounding["status"] != "grounded":
+            violations = grounding["violations"]
+            assert isinstance(violations, list)
+            codes = ", ".join(
+                str(violation.get("code"))
+                for violation in violations
+                if isinstance(violation, dict)
+            )
+            raise ReviewValidationError(
+                f"finding {index} suggested_fix is not grounded: {codes}"
+            )
         findings.append(
             ReviewFinding(
                 file=_normalize_finding_path(raw["file"], root, reviewed),
@@ -249,9 +269,7 @@ def parse_review_output(
                 explanation=_bounded_string(
                     raw["explanation"], "explanation", MAX_EXPLANATION_LENGTH
                 ),
-                suggested_fix=_bounded_string(
-                    raw["suggested_fix"], "suggested_fix", MAX_FIX_LENGTH
-                ),
+                suggested_fix=suggested_fix,
             )
         )
     created_at = time.time()

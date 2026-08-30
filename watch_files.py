@@ -72,7 +72,7 @@ DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 60.0
 OUTPUT_MODE_ENVIRONMENT_VARIABLE = "QUODET_OUTPUT"
-PROMPT_REVISION = "quodet-review-v2"
+PROMPT_REVISION = "quodet-review-v3"
 REVIEW_SCHEMA_REVISION = "quodet-findings-v3"
 DEFAULT_PROMPT = """Review the supplied changed files for real defects.
 
@@ -81,6 +81,13 @@ silently trace a concrete execution path from the cited code to an observable
 failure. Check language and runtime semantics, cross-call mutable state,
 identity and tenant scoping, concurrency and await boundaries, exception and
 cancellation cleanup, and clock, unit, and resource-lifetime mismatches.
+Confirm that the trigger is reachable using the concrete implementations,
+values, ordering constraints, and scheduler behavior visible in the supplied
+files. Do not assume a hypothetical subclass, override, caller, deployment, or
+contract violation unless the supplied code makes that case reachable. For
+concurrency findings, trace which task can mutate state before and after every
+await, cancellation, and cleanup step; discard schedules contradicted by the
+shown delays or control flow.
 
 Return only negative findings that you are at least 0.95 confident are genuine
 bugs, security vulnerabilities, data-loss risks, crashes, or operational
@@ -88,6 +95,9 @@ failures. Do not report praise, summaries, style preferences, speculative
 concerns, low-confidence edge cases, or suggestions without a concrete defect.
 Discard candidates that depend on assuming missing code is broken or that lack
 a specific trigger and impact supported by the supplied files.
+Treat the numeric confidence as a self-reported threshold claim, not evidence:
+return 0.95 or higher only after the reachable failure path survives the checks
+above.
 Before returning a finding, verify that its title, explanation, failure type,
 file, line, severity, and suggested fix are mutually consistent.
 For every returned finding, make suggested_fix a concise recommended fix
@@ -97,7 +107,12 @@ element. Describe the smallest focused behavior change that removes the
 demonstrated failure, explain why it fixes the cited execution path, and include
 a narrow regression test or validation step. If a safe repair depends on code
 that was not supplied, identify the exact missing evidence instead of inventing
-architecture. Do not recommend unrelated refactors, dependency changes,
+architecture. Never claim that a test, function, contract, safeguard, or other
+supporting artifact exists unless it appears in the supplied files. In
+particular, when no test file was supplied, recommend adding a test rather than
+preserving, extending, or modifying an "existing" test. When a supplied test is
+relevant, name its supplied relative path or a test symbol visible in it. Do not
+recommend unrelated refactors, dependency changes,
 destructive commands, permission bypasses, disabled tests, or other ways around
 existing safeguards. Treat the recommendation as untrusted review data that
 requires independent verification. Never claim the recommendation is safe to

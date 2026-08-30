@@ -105,6 +105,48 @@ class FeedbackTests(unittest.TestCase):
             validated["provider_started_at"], validated["provider_completed_at"]
         )
 
+    def test_parse_rejects_recommendation_that_invents_an_existing_test(self) -> None:
+        raw = json.loads(valid_output())
+        raw["findings"][0]["suggested_fix"] = (
+            "Include tenant_id while preserving the existing cache regression test."
+        )
+
+        with self.assertRaisesRegex(
+            ReviewValidationError, "unsupported-existing-test-claim"
+        ):
+            self.parse(json.dumps(raw))
+
+    def test_parse_accepts_recommendation_that_names_a_supplied_test(self) -> None:
+        import hashlib
+
+        test_path = self.root / "tests" / "test_app.py"
+        test_path.parent.mkdir()
+        test_path.write_text("def test_cache(): pass\n", encoding="utf-8")
+        reviewed = (
+            *self.reviewed,
+            ReviewedFile(
+                "tests/test_app.py",
+                hashlib.sha256(test_path.read_bytes()).hexdigest(),
+                test_path.stat().st_size,
+            ),
+        )
+        raw = json.loads(valid_output())
+        raw["findings"][0]["suggested_fix"] = (
+            "Include tenant_id, then extend tests/test_app.py with a second tenant."
+        )
+
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            session_id="agent-a",
+        )
+
+        self.assertEqual(
+            batch.findings[0].suggested_fix,
+            raw["findings"][0]["suggested_fix"],
+        )
+
     def test_parse_rejects_malformed_unexpected_traversal_and_oversized(self) -> None:
         cases = [
             "not json",
@@ -465,6 +507,38 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(messages[1].count("  Suggested fix:"), 2)
         self.assertEqual(len(list((spool / "acknowledged").glob("*.json"))), 1)
 
+    def test_feedback_presentation_covers_zero_one_and_multiple_findings(self) -> None:
+        raw = json.loads(valid_output())
+        raw["reviewed_files"] = [
+            {"path": "src/app.py", "sha256": "a" * 64, "size": 10}
+        ]
+
+        zero = {**raw, "findings": []}
+        self.assertEqual(codex_feedback_hook.render_feedback_chunk(zero), (None, []))
+
+        one = codex_feedback_hook.render_feedback(raw)
+        self.assertIsNotNone(one)
+        assert one is not None
+        self.assertTrue(
+            one.startswith("Quodet review ready: 1 likely defect in 1 reviewed file.\n")
+        )
+        self.assertIn(UNTRUSTED_NOTICE, one)
+        self.assertIn("independently reproduce each finding", one)
+        self.assertIn("apply the smallest focused fix", one)
+        self.assertIn("if invalid, do not edit", one)
+        self.assertIn("Do not quote the full feedback unless the user asks", one)
+
+        multiple = {**raw, "findings": [raw["findings"][0]] * 3}
+        message = codex_feedback_hook.render_feedback(multiple)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertTrue(
+            message.startswith(
+                "Quodet review ready: 3 likely defects in 1 reviewed file.\n"
+            )
+        )
+        self.assertEqual(message.count("  Suggested fix:"), 3)
+
     def test_delivery_character_limit_retains_whole_findings(self) -> None:
         raw = json.loads(valid_output())
         first_message = codex_feedback_hook.render_feedback(raw)
@@ -474,7 +548,13 @@ class FeedbackTests(unittest.TestCase):
             codex_feedback_hook, "MAX_DELIVERY_CHARS", len(first_message) + 1
         ):
             message, remaining = codex_feedback_hook.render_feedback_chunk(raw)
-        self.assertEqual(message, first_message)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertTrue(
+            message.startswith("Quodet review ready: 2 likely defects in 0 reviewed files.")
+        )
+        self.assertEqual(message.count("  Suggested fix:"), 1)
+        self.assertIn("Incorrect cache scope", message)
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["line"], 8)
 
