@@ -823,8 +823,6 @@ def consume_flush_hint(
                 agent_session_id=agent_session_id,
             )
         )
-        if valid and not _reviewed_files_are_current(root, reviewed_files):
-            valid = False
         if valid:
             valid_hints.append(
                 FlushHint(
@@ -850,18 +848,37 @@ def consume_flush_hint(
         if (
             hint.agent_session_id != group[0].agent_session_id
             or hint.created_at - group[-1].created_at > quiet_seconds
-            or hint.created_at - group[0].created_at > max_age_seconds
             or len(known_paths) + len(added_paths) > MAX_REVIEWED_FILES
         ):
             groups.append([hint])
         else:
             group.append(hint)
 
+    has_current_hint = False
     for group in groups:
-        reviewed_by_path: dict[str, ReviewedFile] = {}
+        latest_by_path: dict[str, ReviewedFile] = {}
         for member in group:
             for reviewed in member.reviewed_files:
-                reviewed_by_path[reviewed.path] = reviewed
+                latest_by_path[reviewed.path] = reviewed
+        reviewed_by_path = {
+            path: reviewed
+            for path, reviewed in latest_by_path.items()
+            if _reviewed_files_are_current(root, (reviewed,))
+        }
+        active_members = [
+            member
+            for member in group
+            if any(item.path in reviewed_by_path for item in member.reviewed_files)
+        ]
+        active_hint_paths = {member.path for member in active_members}
+        inactive_members = [
+            member for member in group if member.path not in active_hint_paths
+        ]
+        for member in inactive_members:
+            member.path.unlink(missing_ok=True)
+        if not active_members:
+            continue
+        has_current_hint = True
         if (
             changed_relative is not None
             and changed_relative.isdisjoint(reviewed_by_path)
@@ -869,12 +886,12 @@ def consume_flush_hint(
             continue
         forced = force_ready or (
             force_requested_at is not None
-            and group[-1].created_at <= force_requested_at
+            and active_members[-1].created_at <= force_requested_at
         )
         ready = (
             forced
-            or now - group[-1].created_at >= quiet_seconds
-            or now - group[0].created_at >= max_age_seconds
+            or now - active_members[-1].created_at >= quiet_seconds
+            or now - active_members[0].created_at >= max_age_seconds
             or len(reviewed_by_path) == MAX_REVIEWED_FILES
         )
         if not ready:
@@ -882,13 +899,13 @@ def consume_flush_hint(
         for request_path in force_request_paths:
             request_path.unlink(missing_ok=True)
         return FlushHint(
-            group[0].agent_session_id,
-            group[0].created_at,
-            group[0].path,
+            active_members[0].agent_session_id,
+            active_members[0].created_at,
+            active_members[0].path,
             tuple(reviewed_by_path.values()),
-            tuple(member.path for member in group),
+            tuple(member.path for member in active_members),
         )
-    if force_request_paths and not valid_hints:
+    if force_request_paths and not has_current_hint:
         for request_path in force_request_paths:
             request_path.unlink(missing_ok=True)
     return None

@@ -701,8 +701,129 @@ class AgentIntegrationTests(unittest.TestCase):
                 quiet_seconds=0.1, max_age_seconds=0.3
             )
         self.assertIsNotNone(hint)
-        self.assertEqual(len(hint.reviewed_files), 4)  # type: ignore[union-attr]
+        self.assertEqual(len(hint.reviewed_files), 5)  # type: ignore[union-attr]
         self.assertEqual(len(list((self.spool / "flush-hints").glob("*.json"))), 5)
+
+    def test_repeated_same_file_edits_keep_oldest_max_age_anchor(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        latest_raw = b""
+        for index, created_at in enumerate((100.0, 100.08, 100.16, 100.24, 100.32)):
+            latest_raw = f"value = {index}\n".encode()
+            self.source.write_bytes(latest_raw)
+            with mock.patch("feedback.time.time", return_value=created_at):
+                publish_flush_hint(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                    reviewed_files=(
+                        ReviewedFile(
+                            "src/app.py",
+                            hashlib.sha256(latest_raw).hexdigest(),
+                            len(latest_raw),
+                        ),
+                    ),
+                )
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(self.source)
+
+        with mock.patch("feedback.time.time", return_value=100.33):
+            triggered = watch_files.next_triggered_batch(
+                changes,
+                3.0,
+                hint_source=sink,
+                agent_edit_quiet=0.1,
+                agent_edit_max_age=0.3,
+            )
+
+        hint = triggered.flush_hint
+        self.assertIsNotNone(hint)
+        self.assertAlmostEqual(hint.created_at, 100.0)  # type: ignore[union-attr]
+        self.assertEqual(len(hint.paths), 5)  # type: ignore[union-attr]
+        self.assertEqual(
+            hint.reviewed_files,  # type: ignore[union-attr]
+            (
+                ReviewedFile(
+                    "src/app.py",
+                    hashlib.sha256(latest_raw).hexdigest(),
+                    len(latest_raw),
+                ),
+            ),
+        )
+        marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=hint,
+        )
+        sink.finish_review(marker)
+        self.assertEqual(list((self.spool / "flush-hints").glob("*.json")), [])
+
+    def test_spaced_same_file_replacements_start_new_age_anchor(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+
+        with mock.patch("feedback.time.time", return_value=200.0):
+            first_path = publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        with mock.patch("feedback.time.time", return_value=200.26):
+            first = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertEqual(first.paths, (first_path,))  # type: ignore[union-attr]
+        first_marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=first,
+        )
+        sink.finish_review(first_marker)
+
+        replacement = b"value = 2\n"
+        self.source.write_bytes(replacement)
+        replacement_metadata = (
+            ReviewedFile(
+                "src/app.py",
+                hashlib.sha256(replacement).hexdigest(),
+                len(replacement),
+            ),
+        )
+        with mock.patch("feedback.time.time", return_value=200.6):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=replacement_metadata,
+            )
+        with mock.patch("feedback.time.time", return_value=200.7):
+            self.assertIsNone(
+                sink.consume_flush_hint(quiet_seconds=0.25, max_age_seconds=1.0)
+            )
+        with mock.patch("feedback.time.time", return_value=200.86):
+            second = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertAlmostEqual(second.created_at, 200.6)  # type: ignore[union-attr]
+        self.assertEqual(second.reviewed_files, replacement_metadata)  # type: ignore[union-attr]
 
     def test_stop_request_forces_only_already_pending_session_hints(self) -> None:
         route, _ = self._route()
