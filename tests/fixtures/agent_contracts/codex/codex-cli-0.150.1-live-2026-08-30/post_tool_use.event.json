@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "root": "${ROOT}",
+  "session_id": "${CONFIGURED_SESSION}",
+  "event": "PostToolUse",
+  "input_fields": [
+    "cwd",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "session_id",
+    "tool_input",
+    "tool_name",
+    "tool_response",
+    "tool_use_id",
+    "transcript_path",
+    "turn_id"
+  ],
+  "agent_session_sha256": "4cc0c347f2289830f9d281a0e7a8566c1f23ff482c265df4a6b67794819a0569",
+  "tool_name": "apply_patch",
+  "response_fields": ["hookSpecificOutput"],
+  "response_sha256": "5011111d279d945baaedfea051c08bae8c5a944bb48212b82e342e5d1ccf429c",
+  "response_bytes": 554,
+  "hook_execution_ms": 3.7155000027269125
+}

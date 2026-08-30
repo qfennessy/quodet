@@ -1,0 +1,9 @@
+{
+  "session_id": "live-agent-session",
+  "prompt_id": "prompt-1",
+  "transcript_path": "/tmp/transcript.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "SessionEnd",
+  "reason": "complete"
+}

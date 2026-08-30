@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "root": "${ROOT}",
+  "session_id": "${CONFIGURED_SESSION}",
+  "event": "PostToolUse",
+  "input_fields": [
+    "cwd",
+    "duration_ms",
+    "hook_event_name",
+    "permission_mode",
+    "prompt_id",
+    "session_id",
+    "tool_input",
+    "tool_name",
+    "tool_response",
+    "tool_use_id",
+    "transcript_path"
+  ],
+  "agent_session_sha256": "f76fb56f3cb961bc7d64416c78d60ef132fe78a91e0abc66a5f4dbefafb0d935",
+  "tool_name": "Edit",
+  "response_fields": ["hookSpecificOutput"],
+  "response_sha256": "ca474aa2e5dd039f8a018034d804936607e5436212f30d88ff1a3b54ff2d064f",
+  "response_bytes": 566,
+  "hook_execution_ms": 3.1083330104593188
+}

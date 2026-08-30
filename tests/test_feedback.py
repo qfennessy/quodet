@@ -84,6 +84,26 @@ class FeedbackTests(unittest.TestCase):
         self.assertTrue(batch.batch_id)
         self.assertEqual(self.parse('{"findings": []}').findings, ())
 
+    def test_consumer_accepts_legacy_v1_spool_payload(self) -> None:
+        payload = json.loads(json.dumps(self.parse(valid_output()).to_dict()))
+        payload["notice"] = UNTRUSTED_NOTICE
+        for field in (
+            "batch_flushed_at",
+            "provider_started_at",
+            "provider_completed_at",
+            "published_at",
+        ):
+            payload.pop(field)
+
+        validated = validate_spooled_payload(
+            payload, root=self.root, session_id="agent-a"
+        )
+
+        self.assertEqual(validated["published_at"], validated["created_at"])
+        self.assertLessEqual(
+            validated["provider_started_at"], validated["provider_completed_at"]
+        )
+
     def test_parse_rejects_malformed_unexpected_traversal_and_oversized(self) -> None:
         cases = [
             "not json",

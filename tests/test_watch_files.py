@@ -650,8 +650,14 @@ class WatchFilesTests(unittest.TestCase):
 
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()
+        observed_at: dict[Path, float] = {}
         root = Path("/tmp").resolve()
-        handler = watch_files.ChangeHandler(changes, root=root, exclude_patterns=[])
+        handler = watch_files.ChangeHandler(
+            changes,
+            root=root,
+            exclude_patterns=[],
+            observed_at=observed_at,
+        )
         event = type(
             "Event",
             (),
@@ -665,6 +671,7 @@ class WatchFilesTests(unittest.TestCase):
         handler.on_moved(event)
 
         self.assertEqual(changes.get_nowait(), root / "new.py")
+        self.assertIn(root / "new.py", observed_at)
 
     def test_change_handler_does_not_queue_dependency_events(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()
