@@ -690,7 +690,11 @@ class AgentChangeReplayTests(unittest.TestCase):
         provider = live_eval.ProviderOutcome(
             status="schema-valid", latency_ms=1, transcript="", raw_response="{}",
             parsed_response={"findings": [provider_finding(
-                case["expected_findings"][0]["file"], "Filename only",
+                next(
+                    path for path in live_eval.case_provider_paths(case)
+                    if Path(path).name == case["expected_findings"][0]["file"]
+                ),
+                "Filename only",
             )]}, error=None,
         )
         outcome = live_eval.case_outcome(case, provider)
@@ -717,7 +721,11 @@ class AgentChangeReplayTests(unittest.TestCase):
     def test_repeated_challenge_attempts_have_unique_samples_and_pair_metrics(self) -> None:
         case = challenge.model_cases("challenge-development")[0]
         finding = provider_finding(
-            case["expected_findings"][0]["file"], "Concrete failure path",
+            next(
+                path for path in live_eval.case_provider_paths(case)
+                if Path(path).name == case["expected_findings"][0]["file"]
+            ),
+            "Concrete failure path",
         )
         effective_config = {"candidate_id": "frozen-baseline"}
         runtime_attestation = {
@@ -771,6 +779,114 @@ class AgentChangeReplayTests(unittest.TestCase):
             metrics["challenge_pairs"][case["challenge_pair_id"]]["buggy"]["samples"],
             2,
         )
+
+    def test_challenge_rates_exclude_invalid_provider_attempts(self) -> None:
+        buggy = challenge.model_cases("challenge-development")[0]
+        clean = next(
+            case for case in challenge.model_cases("challenge-development")
+            if case["challenge_pair_id"] == buggy["challenge_pair_id"]
+            and case["challenge_variant"] == "clean"
+        )
+        finding = provider_finding(
+            next(
+                path for path in live_eval.case_provider_paths(buggy)
+                if Path(path).name == buggy["expected_findings"][0]["file"]
+            ),
+            "Concrete failure path",
+        )
+        buggy_valid = live_eval.case_outcome(
+            buggy,
+            live_eval.ProviderOutcome(
+                "schema-valid", 1, "", "{}", {"findings": [finding]}, None,
+            ),
+            attempt_index=1,
+            attempt_count=2,
+        )
+        buggy_invalid = live_eval.case_outcome(
+            buggy,
+            live_eval.ProviderOutcome(
+                "timeout", 1, "", None, None, "provider timed out",
+            ),
+            attempt_index=2,
+            attempt_count=2,
+        )
+        clean_finding = provider_finding(
+            live_eval.case_provider_paths(clean)[0],
+            "Incorrect report against the clean twin",
+        )
+        clean_valid = live_eval.case_outcome(
+            clean,
+            live_eval.ProviderOutcome(
+                "schema-valid", 1, "", "{}", {"findings": [clean_finding]}, None,
+            ),
+            attempt_index=1,
+            attempt_count=2,
+        )
+        clean_invalid = live_eval.case_outcome(
+            clean,
+            live_eval.ProviderOutcome(
+                "provider-error", 1, "", None, None, "provider failed",
+            ),
+            attempt_index=2,
+            attempt_count=2,
+        )
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 3,
+            "cases": {
+                buggy_valid["sample_id"]: {"findings": [{
+                    "finding_index": 0,
+                    "verdict": "true-positive",
+                    "expected_finding_id": buggy["expected_findings"][0]["id"],
+                    "rationale": "matches the demonstrated path",
+                    "fix_quality": "actionable",
+                    "evidence": {
+                        "trigger": "concurrent update",
+                        "failure_path": "stale completion overwrites the new value",
+                        "impact": "new state is lost",
+                    },
+                }]},
+                clean_valid["sample_id"]: {"findings": [{
+                    "finding_index": 0,
+                    "verdict": "false-positive",
+                    "expected_finding_id": None,
+                    "rationale": "the clean twin has the required guard",
+                    "fix_quality": "not-actionable",
+                }]},
+            },
+        }
+        metrics = scoring.score_run(
+            raw_run([buggy_valid, buggy_invalid, clean_valid, clean_invalid]),
+            adjudication,
+        )
+
+        pair = metrics["challenge_pairs"][buggy["challenge_pair_id"]]
+        for variant in ("buggy", "clean"):
+            self.assertEqual(pair[variant]["attempts"], 2)
+            self.assertEqual(pair[variant]["samples"], 1)
+            self.assertEqual(pair[variant]["valid_samples"], 1)
+            self.assertEqual(pair[variant]["invalid_samples"], 1)
+        self.assertEqual(metrics["challenge_valid_attempts"], 2)
+        self.assertEqual(metrics["challenge_invalid_attempts"], 2)
+        self.assertEqual(metrics["challenge_defect_recall"], 1.0)
+        self.assertEqual(metrics["challenge_clean_twin_false_positive_rate"], 1.0)
+
+    def test_challenge_rates_are_unavailable_without_valid_attempts(self) -> None:
+        case = challenge.model_cases("challenge-development")[0]
+        invalid = live_eval.case_outcome(
+            case,
+            live_eval.ProviderOutcome(
+                "schema-error", 1, "", "not-json", None, "malformed response",
+            ),
+        )
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 3, "cases": {},
+        }
+        metrics = scoring.score_run(raw_run([invalid]), adjudication)
+
+        self.assertEqual(metrics["challenge_valid_attempts"], 0)
+        self.assertEqual(metrics["challenge_invalid_attempts"], 1)
+        self.assertIsNone(metrics["challenge_defect_recall"])
+        self.assertIsNone(metrics["challenge_clean_twin_false_positive_rate"])
 
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()

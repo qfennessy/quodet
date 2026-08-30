@@ -285,29 +285,51 @@ def score_run(
         pair_id = outcome.get("challenge_pair_id")
         if not pair_id:
             continue
+        variant = outcome["challenge_variant"]
+        aggregate = challenge_pairs.setdefault(pair_id, {}).setdefault(
+            variant,
+            {
+                "tp": 0, "fp": 0, "fn": 0,
+                "attempts": 0, "samples": 0, "valid_samples": 0,
+                "invalid_samples": 0, "samples_with_fp": 0,
+            },
+        )
+        aggregate["attempts"] += 1
+        if outcome["status"] != "schema-valid":
+            aggregate["invalid_samples"] += 1
+            continue
         counts = _case_counts(
             outcome, adjudicated_cases.get(outcome.get("sample_id", outcome["case_id"]))
         )
-        variant = outcome["challenge_variant"]
-        aggregate = challenge_pairs.setdefault(pair_id, {}).setdefault(
-            variant, {"tp": 0, "fp": 0, "fn": 0, "samples": 0, "samples_with_fp": 0}
-        )
         _add_counts(aggregate, counts)
         aggregate["samples"] += 1
+        aggregate["valid_samples"] += 1
         aggregate["samples_with_fp"] += counts["fp"] > 0
     if challenge_pairs:
         defects = [pair["buggy"] for pair in challenge_pairs.values() if "buggy" in pair]
         clean = [pair["clean"] for pair in challenge_pairs.values() if "clean" in pair]
+        defect_denominator = sum(item["tp"] + item["fn"] for item in defects)
+        clean_denominator = sum(item["valid_samples"] for item in clean)
         base["challenge_pairs"] = challenge_pairs
+        base["challenge_valid_attempts"] = sum(
+            item["valid_samples"]
+            for pair in challenge_pairs.values()
+            for item in pair.values()
+        )
+        base["challenge_invalid_attempts"] = sum(
+            item["invalid_samples"]
+            for pair in challenge_pairs.values()
+            for item in pair.values()
+        )
         base["challenge_defect_recall"] = (
             sum(item["tp"] for item in defects)
-            / sum(item["tp"] + item["fn"] for item in defects)
-            if defects else 0.0
+            / defect_denominator
+            if defect_denominator else None
         )
         base["challenge_clean_twin_false_positive_rate"] = (
             sum(item["samples_with_fp"] for item in clean)
-            / sum(item["samples"] for item in clean)
-            if clean else 0.0
+            / clean_denominator
+            if clean_denominator else None
         )
     return base
 

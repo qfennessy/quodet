@@ -498,7 +498,10 @@ baseline calls have been made, so every entry records zero valid baseline misses
 and remains `candidate-not-qualified`. A candidate becomes a qualified challenge
 only after a second reader verifies it and the same frozen baseline misses its
 real trigger and failure path in three valid attempts. Provider errors, malformed
-responses, timeouts, and unavailable runtimes do not qualify it.
+responses, timeouts, and unavailable runtimes do not qualify it. Challenge
+metrics report valid and invalid attempt counts separately; invalid attempts do
+not enter defect-recall or clean-twin false-positive-rate denominators, and a
+rate remains unavailable until at least one valid attempt exists.
 
 Development and holdout candidates live under different directories and
 manifests. This is a process seal, not encryption: directly reading a holdout

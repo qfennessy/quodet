@@ -294,15 +294,19 @@ def wait_for_startup(output: queue.Queue[str], timeout: float = 15.0) -> None:
 
 def case_provider_paths(case: dict[str, Any]) -> tuple[str, ...]:
     """Return the exact sanitized paths exposed by the replay watcher."""
+    replay_directory = replay.replay_relative_directory(case)
     return tuple(
-        watch_files.redact_sensitive_path(Path(case["id"]) / filename)[0]
+        watch_files.redact_sensitive_path(replay_directory / filename)[0]
         for filename in case["files"]
     )
 
 
 def case_test_symbols(case: dict[str, Any]) -> tuple[str, ...]:
+    source_root = Path(
+        case.get("_source_root", replay.CASES_ROOT / case["id"])
+    )
     sources = tuple(
-        (replay.CASES_ROOT / case["id"] / filename).read_text(encoding="utf-8")
+        (source_root / filename).read_text(encoding="utf-8")
         for filename, provider_path in zip(
             case["files"], case_provider_paths(case), strict=True
         )
