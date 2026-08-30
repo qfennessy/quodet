@@ -5,6 +5,6 @@
   "agent_version": "2.1.251 (Claude Code)",
   "provenance": "live-capture",
   "probe": "non-persistent Claude Code print session using a generated project hook",
-  "observed_result": "The client emitted a successful PostToolUse:Edit hook response and the agent quoted the synthetic finding title.",
+  "observed_result": "The client emitted a successful PostToolUse:Edit hook response and quoted the synthetic finding title. A second bounded three-file implementation probe did not prescribe tool scheduling; one PostToolBatch event contained all three Write calls.",
   "provider_inference": "synthetic; not exercised"
 }

@@ -120,7 +120,9 @@ Stop the watcher with Ctrl-C. Useful options include:
 --agent-edit-quiet S
                      Coalesce rapid direct agent edits (default: 0.25)
 --agent-edit-max-age S
-                     Flush continuous direct agent edits by this age (default: 1)
+                     Safety cap for unidentified direct edits (default: 1)
+--agent-turn-max-age S
+                     Safety cap for one identified agent turn (default: 3)
 --exclude GLOB      Ignore matching paths; may be repeated
 --max-bytes BYTES   Skip larger individual files
 --review-timeout S  Stop a stalled provider review (default: 60 seconds)
@@ -133,10 +135,12 @@ Stop the watcher with Ctrl-C. Useful options include:
 --log               Save requests and responses in llm's local history
 ```
 
-`--debounce` must be at least as long as `--agent-edit-quiet`; otherwise
-ordinary filesystem timing could flush a direct edit before its configured
-agent coalescing window. Quodet rejects that configuration before starting the
-watcher.
+`--debounce` must be at least as long as `--agent-edit-quiet` and
+`--agent-turn-max-age`; otherwise ordinary filesystem timing could flush a
+direct edit before its configured agent coalescing window. Quodet rejects that
+configuration before starting the watcher. `--agent-turn-max-age` must be at
+least `--agent-edit-max-age`, because an identified turn must never have a
+shorter safety cap than an unidentified edit group.
 
 Quodet prints a compact summary for people by default. A review with no
 findings is one line; reviews with findings show the file, line, severity,
@@ -530,7 +534,7 @@ cannot claim the same batch, abandoned claims become retryable after five
 minutes. The spool must be disjoint from the watched root: neither a descendant
 nor an ancestor.
 
-The generated file includes `PostToolUse`, `Stop`, and scoped `SessionEnd`
+The generated Codex file includes `PostToolUse`, `Stop`, and scoped `SessionEnd`
 cleanup. Its delivery events follow the official [Codex hooks
 documentation](https://learn.chatgpt.com/docs/hooks). A shortened form is:
 
@@ -563,14 +567,21 @@ documentation](https://learn.chatgpt.com/docs/hooks). A shortened form is:
 ```
 
 `PostToolUse` sends the watcher a private, session-owned flush hint after a
-direct edit, then returns without waiting for provider inference. The watcher
-coalesces rapid hints from the same root, route, and real agent session for
-250 ms, so sequential `Write` or `Edit` calls that implement one change reach
-the provider as one snapshot. This agent-edit window is capped at one second,
-so continuous writes cannot postpone review indefinitely, and it remains well
-below the three-second filesystem debounce. Ordinary shell and watcher events
-without authenticated hints retain the normal debounce. Before provider
-invocation Quodet publishes an expiring in-flight marker for the exact route.
+direct edit, then returns without waiting for provider inference. When the
+agent supplies a stable turn identity (Codex `turn_id`, or Claude Code
+`prompt_id` in a legacy `PostToolUse` setup), Quodet coalesces all direct edits
+from that exact turn until
+`Stop` forces the snapshot. This keeps realistically spaced sequential
+`Write` or `Edit` calls together rather than reviewing incomplete one-file
+snapshots, including turns that span beyond the unidentified-edit cap. The
+group still flushes after at most three seconds if `Stop` is late or missing,
+matching the ordinary filesystem debounce so continuous writes cannot postpone
+review indefinitely or add a longer default delay. This safety cap is
+configurable with `--agent-turn-max-age`. Older or custom adapters without a
+turn identity retain the 250 ms quiet window and one-second max age.
+Ordinary shell and watcher events without authenticated hints retain the
+normal debounce. Before provider invocation Quodet publishes an expiring
+in-flight marker for the exact route.
 
 When no feedback is ready, `Stop` first asks the watcher to flush that
 session's already-pending edit group, then waits up to the route's
@@ -649,9 +660,10 @@ root/session route and does not inspect another spool.
 
 ## Integrate with Claude Code
 
-Claude Code exposes the same two delivery boundaries Quodet needs: a
-`PostToolUse` hook can add review feedback to the active conversation, and a
-`Stop` hook can keep the agent running when a review arrives at completion.
+Claude Code exposes the exact grouped-edit boundary Quodet needs:
+`PostToolBatch` fires once after all parallel tool calls in one batch resolve,
+before Claude's next model request. A `Stop` hook can keep the agent running
+when a review arrives at completion.
 The `quodet-claude-hook` command is an alias of the same validated, bounded
 consumer used for Codex.
 
@@ -672,13 +684,12 @@ The generated hooks use the same absolute values. Their core shape is:
 ```json
 {
   "hooks": {
-    "PostToolUse": [
+    "PostToolBatch": [
       {
-        "matcher": "^(Write|Edit)$",
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/quodet-claude-hook --spool-dir /absolute/private/runtime/quodet-claude --session-id claude-project-20260830 --root /absolute/path/to/project --event PostToolUse"
+            "command": "/absolute/path/to/quodet-claude-hook --spool-dir /absolute/private/runtime/quodet-claude --session-id claude-project-20260830 --root /absolute/path/to/project --event PostToolBatch"
           }
         ]
       }
@@ -698,18 +709,25 @@ The generated hooks use the same absolute values. Their core shape is:
 ```
 
 These settings use Claude Code's documented command-hook input and output
-contract. On `PostToolUse`, Quodet returns `additionalContext`; on `Stop`, it
-returns a blocking decision and reason only when fresh feedback is pending.
+contract. `PostToolBatch` supplies every tool call in the resolved batch;
+Quodet reads only bounded `Write` and `Edit` path metadata, publishes one
+multi-file hint, and immediately wakes the watcher without waiting for provider
+inference. If older feedback is already ready, it returns `additionalContext`
+before Claude's next model request. On `Stop`, it returns a blocking decision
+and reason only when fresh feedback is pending.
 Claude Code supplies its real `session_id` and `cwd` on standard input, so the
 same fail-closed root and session lease checks apply. See the official
 [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 The filesystem watcher still observes writes from shell commands and other
-processes even though the `PostToolUse` matcher names Claude's direct editing
-tools. Rapid sequential Claude `Write` calls share the bounded agent-edit
-window rather than being reviewed as incomplete one-file snapshots. The
-`Stop` hook forces an already-pending direct-edit group and remains the fallback
-delivery boundary for other changes.
+processes. A parallel Claude batch containing three `Write` calls now produces
+one three-file review snapshot at the documented `PostToolBatch` boundary,
+instead of three incomplete one-file reviews. The hook ignores non-edit calls
+in the same batch. Legacy manual `PostToolUse` configurations remain supported:
+their same-`prompt_id` hints use the bounded turn-aware fallback described
+above. The `Stop` hook forces any pending direct-edit group and remains the
+fallback delivery boundary for other changes. Different prompts, sessions, and
+roots cannot join a fallback group.
 Project hooks can execute commands, so review `.claude/settings.json` before
 trusting the repository. Attaching Quodet to another agent still requires that
 agent to expose a documented hook or steering interface.
@@ -724,7 +742,8 @@ then bind a second real-agent session and verify that the new generation cannot
 consume or publish the ended generation's feedback. Their metadata records
 `provenance: "official-docs"`
 and a null agent version, keeping documentation replay distinct from live
-evidence.
+evidence. The Claude Code replay includes the documented
+`PostToolBatch.tool_calls` shape.
 
 Isolated black-box probes were also completed on 2026-08-30 with Codex CLI
 0.150.1 and Claude Code 2.1.251. Each client ran its generated project hook
@@ -734,7 +753,11 @@ after a real edit, received a synthetic validated finding through
 tool/event identity, output shape and hash, and hook execution time. Source,
 tool payloads, finding text, transcripts, absolute probe paths, and raw agent
 session IDs are not checked in. These probes validate client delivery, not the
-LLM provider inference path.
+LLM provider inference path. A second bounded Claude Code 2.1.251 three-file
+implementation probe did not prescribe tool scheduling and emitted one
+`PostToolBatch` event containing all three `Write` calls; its
+sanitized fixture retains the count and tool names but no call inputs or
+responses.
 
 ```sh
 uv run python -m unittest tests.test_agent_integration -v

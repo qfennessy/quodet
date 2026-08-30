@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "root": "${ROOT}",
+  "session_id": "${CONFIGURED_SESSION}",
+  "event": "PostToolBatch",
+  "input_fields": [
+    "cwd",
+    "hook_event_name",
+    "permission_mode",
+    "prompt_id",
+    "session_id",
+    "tool_calls",
+    "transcript_path"
+  ],
+  "agent_session_sha256": "a97c881bf8efa3dc06df96f2d9d3e4f0228c32e1085d37d6291d193701c95ca0",
+  "prompt_id_present": true,
+  "tool_call_count": 3,
+  "tool_names": [
+    "Write",
+    "Write",
+    "Write"
+  ]
+}

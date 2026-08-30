@@ -5,5 +5,5 @@
   "docs_version": null,
   "agent_version": null,
   "provenance": "official-docs",
-  "notes": "Documentation-derived replay; not a live Claude Code capture."
+  "notes": "Documentation-derived PostToolUse, PostToolBatch, Stop, and SessionEnd replays; not a live Claude Code capture."
 }

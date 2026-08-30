@@ -43,7 +43,19 @@ DEFAULT_ROUND_RESET_SECONDS = 900
 DEFAULT_FLUSH_HINT_TTL_SECONDS = 30.0
 DEFAULT_AGENT_EDIT_QUIET_SECONDS = 0.25
 DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS = 1.0
+DEFAULT_AGENT_TURN_MAX_AGE_SECONDS = 3.0
 MAX_IN_FLIGHT_SECONDS = 3_600.0
+MAX_AGENT_TURN_ID_LENGTH = 200
+_FLUSH_HINT_V1_KEYS = {
+    "version",
+    "root",
+    "session_id",
+    "agent_session_id",
+    "created_at",
+    "expires_at",
+    "reviewed_files",
+}
+_FLUSH_HINT_V2_KEYS = _FLUSH_HINT_V1_KEYS | {"agent_turn_id"}
 UNTRUSTED_NOTICE = (
     "Untrusted automated review suggestions follow. Independently verify every "
     "finding against the current code before editing."
@@ -108,6 +120,7 @@ class FlushHint:
     path: Path
     reviewed_files: tuple[ReviewedFile, ...]
     constituent_paths: tuple[Path, ...] = ()
+    agent_turn_id: str | None = None
 
     @property
     def paths(self) -> tuple[Path, ...]:
@@ -626,6 +639,21 @@ def _raw_hint_has_current_file(root: Path, value: object) -> bool:
     )
 
 
+def _flush_hint_turn_id(value: dict[str, object]) -> tuple[bool, str | None]:
+    """Validate a durable hint version and return its optional turn identity."""
+    if value.get("version") == 1 and set(value) == _FLUSH_HINT_V1_KEYS:
+        return True, None
+    agent_turn_id = value.get("agent_turn_id")
+    if (
+        value.get("version") == 2
+        and set(value) == _FLUSH_HINT_V2_KEYS
+        and isinstance(agent_turn_id, str)
+        and 0 < len(agent_turn_id) <= MAX_AGENT_TURN_ID_LENGTH
+    ):
+        return True, agent_turn_id
+    return False, None
+
+
 def publish_flush_hint(
     directory: Path,
     *,
@@ -634,10 +662,18 @@ def publish_flush_hint(
     agent_session_id: str,
     ttl_seconds: float = DEFAULT_FLUSH_HINT_TTL_SECONDS,
     reviewed_files: Sequence[ReviewedFile] = (),
+    agent_turn_id: str | None = None,
 ) -> Path:
     """Publish a bounded, session-owned request to flush the current edit batch."""
     if (
         not 0 < ttl_seconds <= 300
+        or (
+            agent_turn_id is not None
+            and (
+                not isinstance(agent_turn_id, str)
+                or not 0 < len(agent_turn_id) <= MAX_AGENT_TURN_ID_LENGTH
+            )
+        )
         or not _producer_is_active(root)
         or not _session_is_owned(
             directory,
@@ -662,18 +698,18 @@ def publish_flush_hint(
         normalized_files.append(ReviewedFile(path, item.sha256, item.size))
     created_at = time.time()
     destination = hints / f"{time.time_ns()}-{uuid.uuid4()}.json"
-    _atomic_private_json(
-        destination,
-        {
-            "version": 1,
-            "root": os.fspath(root.resolve()),
-            "session_id": session_id,
-            "agent_session_id": agent_session_id,
-            "created_at": created_at,
-            "expires_at": created_at + ttl_seconds,
-            "reviewed_files": [asdict(item) for item in normalized_files],
-        },
-    )
+    payload: dict[str, object] = {
+        "version": 1 if agent_turn_id is None else 2,
+        "root": os.fspath(root.resolve()),
+        "session_id": session_id,
+        "agent_session_id": agent_session_id,
+        "created_at": created_at,
+        "expires_at": created_at + ttl_seconds,
+        "reviewed_files": [asdict(item) for item in normalized_files],
+    }
+    if agent_turn_id is not None:
+        payload["agent_turn_id"] = agent_turn_id
+    _atomic_private_json(destination, payload)
     return destination
 
 
@@ -726,10 +762,15 @@ def consume_flush_hint(
     changed_paths: Sequence[Path] | None = None,
     quiet_seconds: float = 0.0,
     max_age_seconds: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+    turn_max_age_seconds: float = DEFAULT_AGENT_TURN_MAX_AGE_SECONDS,
     force_ready: bool = False,
 ) -> FlushHint | None:
     """Consume one quiet or max-aged logical edit group for this exact route."""
-    if not 0 <= quiet_seconds <= 10 or not 0 < max_age_seconds <= 30:
+    if (
+        not 0 <= quiet_seconds <= 10
+        or not 0 < max_age_seconds <= 30
+        or not max_age_seconds <= turn_max_age_seconds <= 30
+    ):
         raise ValueError("invalid agent edit coalescing window")
     hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
     requests = _ensure_private_directory(
@@ -793,15 +834,9 @@ def consume_flush_hint(
     valid_hints: list[FlushHint] = []
     for _, path in sorted(candidates):
         value = _load_bounded_object(path)
-        valid_shape = value is not None and set(value) == {
-            "version",
-            "root",
-            "session_id",
-            "agent_session_id",
-            "created_at",
-            "expires_at",
-            "reviewed_files",
-        }
+        valid_shape, agent_turn_id = (
+            _flush_hint_turn_id(value) if value is not None else (False, None)
+        )
         if not valid_shape:
             path.unlink(missing_ok=True)
             continue
@@ -850,8 +885,7 @@ def consume_flush_hint(
                 ReviewedFile(normalized_path, item["sha256"], item["size"])
             )
         valid = (
-            value["version"] == 1
-            and value["root"] == expected_root
+            value["root"] == expected_root
             and value["session_id"] == session_id
             and isinstance(agent_session_id, str)
             and bool(agent_session_id)
@@ -876,6 +910,7 @@ def consume_flush_hint(
                     float(created_at),
                     path,
                     tuple(reviewed_files),
+                    agent_turn_id=agent_turn_id,
                 )
             )
         else:
@@ -891,9 +926,20 @@ def consume_flush_hint(
             reviewed.path for member in group for reviewed in member.reviewed_files
         }
         added_paths = {item.path for item in hint.reviewed_files} - known_paths
+        group_turn_id = group[0].agent_turn_id
+        same_turn = (
+            group_turn_id is not None
+            and hint.agent_turn_id is not None
+            and hint.agent_turn_id == group_turn_id
+        )
+        legacy_quiet_group = (
+            group_turn_id is None
+            and hint.agent_turn_id is None
+            and hint.created_at - group[-1].created_at <= quiet_seconds
+        )
         if (
             hint.agent_session_id != group[0].agent_session_id
-            or hint.created_at - group[-1].created_at > quiet_seconds
+            or not (same_turn or legacy_quiet_group)
             or len(known_paths) + len(added_paths) > MAX_REVIEWED_FILES
         ):
             groups.append([hint])
@@ -931,8 +977,16 @@ def consume_flush_hint(
         )
         ready = (
             forced
-            or now - active_members[-1].created_at >= quiet_seconds
-            or now - active_members[0].created_at >= max_age_seconds
+            or (
+                active_members[0].agent_turn_id is None
+                and now - active_members[-1].created_at >= quiet_seconds
+            )
+            or now - active_members[0].created_at
+            >= (
+                turn_max_age_seconds
+                if active_members[0].agent_turn_id is not None
+                else max_age_seconds
+            )
             or len(reviewed_by_path) == MAX_REVIEWED_FILES
         )
         if not ready:
@@ -945,6 +999,7 @@ def consume_flush_hint(
             active_members[0].path,
             tuple(reviewed_by_path.values()),
             tuple(member.path for member in active_members),
+            active_members[0].agent_turn_id,
         )
     if force_request_paths and not has_current_hint:
         for request_path in force_request_paths:
@@ -1010,23 +1065,17 @@ def matching_review_in_flight(
     hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
     for path in hints.glob("*.json"):
         value = _load_bounded_object(path)
-        if value is None or set(value) != {
-            "version",
-            "root",
-            "session_id",
-            "agent_session_id",
-            "created_at",
-            "expires_at",
-            "reviewed_files",
-        }:
+        valid_shape, _ = (
+            _flush_hint_turn_id(value) if value is not None else (False, None)
+        )
+        if not valid_shape:
             path.unlink(missing_ok=True)
             continue
         created_at = value.get("created_at")
         expires_at = value.get("expires_at")
         reviewed_files = value.get("reviewed_files")
         live = (
-            value.get("version") == 1
-            and value.get("root") == expected_root
+            value.get("root") == expected_root
             and value.get("session_id") == session_id
             and value.get("agent_session_id") == agent_session_id
             and isinstance(created_at, (int, float))
@@ -1257,6 +1306,7 @@ class SpoolSink:
         *,
         quiet_seconds: float = 0.0,
         max_age_seconds: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+        turn_max_age_seconds: float = DEFAULT_AGENT_TURN_MAX_AGE_SECONDS,
         force_ready: bool = False,
     ) -> FlushHint | None:
         return consume_flush_hint(
@@ -1266,6 +1316,7 @@ class SpoolSink:
             changed_paths=changed_paths,
             quiet_seconds=quiet_seconds,
             max_age_seconds=max_age_seconds,
+            turn_max_age_seconds=turn_max_age_seconds,
             force_ready=force_ready,
         )
 

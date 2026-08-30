@@ -16,7 +16,7 @@ import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -61,8 +61,11 @@ ADAPTERS = {
         settings_path=".claude/settings.json",
         hook_executable="quodet-claude-hook",
         documentation="https://code.claude.com/docs/en/hooks",
-        contract="claude-code-hooks-2026-08-30",
+        contract="claude-code-post-tool-batch-2026-08-30",
     ),
+}
+LEGACY_AGENT_CONTRACTS = {
+    "claude": {"claude-code-hooks-2026-08-30"},
 }
 
 
@@ -384,7 +387,11 @@ def _validate_route_value(value: object) -> RouteConfig:
         raise ValueError("route spool_dir must be absolute")
     if not isinstance(session, str) or not SESSION_ID_RE.fullmatch(session):
         raise ValueError("route session_id is invalid")
-    if contract != ADAPTERS[agent].contract:
+    supported_contracts = {
+        ADAPTERS[agent].contract,
+        *LEGACY_AGENT_CONTRACTS.get(agent, set()),
+    }
+    if contract not in supported_contracts:
         raise ValueError("route contract does not match the selected agent")
     if (
         isinstance(stop_grace, bool)
@@ -477,22 +484,27 @@ def hook_configuration(
     stop = f"{common} --event Stop"
     if include_stop_grace:
         stop += f" --stop-grace {route.stop_grace_seconds:g}"
-    matcher = "^(Write|Edit|apply_patch)$" if route.agent == "codex" else "^(Write|Edit)$"
+    legacy_claude = route.contract in LEGACY_AGENT_CONTRACTS.get("claude", set())
+    event = (
+        "PostToolUse"
+        if route.agent == "codex" or legacy_claude
+        else "PostToolBatch"
+    )
+    edit_hook: dict[str, object] = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": f"{common} --event {event}",
+                "timeout": 10,
+                "statusMessage": "Delivering Quodet feedback",
+            }
+        ],
+    }
+    if route.agent == "codex":
+        edit_hook["matcher"] = "^(Write|Edit|apply_patch)$"
     return {
         "hooks": {
-            "PostToolUse": [
-                {
-                    "matcher": matcher,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"{common} --event PostToolUse",
-                            "timeout": 10,
-                            "statusMessage": "Delivering Quodet feedback",
-                        }
-                    ],
-                }
-            ],
+            event: [edit_hook],
             "Stop": [
                 {
                     "hooks": [
@@ -635,6 +647,20 @@ def initialize(
     resolved_hook = _resolve_command(hook_command, adapter.hook_executable)
     resolved_agent = _resolve_command(agent_command, "quodet-agent")
     settings = canonical_root / adapter.settings_path
+
+    # Preserve validation-only reruns for an installed legacy contract while
+    # generating the current contract for every new route.
+    existing_route_file = route_path(canonical_spool)
+    if existing_route_file.exists():
+        existing_route = load_route(existing_route_file)
+        requested_with_existing_contract = replace(
+            route, contract=existing_route.contract
+        )
+        if existing_route != requested_with_existing_contract:
+            raise FileExistsError(
+                f"refusing to overwrite existing route: {existing_route_file}"
+            )
+        route = existing_route
     expected_settings = hook_configuration(
         route, hook_command=resolved_hook, agent_command=resolved_agent
     )
@@ -647,12 +673,6 @@ def initialize(
 
     # Preserve validation-only behavior when another route already owns the
     # requested spool: do not even create an empty agent settings directory.
-    existing_route_file = route_path(canonical_spool)
-    if existing_route_file.exists() and load_route(existing_route_file) != route:
-        raise FileExistsError(
-            f"refusing to overwrite existing route: {existing_route_file}"
-        )
-
     # Open every settings-path component relative to the canonical root without
     # following links and retain those descriptors through validation/creation.
     with _secure_settings_location(canonical_root, adapter.settings_path) as location:

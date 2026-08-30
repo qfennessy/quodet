@@ -75,6 +75,34 @@ class WatchFilesTests(unittest.TestCase):
 
         runtime_validation.assert_not_called()
 
+    def test_watcher_rejects_turn_cap_shorter_than_unidentified_edit_cap(self) -> None:
+        with (
+            mock.patch("watch_files.validate_runtime") as runtime_validation,
+            self.assertRaisesRegex(
+                SystemExit,
+                "--agent-edit-max-age must not exceed --agent-turn-max-age",
+            ),
+        ):
+            watch_files.main([
+                ".",
+                "--agent-edit-max-age", "2",
+                "--agent-turn-max-age", "1",
+            ])
+
+        runtime_validation.assert_not_called()
+
+    def test_watcher_rejects_debounce_shorter_than_agent_turn_cap(self) -> None:
+        with (
+            mock.patch("watch_files.validate_runtime") as runtime_validation,
+            self.assertRaisesRegex(
+                SystemExit,
+                "--debounce must not be shorter than --agent-turn-max-age",
+            ),
+        ):
+            watch_files.main([".", "--debounce", "2"])
+
+        runtime_validation.assert_not_called()
+
     def test_watcher_rejects_incomplete_benchmark_approval_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -238,6 +266,8 @@ class WatchFilesTests(unittest.TestCase):
     def test_default_debounce_groups_related_agent_changes(self) -> None:
         args = watch_files.parse_args(["."])
         self.assertEqual(args.debounce, 3.0)
+        self.assertEqual(args.agent_edit_max_age, 1.0)
+        self.assertEqual(args.agent_turn_max_age, 3.0)
         self.assertEqual(args.review_timeout, 60.0)
         self.assertEqual(args.model, "gpt-5.6-luna")
         self.assertEqual(
