@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -84,6 +85,28 @@ class AgentChangeReplayTests(unittest.TestCase):
 
         self.assertFalse(missing.passed)
         self.assertFalse(extra.passed)
+
+    def test_live_eval_records_model_prompt_and_fixture_revision(self) -> None:
+        manifest = replay.load_manifest()
+        cases = manifest["cases"][:2]
+
+        provenance = live_eval.evaluation_provenance(
+            model="test-model",
+            prompt="frozen prompt",
+            fixture_revision=manifest["version"],
+            cases=cases,
+        )
+
+        self.assertEqual(provenance["model"], "test-model")
+        self.assertEqual(
+            provenance["prompt_sha256"],
+            hashlib.sha256(b"frozen prompt").hexdigest(),
+        )
+        self.assertEqual(provenance["fixture_revision"], manifest["version"])
+        self.assertEqual(
+            provenance["case_ids"],
+            [case["id"] for case in cases],
+        )
 
 
 if __name__ == "__main__":

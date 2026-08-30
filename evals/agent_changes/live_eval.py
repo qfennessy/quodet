@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import queue
 import signal
@@ -52,6 +53,21 @@ def score_response(case: dict[str, Any], response: dict[str, Any]) -> CaseResult
         actual_files=response_files(response),
         response=response,
     )
+
+
+def evaluation_provenance(
+    *,
+    model: str,
+    prompt: str,
+    fixture_revision: int,
+    cases: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "fixture_revision": fixture_revision,
+        "case_ids": [case["id"] for case in cases],
+    }
 
 
 def _read_lines(stream: TextIO, output: queue.Queue[str]) -> None:
@@ -182,6 +198,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args.destination = args.destination.expanduser().resolve()
     args.destination.mkdir(parents=True, exist_ok=True)
+    provenance = evaluation_provenance(
+        model=args.model,
+        prompt=watch_files.DEFAULT_PROMPT,
+        fixture_revision=manifest["version"],
+        cases=cases,
+    )
+    print(f"Evaluation provenance: {json.dumps(provenance, sort_keys=True)}")
 
     process = subprocess.Popen(
         watcher_command(args),

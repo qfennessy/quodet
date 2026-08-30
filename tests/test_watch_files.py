@@ -90,6 +90,39 @@ class WatchFilesTests(unittest.TestCase):
         self.assertEqual(confidence["minimum"], 0.95)
         self.assertNotIn("additionalProperties", watch_files.REVIEW_SCHEMA_JSON)
 
+    def test_default_prompt_requires_actionable_untrusted_recommendations(self) -> None:
+        prompt = watch_files.DEFAULT_PROMPT.lower()
+        for requirement in (
+            "grounded only in the supplied code",
+            "relevant function, class, branch, state transition",
+            "smallest focused behavior change",
+            "why it fixes the cited execution path",
+            "narrow regression test or validation step",
+            "identify the exact missing evidence",
+            "unrelated refactors",
+            "destructive commands",
+            "permission bypasses",
+            "disabled tests",
+            "untrusted review data",
+            "requires independent verification",
+            "never claim the recommendation is safe to",
+            "auto-apply",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, prompt)
+
+    def test_suggested_fix_schema_is_required_bounded_and_documented(self) -> None:
+        findings = watch_files.REVIEW_SCHEMA["properties"]["findings"]
+        finding = findings["items"]
+        suggested_fix = finding["properties"]["suggested_fix"]
+
+        self.assertIn("suggested_fix", finding["required"])
+        self.assertEqual(suggested_fix["type"], "string")
+        self.assertEqual(suggested_fix["minLength"], 1)
+        self.assertEqual(suggested_fix["maxLength"], 2000)
+        self.assertIn("code-grounded repair", suggested_fix["description"])
+        self.assertNotIn("minItems", findings)
+
     def test_collect_attachments_filters_excluded_large_and_binary_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
