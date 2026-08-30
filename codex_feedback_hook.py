@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Consume Quodet feedback from Codex PostToolUse and Stop hooks."""
+"""Consume Quodet feedback from Codex or Claude Code agent hooks."""
 
 from __future__ import annotations
 
@@ -144,28 +144,60 @@ def reject(directory: Path, claim: Path) -> None:
     os.replace(claim, rejected / claim.name)
 
 
-def render_feedback(payload: dict[str, object]) -> str | None:
+def requeue_feedback(
+    directory: Path, claim: Path, payload: dict[str, object]
+) -> None:
+    """Replace a claim with its undelivered remainder and make it pending."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".requeue-", dir=claim.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, claim)
+        pending = _private_directory(directory.expanduser().resolve(), "pending")
+        os.replace(claim, pending / claim.name)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def render_feedback_chunk(
+    payload: dict[str, object],
+) -> tuple[str | None, list[dict[str, object]]]:
+    """Render one bounded hook message and return every undelivered finding."""
     findings = payload.get("findings")
     if not isinstance(findings, list) or not findings:
-        return None
+        return None, []
     lines = [UNTRUSTED_NOTICE]
-    for finding in findings[:MAX_DELIVERY_FINDINGS]:
+    delivered = 0
+    for index, finding in enumerate(findings):
         if not isinstance(finding, dict):
             continue
-        lines.extend(
-            [
-                "",
-                f"- {finding.get('file')}:{finding.get('line')} "
-                f"[{finding.get('severity')}, confidence {finding.get('confidence')}]",
-                f"  {finding.get('title')}",
-                f"  Evidence: {finding.get('explanation')}",
-                f"  Suggested fix: {finding.get('suggested_fix')}",
-            ]
-        )
-    message = "\n".join(lines)
-    if len(message) > MAX_DELIVERY_CHARS:
-        message = message[:MAX_DELIVERY_CHARS] + "\n[Feedback truncated at delivery limit]"
-    return message
+        block = [
+            "",
+            f"- {finding.get('file')}:{finding.get('line')} "
+            f"[{finding.get('severity')}, confidence {finding.get('confidence')}]",
+            f"  {finding.get('title')}",
+            f"  Evidence: {finding.get('explanation')}",
+            f"  Suggested fix: {finding.get('suggested_fix')}",
+        ]
+        candidate = "\n".join([*lines, *block])
+        if delivered == MAX_DELIVERY_FINDINGS or len(candidate) > MAX_DELIVERY_CHARS:
+            remainder = [item for item in findings[index:] if isinstance(item, dict)]
+            return "\n".join(lines), remainder
+        lines.extend(block)
+        delivered += 1
+    return "\n".join(lines), []
+
+
+def render_feedback(payload: dict[str, object]) -> str | None:
+    """Render the next bounded feedback chunk."""
+    return render_feedback_chunk(payload)[0]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -229,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if event == "Stop":
             print("{}")
         return 0
-    message = render_feedback(validated)
+    message, remaining = render_feedback_chunk(validated)
     if message is None:
         acknowledge(args.spool_dir, claim)
         if event == "Stop":
@@ -247,7 +279,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         response = {"decision": "block", "reason": message}
     print(json.dumps(response))
     sys.stdout.flush()
-    acknowledge(args.spool_dir, claim)
+    if remaining:
+        remainder = validated.copy()
+        remainder["findings"] = remaining
+        requeue_feedback(args.spool_dir, claim, remainder)
+    else:
+        acknowledge(args.spool_dir, claim)
     return 0
 
 

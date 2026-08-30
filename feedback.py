@@ -7,6 +7,7 @@ into bounded values before they can be displayed or delivered to an agent.
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import stat
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - Windows lacks flock.
 MAX_FINDINGS = 50
 MAX_REVIEWED_FILES = 100
 MAX_PROVIDER_OUTPUT_BYTES = 256_000
+MAX_REVIEWED_FILE_BYTES = 100_000_000
 MAX_PATH_LENGTH = 1_024
 MAX_TITLE_LENGTH = 300
 MAX_EXPLANATION_LENGTH = 8_000
@@ -45,6 +47,7 @@ class ReviewValidationError(ValueError):
 class ReviewedFile:
     path: str
     sha256: str
+    size: int
 
 
 @dataclass(frozen=True)
@@ -76,18 +79,57 @@ class FeedbackSink(Protocol):
     def publish(self, batch: ReviewBatch) -> bool: ...
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(128 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def read_bounded_beneath_root(
+    root: Path, relative_path: Path, *, max_bytes: int
+) -> bytes:
+    """Read one regular file without following symlinks below a trusted root."""
+    if relative_path.is_absolute() or ".." in relative_path.parts or max_bytes < 0:
+        raise OSError(errno.EINVAL, "invalid bounded relative read")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory_flag or os.open not in os.supports_dir_fd:
+        raise OSError(errno.ENOTSUP, "safe descriptor-relative opens are unavailable")
+    common_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, common_flags | directory_flag)
+        descriptors.append(current)
+        for component in relative_path.parts[:-1]:
+            current = os.open(
+                component,
+                common_flags | directory_flag,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        file_descriptor = os.open(
+            relative_path.name,
+            common_flags | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=current,
+        )
+        descriptors.append(file_descriptor)
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise OSError(errno.EINVAL, "source is not a regular file")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(file_descriptor, min(remaining, 128 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
-def _sha256_inside_root(root: Path, relative_path: str) -> str:
-    candidate = (root / relative_path).resolve(strict=True)
-    candidate.relative_to(root)
-    return sha256_file(candidate)
+def _sha256_inside_root(root: Path, relative_path: str, *, max_bytes: int) -> str:
+    raw = read_bounded_beneath_root(
+        root, Path(relative_path), max_bytes=max_bytes
+    )
+    if len(raw) > max_bytes:
+        raise OSError(errno.EFBIG, "source exceeds reviewed size")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _bounded_string(value: object, field: str, maximum: int) -> str:
@@ -183,7 +225,9 @@ def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
     fresh_paths: set[str] = set()
     for reviewed in batch.reviewed_files:
         try:
-            if _sha256_inside_root(root, reviewed.path) == reviewed.sha256:
+            if _sha256_inside_root(
+                root, reviewed.path, max_bytes=reviewed.size
+            ) == reviewed.sha256:
                 fresh_paths.add(reviewed.path)
         except (OSError, ValueError):
             pass
@@ -452,19 +496,26 @@ def validate_spooled_payload(
         raise ReviewValidationError("invalid reviewed file collection")
     reviewed: list[ReviewedFile] = []
     for item in raw_reviewed:
-        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
             raise ReviewValidationError("invalid reviewed file")
         path = _normalize_finding_path(
             item["path"], root.resolve(), {str(item["path"]).replace("\\", "/")}
         )
         digest = item["sha256"]
+        size = item["size"]
         if (
             not isinstance(digest, str)
             or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
         ):
             raise ReviewValidationError("invalid reviewed file digest")
-        reviewed.append(ReviewedFile(path=path, sha256=digest))
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 <= size <= MAX_REVIEWED_FILE_BYTES
+        ):
+            raise ReviewValidationError("invalid reviewed file size")
+        reviewed.append(ReviewedFile(path=path, sha256=digest, size=size))
     normalized = parse_review_output(
         json.dumps({"findings": payload["findings"]}),
         root=root.resolve(),
@@ -481,13 +532,15 @@ def validate_spooled_payload(
 def fresh_spooled_payload(payload: dict[str, object], *, root: Path) -> dict[str, object]:
     """Recheck source digests again at the independent consumer boundary."""
     reviewed = {
-        str(item["path"]): str(item["sha256"])
+        str(item["path"]): (str(item["sha256"]), int(item["size"]))
         for item in payload["reviewed_files"]  # type: ignore[union-attr]
     }
     fresh: set[str] = set()
-    for relative_path, digest in reviewed.items():
+    for relative_path, (digest, size) in reviewed.items():
         try:
-            if _sha256_inside_root(root.resolve(), relative_path) == digest:
+            if _sha256_inside_root(
+                root.resolve(), relative_path, max_bytes=size
+            ) == digest:
                 fresh.add(relative_path)
         except (OSError, ValueError):
             pass

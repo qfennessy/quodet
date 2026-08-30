@@ -206,7 +206,7 @@ explicit, separate evaluation through `evals.agent_changes.live_eval`, which
 records exact run provenance and raw outcomes. Normal unit tests are
 deterministic and never contact a provider.
 
-## Deliver feedback to Codex
+## Integrate with Codex
 
 Console output remains the default. To feed validated findings back to one
 active Codex session, choose a spool directory outside the watched repository
@@ -301,9 +301,60 @@ Troubleshooting:
 - Secure source snapshots require POSIX descriptor-relative `O_NOFOLLOW` opens,
   and exclusive producer leases require `flock`. Delivery fails closed on
   platforms without these primitives.
-- This integration targets Codex hooks. Attaching to an arbitrary already
-  running agent without a documented hook or steering interface is out of
-  scope.
+
+## Integrate with Claude Code
+
+Claude Code exposes the same two delivery boundaries Quodet needs: a
+`PostToolUse` hook can add review feedback to the active conversation, and a
+`Stop` hook can keep the agent running when a review arrives at completion.
+The `quodet-claude-hook` command is an alias of the same validated, bounded
+consumer used for Codex.
+
+Start Quodet with a private spool and a unique configured session ID as in the
+Codex example above. Then add project hooks to `.claude/settings.json`, using
+the exact same absolute root, spool directory, and configured session ID:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "quodet-claude-hook --event PostToolUse --spool-dir /tmp/quodet-501/feedback --session-id claude-example --root /absolute/path/to/project"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "quodet-claude-hook --event Stop --spool-dir /tmp/quodet-501/feedback --session-id claude-example --root /absolute/path/to/project"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+These settings use Claude Code's documented command-hook input and output
+contract. On `PostToolUse`, Quodet returns `additionalContext`; on `Stop`, it
+returns a blocking decision and reason only when fresh feedback is pending.
+Claude Code supplies its real `session_id` and `cwd` on standard input, so the
+same fail-closed root and session lease checks apply. See the official
+[Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
+
+The filesystem watcher still observes writes from shell commands and other
+processes even though the `PostToolUse` matcher names Claude's direct editing
+tools. The `Stop` hook is the fallback delivery boundary for those changes.
+Project hooks can execute commands, so review `.claude/settings.json` before
+trusting the repository. Attaching Quodet to another agent still requires that
+agent to expose a documented hook or steering interface.
 
 ## Privacy
 

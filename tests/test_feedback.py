@@ -55,7 +55,11 @@ class FeedbackTests(unittest.TestCase):
         import hashlib
 
         self.reviewed = (
-            ReviewedFile("src/app.py", hashlib.sha256(source.read_bytes()).hexdigest()),
+            ReviewedFile(
+                "src/app.py",
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                source.stat().st_size,
+            ),
         )
 
     def parse(self, output: str, **kwargs: object):
@@ -96,6 +100,18 @@ class FeedbackTests(unittest.TestCase):
         batch = self.parse(valid_output())
         (self.root / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
         self.assertEqual(fresh_findings(batch).findings, ())
+
+    def test_freshness_reads_are_bounded_and_reject_non_regular_files(self) -> None:
+        source = self.root / "src" / "app.py"
+        batch = self.parse(valid_output())
+        source.write_text("x" * 1_000_000, encoding="utf-8")
+        self.assertEqual(fresh_findings(batch).findings, ())
+
+        source.unlink()
+        os.mkfifo(source)
+        started = time.monotonic()
+        self.assertEqual(fresh_findings(batch).findings, ())
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_consumer_rechecks_freshness_after_spooling(self) -> None:
         spool = self.base / "runtime" / "feedback"
@@ -165,7 +181,9 @@ class FeedbackTests(unittest.TestCase):
             self.reviewed = (
                 cited,
                 ReviewedFile(
-                    "src/context.py", hashlib.sha256(context.read_bytes()).hexdigest()
+                    "src/context.py",
+                    hashlib.sha256(context.read_bytes()).hexdigest(),
+                    context.stat().st_size,
                 ),
             )
             self.assertFalse(sink.publish(self.parse(valid_output())))
@@ -174,7 +192,9 @@ class FeedbackTests(unittest.TestCase):
             source.write_text(f"value = {time.time_ns()}\n")
             self.reviewed = (
                 ReviewedFile(
-                    "src/app.py", hashlib.sha256(source.read_bytes()).hexdigest()
+                    "src/app.py",
+                    hashlib.sha256(source.read_bytes()).hexdigest(),
+                    source.stat().st_size,
                 ),
             )
             self.assertEqual(sink.publish(self.parse(valid_output())), expected)
@@ -281,6 +301,60 @@ class FeedbackTests(unittest.TestCase):
                     )
                 else:
                     self.assertEqual(response["decision"], "block")
+
+    def test_hook_requeues_findings_that_do_not_fit_one_delivery(self) -> None:
+        spool = self.base / "chunked" / "feedback"
+        raw = json.loads(valid_output())
+        template = raw["findings"][0]
+        raw["findings"] = [
+            {**template, "line": line, "title": f"Finding {line}"}
+            for line in range(1, 13)
+        ]
+        SpoolSink(spool, root=self.root, session_id="agent-a").publish(
+            self.parse(json.dumps(raw))
+        )
+        outputs: list[dict[str, object]] = []
+        event_input = json.dumps(
+            {"session_id": "real-chunked", "cwd": os.fspath(self.root)}
+        )
+        for expected_pending in (1, 0):
+            output = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(event_input)), mock.patch(
+                "sys.stdout", output
+            ):
+                codex_feedback_hook.main(
+                    [
+                        "--event", "PostToolUse",
+                        "--spool-dir", os.fspath(spool),
+                        "--session-id", "agent-a",
+                        "--root", os.fspath(self.root),
+                    ]
+                )
+            outputs.append(json.loads(output.getvalue()))
+            self.assertEqual(
+                len(list((spool / "pending").glob("*.json"))), expected_pending
+            )
+
+        messages = [
+            output["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+            for output in outputs
+        ]
+        self.assertEqual(messages[0].count("  Suggested fix:"), 10)
+        self.assertEqual(messages[1].count("  Suggested fix:"), 2)
+        self.assertEqual(len(list((spool / "acknowledged").glob("*.json"))), 1)
+
+    def test_delivery_character_limit_retains_whole_findings(self) -> None:
+        raw = json.loads(valid_output())
+        first_message = codex_feedback_hook.render_feedback(raw)
+        self.assertIsNotNone(first_message)
+        raw["findings"].append({**raw["findings"][0], "line": 8})
+        with mock.patch.object(
+            codex_feedback_hook, "MAX_DELIVERY_CHARS", len(first_message) + 1
+        ):
+            message, remaining = codex_feedback_hook.render_feedback_chunk(raw)
+        self.assertEqual(message, first_message)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["line"], 8)
 
     def test_session_lease_fails_closed_for_a_second_codex_session(self) -> None:
         spool = self.base / "runtime" / "feedback"

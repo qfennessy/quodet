@@ -6,6 +6,7 @@ import io
 import json
 import queue
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -295,8 +296,7 @@ class WatchFilesTests(unittest.TestCase):
             def fake_run(command: list[str], **_: object) -> object:
                 nonlocal observed_path
                 self.assertEqual(_["timeout"], 60)
-                self.assertTrue(_["capture_output"])
-                self.assertTrue(_["text"])
+                self.assertEqual(_["output_limit"], watch_files.MAX_PROVIDER_OUTPUT_BYTES)
                 attachment_index = command.index("--fragment") + 1
                 observed_path = Path(command[attachment_index])
                 self.assertNotEqual(observed_path, source)
@@ -316,10 +316,15 @@ class WatchFilesTests(unittest.TestCase):
                 return type(
                     "Result",
                     (),
-                    {"returncode": 0, "stdout": '{"findings": []}', "stderr": ""},
+                    {
+                        "returncode": 0,
+                        "stdout": '{"findings": []}',
+                        "stderr": "",
+                        "output_exceeded": False,
+                    },
                 )()
 
-            with mock.patch("watch_files.subprocess.run", side_effect=fake_run):
+            with mock.patch("watch_files.run_bounded_command", side_effect=fake_run):
                 watch_files.review_files(
                     [source],
                     root=root,
@@ -345,10 +350,13 @@ class WatchFilesTests(unittest.TestCase):
                 "returncode": 2,
                 "stdout": '{"findings": []}\n',
                 "stderr": "provider rejected request\n",
+                "output_exceeded": False,
             })()
             output = io.StringIO()
             with (
-                mock.patch("watch_files.subprocess.run", return_value=result) as run,
+                mock.patch(
+                    "watch_files.run_bounded_command", return_value=result
+                ) as run,
                 contextlib.redirect_stdout(output),
             ):
                 watch_files.review_files(
@@ -358,8 +366,10 @@ class WatchFilesTests(unittest.TestCase):
                     evaluation_events=True,
                 )
 
-            self.assertTrue(run.call_args.kwargs["capture_output"])
-            self.assertTrue(run.call_args.kwargs["text"])
+            self.assertEqual(
+                run.call_args.kwargs["output_limit"],
+                watch_files.MAX_PROVIDER_OUTPUT_BYTES,
+            )
             event = json.loads(output.getvalue().splitlines()[-1])[
                 "quodet_evaluation_event"
             ]
@@ -386,19 +396,33 @@ class WatchFilesTests(unittest.TestCase):
             )
 
             malformed = type(
-                "Result", (), {"returncode": 0, "stdout": "not json", "stderr": ""}
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": "not json",
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
             )()
-            with mock.patch("watch_files.subprocess.run", return_value=malformed):
+            with mock.patch("watch_files.run_bounded_command", return_value=malformed):
                 self.assertIsNone(watch_files.review_files(**common))
 
             failed = type(
-                "Result", (), {"returncode": 2, "stdout": "", "stderr": "provider error"}
+                "Result",
+                (),
+                {
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": "provider error",
+                    "output_exceeded": False,
+                },
             )()
-            with mock.patch("watch_files.subprocess.run", return_value=failed):
+            with mock.patch("watch_files.run_bounded_command", return_value=failed):
                 self.assertIsNone(watch_files.review_files(**common))
 
             with mock.patch(
-                "watch_files.subprocess.run",
+                "watch_files.run_bounded_command",
                 side_effect=subprocess.TimeoutExpired("llm", 60),
             ):
                 self.assertIsNone(watch_files.review_files(**common))
@@ -429,12 +453,17 @@ class WatchFilesTests(unittest.TestCase):
                 return type(
                     "Result",
                     (),
-                    {"returncode": 0, "stdout": response, "stderr": ""},
+                    {
+                        "returncode": 0,
+                        "stdout": response,
+                        "stderr": "",
+                        "output_exceeded": False,
+                    },
                 )()
 
             sink = mock.Mock()
             with mock.patch(
-                "watch_files.subprocess.run", side_effect=change_during_review
+                "watch_files.run_bounded_command", side_effect=change_during_review
             ):
                 batch = watch_files.review_files(
                     [source],
@@ -452,6 +481,18 @@ class WatchFilesTests(unittest.TestCase):
             self.assertIsInstance(batch, watch_files.ReviewBatch)
             self.assertEqual(batch.findings, ())
             sink.publish.assert_called_once_with(batch)
+
+    def test_provider_output_is_bounded_before_memory_buffering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = watch_files.run_bounded_command(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000)"],
+                cwd=Path(temporary_directory),
+                timeout=5,
+                output_limit=1_024,
+            )
+
+        self.assertTrue(result.output_exceeded)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 1_025)
 
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import json
 import math
@@ -12,7 +11,6 @@ import os
 import queue
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +23,7 @@ from feedback import (
     CompositeSink,
     ConsoleSink,
     FeedbackSink,
+    MAX_PROVIDER_OUTPUT_BYTES,
     MAX_REVIEWED_FILES,
     ReviewBatch,
     ReviewValidationError,
@@ -32,6 +31,7 @@ from feedback import (
     SpoolSink,
     fresh_findings,
     parse_review_output,
+    read_bounded_beneath_root,
 )
 
 try:
@@ -230,6 +230,15 @@ class SourceSnapshot:
     relative_path: Path
     contents: str
     sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    output_exceeded: bool = False
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -380,48 +389,6 @@ def is_excluded(
         or any(Path(part).match(pattern) for part in relative_path.parts)
         for pattern in patterns
     )
-
-
-def read_bounded_beneath_root(
-    root: Path, relative_path: Path, *, max_bytes: int
-) -> bytes:
-    """Open one regular file without following symlinks below the trusted root."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    if not nofollow or not directory_flag or os.open not in os.supports_dir_fd:
-        raise OSError(errno.ENOTSUP, "safe descriptor-relative opens are unavailable")
-    common_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
-    descriptors: list[int] = []
-    try:
-        current = os.open(root, common_flags | directory_flag)
-        descriptors.append(current)
-        for component in relative_path.parts[:-1]:
-            current = os.open(
-                component,
-                common_flags | directory_flag,
-                dir_fd=current,
-            )
-            descriptors.append(current)
-        file_descriptor = os.open(
-            relative_path.name,
-            common_flags,
-            dir_fd=current,
-        )
-        descriptors.append(file_descriptor)
-        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
-            raise OSError(errno.EINVAL, "source is not a regular file")
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining:
-            chunk = os.read(file_descriptor, min(remaining, 128 * 1024))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def is_utf8_text(root: Path, relative_path: Path, *, max_bytes: int) -> bool:
@@ -581,6 +548,7 @@ def snapshot_attachments(
                 relative_path=relative_path,
                 contents=contents,
                 sha256=hashlib.sha256(source_bytes).hexdigest(),
+                size=len(source_bytes),
             )
         )
     return snapshots
@@ -649,6 +617,62 @@ def _subprocess_output_text(value: str | bytes | None) -> str | None:
     return value
 
 
+def run_bounded_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    output_limit: int,
+) -> BoundedProcessResult:
+    """Run a command without buffering unbounded provider output in memory."""
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+    ):
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        deadline = time.monotonic() + timeout
+        output_exceeded = False
+        while process.poll() is None:
+            if (
+                os.fstat(stdout_file.fileno()).st_size > output_limit
+                or os.fstat(stderr_file.fileno()).st_size > output_limit
+            ):
+                output_exceeded = True
+                process.kill()
+                process.wait()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+        if (
+            os.fstat(stdout_file.fileno()).st_size > output_limit
+            or os.fstat(stderr_file.fileno()).st_size > output_limit
+        ):
+            output_exceeded = True
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(output_limit + 1).decode("utf-8", errors="replace")
+        stderr = stderr_file.read(output_limit + 1).decode("utf-8", errors="replace")
+        return BoundedProcessResult(
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            output_exceeded=output_exceeded,
+        )
+
+
 def review_files(
     paths: Iterable[Path],
     *,
@@ -706,13 +730,11 @@ def review_files(
         )
 
         try:
-            result = subprocess.run(
+            result = run_bounded_command(
                 command,
                 cwd=root,
-                check=False,
-                capture_output=True,
-                text=True,
                 timeout=review_timeout,
+                output_limit=MAX_PROVIDER_OUTPUT_BYTES,
             )
         except subprocess.TimeoutExpired as error:
             if evaluation_events:
@@ -740,6 +762,21 @@ def review_files(
                 print(f"Could not run llm: {error}", file=sys.stderr)
             return None
 
+    if result.output_exceeded:
+        diagnostic = (
+            f"Rejected llm response: output exceeded "
+            f"{MAX_PROVIDER_OUTPUT_BYTES} bytes"
+        )
+        if evaluation_events:
+            print(json.dumps({"quodet_evaluation_event": {
+                "status": "provider-error",
+                "returncode": result.returncode,
+                "raw_response": result.stdout,
+                "stderr": diagnostic,
+            }}), flush=True)
+        else:
+            print(diagnostic, file=sys.stderr)
+        return None
     if evaluation_events:
         print(json.dumps({"quodet_evaluation_event": {
             "status": "success" if result.returncode == 0 else "provider-error",
@@ -756,7 +793,11 @@ def review_files(
         return None
 
     reviewed_files = tuple(
-        ReviewedFile(path=snapshot.relative_path.as_posix(), sha256=snapshot.sha256)
+        ReviewedFile(
+            path=snapshot.relative_path.as_posix(),
+            sha256=snapshot.sha256,
+            size=snapshot.size,
+        )
         for snapshot in snapshots
     )
     try:
