@@ -651,6 +651,13 @@ def cleanup_route(
                     if _payload_owned(path, route):
                         path.unlink()
                         removed[name] += 1
+            policy = route.spool_path / "policy" / "rounds.json"
+            if policy.exists():
+                _private_file(policy)
+                policy.unlink()
+                removed["policy"] = 1
+            else:
+                removed["policy"] = 0
             if lease.exists():
                 lease.unlink()
                 removed["session_lease"] = 1

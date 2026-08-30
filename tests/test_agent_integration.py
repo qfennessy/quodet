@@ -1012,6 +1012,8 @@ class AgentIntegrationTests(unittest.TestCase):
             discard_feedback=True,
         )
         self.assertEqual(removed["pending"], 1)
+        self.assertEqual(removed["policy"], 1)
+        self.assertFalse((self.spool / "policy" / "rounds.json").exists())
         self.assertEqual(removed["session_lease"], 1)
 
     def test_platform_support_fails_closed(self) -> None:
