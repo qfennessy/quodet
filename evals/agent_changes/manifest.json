@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "description": "Frozen, repository-neutral coding-agent change evaluation corpus",
   "source_boundary": {
     "corpus": "independently verified non-public review corpus",
@@ -158,6 +158,11 @@
       "id": "25_clean_tooling_dependencies", "difficulty": "clean-control", "files": ["change_filter.py", "workflow.py"],
       "failure_families": ["CI/tooling"], "scope": "cross-file", "expected_evidence_depth": "job dependency graph and path filter", "evaluation_split": "clean-control",
       "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["16_tooling_dependency_filter"], "expected_findings": []
+    },
+    {
+      "id": "26_clean_settled_async_rollback", "difficulty": "clean-control", "files": ["repository.py", "service.py"],
+      "failure_families": ["persistence/atomicity", "retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "reachable cancellation and sibling-task schedule", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "observed-quodet-false-positive-regression", "calibration_ids": []}, "matched_control_for": ["11_partial_async_rollback"], "expected_findings": []
     }
   ]
 }

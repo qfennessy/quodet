@@ -46,7 +46,7 @@ def provider_finding(file: str, explanation: str) -> dict[str, object]:
 def raw_run(cases: list[dict[str, object]]) -> dict[str, object]:
     return {
         "run_id": "run-1",
-        "configuration": {"fixture": {"revision": 2}},
+        "configuration": {"fixture": {"revision": 3}},
         "cases": cases,
     }
 
@@ -111,7 +111,7 @@ class AgentChangeReplayTests(unittest.TestCase):
 
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
-        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["version"], 3)
         covered_families: set[str] = set()
 
         for case in manifest["cases"]:
@@ -182,7 +182,7 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(configuration["prompt"]["revision"], watch_files.PROMPT_REVISION)
         self.assertEqual(configuration["schema"]["value"], watch_files.REVIEW_SCHEMA)
         self.assertEqual(configuration["schema"]["revision"], watch_files.REVIEW_SCHEMA_REVISION)
-        self.assertEqual(configuration["fixture"]["revision"], 2)
+        self.assertEqual(configuration["fixture"]["revision"], 3)
         self.assertEqual(configuration["fixture"]["case_ids"], [case["id"] for case in cases])
 
     def test_wait_for_outcome_retains_raw_schema_valid_response_and_latency(self) -> None:
@@ -281,7 +281,7 @@ class AgentChangeReplayTests(unittest.TestCase):
 
         run = raw_run([outcome])
         adjudication = {
-            "run_id": "run-1", "fixture_revision": 2,
+            "run_id": "run-1", "fixture_revision": 3,
             "cases": {case["id"]: {"findings": [{
                 "finding_index": 0, "verdict": "false-positive",
                 "expected_finding_id": None, "rationale": "Right file, wrong failure path",
@@ -305,7 +305,7 @@ class AgentChangeReplayTests(unittest.TestCase):
         }
         run = raw_run([defect, clean])
         adjudication = {
-            "run_id": "run-1", "fixture_revision": 2,
+            "run_id": "run-1", "fixture_revision": 3,
             "cases": {
                 "defect": {"findings": [{
                     "finding_index": 0, "verdict": "true-positive",
@@ -338,7 +338,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             "parsed_response": None,
         }
         run = raw_run([failed])
-        adjudication = {"run_id": "run-1", "fixture_revision": 2, "cases": {}}
+        adjudication = {"run_id": "run-1", "fixture_revision": 3, "cases": {}}
         metrics = scoring.score_run(run, adjudication)
         self.assertEqual(metrics["schema_valid_rate"], 0.0)
         self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (0, 0, 2))
@@ -571,7 +571,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             model=config.model,
             reasoning_effort=None,
             prompt=watch_files.DEFAULT_PROMPT,
-            fixture_revision=2,
+            fixture_revision=3,
             cases=[],
             model_run_config=config,
             benchmark_plan=plan,
@@ -585,7 +585,7 @@ class AgentChangeReplayTests(unittest.TestCase):
                 },
             },
         )
-        adjudication = {"run_id": "run-1", "fixture_revision": 2, "cases": {}}
+        adjudication = {"run_id": "run-1", "fixture_revision": 3, "cases": {}}
         run["metrics"] = scoring.score_run(run, adjudication)
         run["adjudication"] = adjudication
         run["adjudication_sha256"] = scoring.adjudication_sha256(adjudication)

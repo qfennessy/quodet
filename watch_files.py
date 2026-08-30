@@ -58,7 +58,7 @@ DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 60.0
 PROMPT_REVISION = "quodet-review-v2"
-REVIEW_SCHEMA_REVISION = "quodet-findings-v2"
+REVIEW_SCHEMA_REVISION = "quodet-findings-v3"
 DEFAULT_PROMPT = """Review the supplied changed files for real defects.
 
 Analyze each supplied file as a separate file. For every candidate finding,
@@ -113,8 +113,8 @@ REVIEW_SCHEMA = {
                     "confidence": {
                         "type": "number",
                         "description": (
-                            "Calibrated probability from 0.95 to 1.0 that the "
-                            "finding is a real defect"
+                            "Raw model-reported confidence from 0.95 to 1.0; "
+                            "not a calibrated probability"
                         ),
                         "minimum": 0.95,
                         "maximum": 1,

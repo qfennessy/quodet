@@ -42,10 +42,11 @@ synthetic code; none is source application code.
 | `23_clean_async_rollback` | persistence/atomicity; retry/concurrency | cross-file | matched atomicity control | clean-control |
 | `24_clean_external_validation` | external API contract | narrow | matched semantic-contract control | clean-control |
 | `25_clean_tooling_dependencies` | CI/tooling | cross-file | matched tooling-dependency control | clean-control |
+| `26_clean_settled_async_rollback` | persistence/atomicity; retry/concurrency | cross-file | reachable cancellation and settled sibling schedule | clean-control |
 
 All eight corpus families now have positive coverage. Each has both narrow and
 cross-file evidence, including multi-family cases where one execution path
-crosses two failure modes. Five new matched controls
+crosses two failure modes. Six new matched controls
 span one- and two-file cases and basic through sophisticated reasoning, in
 addition to the original two-file control.
 
