@@ -75,15 +75,27 @@ def provider_fixture_payload_sha256(
 
 def _matches_frozen_model_options(
     model_options: Mapping[str, Any], expected_temperature: Any,
+    expected_reasoning_effort: Any = None,
 ) -> bool:
     temperature = model_options.get("temperature")
+    expected_keys = {"temperature"}
+    if expected_reasoning_effort is not None:
+        expected_keys.add("reasoning_effort")
     return (
         isinstance(expected_temperature, (int, float))
         and not isinstance(expected_temperature, bool)
-        and set(model_options) == {"temperature"}
+        and set(model_options) == expected_keys
         and isinstance(temperature, (int, float))
         and not isinstance(temperature, bool)
         and temperature == expected_temperature
+        and (
+            expected_reasoning_effort is None
+            or (
+                expected_reasoning_effort in {"low", "medium", "high"}
+                and model_options.get("reasoning_effort")
+                == expected_reasoning_effort
+            )
+        )
     )
 
 
@@ -349,7 +361,9 @@ def prepare_run_config(
     if max_output_bytes != execution["max_output_bytes"]:
         raise ValueError("candidate output-byte cap differs from frozen contract")
     if not _matches_frozen_model_options(
-        model_options, execution["temperature"],
+        model_options,
+        execution["temperature"],
+        execution.get("reasoning_effort"),
     ):
         raise ValueError("candidate model options differ from frozen execution contract")
     if locality == "hosted" and not external_upload_consent:
@@ -577,7 +591,9 @@ def validate_run_against_plan(
             raise ValueError(f"run model config {key} differs from frozen contract")
     model_options = model_config.get("model_options")
     if not isinstance(model_options, Mapping) or not _matches_frozen_model_options(
-        model_options, execution["temperature"],
+        model_options,
+        execution["temperature"],
+        execution.get("reasoning_effort"),
     ):
         raise ValueError("run model options differ from frozen contract")
     for key in ("model_artifact", "model_revision", "locality"):

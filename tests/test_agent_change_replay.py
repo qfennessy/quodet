@@ -251,6 +251,88 @@ class AgentChangeReplayTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     benchmark.validate_model_run_config_against_plan(plan, tampered)
 
+    def test_challenge_plan_can_freeze_high_reasoning_without_weakening_ordinary(self) -> None:
+        cases = challenge.model_cases("challenge-development")
+        plan = bind_challenge_plan(plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        ), cases)
+        plan["execution_contract"]["reasoning_effort"] = "high"
+        config = benchmark.prepare_run_config(
+            plan,
+            candidate_id="deepseek-v4-flash-hosted",
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            model_options={"temperature": 0, "reasoning_effort": "high"},
+            timeout_seconds=60,
+            max_output_tokens=4096,
+            max_output_tokens_option="max_tokens",
+            max_output_bytes=262144,
+            pricing=Pricing(
+                1.0, 1.0, "https://provider.example/pricing", "2026-08-30",
+            ),
+            max_cost_usd=100.0,
+            external_upload_consent=True,
+            hardware={
+                "endpoint": "fixture",
+                "provider_model_revision": "deepseek-v4-flash-test-revision",
+            },
+        )
+        self.assertEqual(
+            benchmark.validate_model_run_config_against_plan(plan, config),
+            "deepseek-v4-flash-hosted",
+        )
+        for reasoning_effort in ("low", "max", None):
+            with self.subTest(reasoning_effort=reasoning_effort):
+                model_options = {"temperature": 0}
+                if reasoning_effort is not None:
+                    model_options["reasoning_effort"] = reasoning_effort
+                tampered = ModelRunConfig.from_dict({
+                    **config.to_dict(), "model_options": model_options,
+                })
+                with self.assertRaises(ValueError):
+                    benchmark.validate_model_run_config_against_plan(plan, tampered)
+
+        ordinary = plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        )
+        with self.assertRaisesRegex(ValueError, "model options"):
+            benchmark.prepare_run_config(
+                ordinary,
+                candidate_id="deepseek-v4-flash-hosted",
+                model="hosted-deepseek",
+                provider="test-provider",
+                runtime="test-runtime",
+                runtime_version="1.0.0",
+                quantization="fp8",
+                model_options={"temperature": 0, "reasoning_effort": "high"},
+                timeout_seconds=60,
+                max_output_tokens=4096,
+                max_output_tokens_option="max_tokens",
+                max_output_bytes=262144,
+                pricing=Pricing(
+                    1.0, 1.0, "https://provider.example/pricing", "2026-08-30",
+                ),
+                max_cost_usd=100.0,
+                external_upload_consent=True,
+                hardware={
+                    "endpoint": "fixture",
+                    "provider_model_revision": "deepseek-v4-flash-test-revision",
+                },
+            )
+
     def test_live_eval_rejects_unregistered_config_before_any_runtime_work(self) -> None:
         hosted_plan = plan_with_approved_hosted_artifact(
             model="hosted-deepseek",
