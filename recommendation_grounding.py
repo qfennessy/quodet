@@ -109,7 +109,11 @@ def _mutates_unsupplied_test(
         if _path_is_proposed(clause, match.start())
     ]
     test_matches = list(_TEST_WORD.finditer(clause))
-    if test_matches:
+    visible_spec_symbol = any(
+        _SPEC_SYMBOL.fullmatch(symbol) is not None
+        for symbol in visible_clause_symbols
+    )
+    if test_matches or visible_spec_symbol:
         test_matches.extend(_SPEC_SYMBOL.finditer(clause))
         test_matches.sort(key=lambda match: match.start())
     for test_match in test_matches:

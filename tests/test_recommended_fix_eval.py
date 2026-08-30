@@ -221,6 +221,10 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                 "Extend known_test and missing_spec with boundary assertions.",
                 "known_test",
             ),
+            (
+                "Extend known_spec and missing_spec with boundary assertions.",
+                "known_spec",
+            ),
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
