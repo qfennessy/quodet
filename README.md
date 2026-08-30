@@ -9,6 +9,9 @@ The independent watcher batches related file changes, reviews the current code,
 and is designed to return high-confidence defects quickly enough for the coding
 agent to verify and address them in the same development loop.
 
+See [EXAMPLES.md](EXAMPLES.md) for complete buggy evaluation snippets and the
+focused fixes Quodet recommended during a live review.
+
 `quodet` recursively watches a directory. After file writes settle for three
 seconds, it sends all changed files in that batch to Codex Luna through Simon
 Willison's [`llm`](https://llm.datasette.io/) CLI. The default review requests
