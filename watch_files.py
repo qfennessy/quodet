@@ -34,6 +34,8 @@ DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 60.0
+PROMPT_REVISION = "quodet-review-v2"
+REVIEW_SCHEMA_REVISION = "quodet-findings-v2"
 DEFAULT_PROMPT = """Review the supplied changed files for real defects.
 
 Analyze each supplied file as a separate file. For every candidate finding,
@@ -261,6 +263,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--poll",
         action="store_true",
         help="poll for changes when native filesystem events are unavailable",
+    )
+    parser.add_argument(
+        "--evaluation-events",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args(argv)
 
@@ -517,6 +524,12 @@ def build_llm_command(
     return command
 
 
+def _subprocess_output_text(value: str | bytes | None) -> str | None:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def review_files(
     paths: Iterable[Path],
     *,
@@ -528,6 +541,7 @@ def review_files(
     log: bool,
     review_timeout: float,
     reasoning_effort: str | None,
+    evaluation_events: bool = False,
 ) -> None:
     attachments = collect_attachments(
         paths,
@@ -567,24 +581,53 @@ def review_files(
             reasoning_effort=reasoning_effort,
         )
 
+        run_options: dict[str, object] = {
+            "cwd": root,
+            "check": False,
+            "timeout": review_timeout,
+        }
+        if evaluation_events:
+            run_options.update({"capture_output": True, "text": True})
+
         try:
             result = subprocess.run(
                 command,
-                cwd=root,
-                check=False,
-                timeout=review_timeout,
+                **run_options,
             )
-        except subprocess.TimeoutExpired:
-            print(
-                f"llm review timed out after {review_timeout:g} seconds",
-                file=sys.stderr,
-            )
+        except subprocess.TimeoutExpired as error:
+            if evaluation_events:
+                print(json.dumps({"quodet_evaluation_event": {
+                    "status": "timeout",
+                    "returncode": None,
+                    "raw_response": _subprocess_output_text(error.stdout),
+                    "stderr": _subprocess_output_text(error.stderr),
+                }}), flush=True)
+            else:
+                print(
+                    f"llm review timed out after {review_timeout:g} seconds",
+                    file=sys.stderr,
+                )
             return
         except OSError as error:
-            print(f"Could not run llm: {error}", file=sys.stderr)
+            if evaluation_events:
+                print(json.dumps({"quodet_evaluation_event": {
+                    "status": "provider-error",
+                    "returncode": None,
+                    "raw_response": None,
+                    "stderr": str(error),
+                }}), flush=True)
+            else:
+                print(f"Could not run llm: {error}", file=sys.stderr)
             return
 
-    if result.returncode != 0:
+    if evaluation_events:
+        print(json.dumps({"quodet_evaluation_event": {
+            "status": "success" if result.returncode == 0 else "provider-error",
+            "returncode": result.returncode,
+            "raw_response": result.stdout,
+            "stderr": result.stderr,
+        }}), flush=True)
+    elif result.returncode != 0:
         print(f"llm exited with status {result.returncode}", file=sys.stderr)
 
 
@@ -705,6 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reasoning_effort=resolve_reasoning_effort(
                     args.model, args.reasoning_effort
                 ),
+                evaluation_events=args.evaluation_events,
             )
     except KeyboardInterrupt:
         print("\nStopping watcher.")

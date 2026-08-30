@@ -1,112 +1,226 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import queue
 import tempfile
 import unittest
 from pathlib import Path
 
-from evals.agent_changes import live_eval
-from evals.agent_changes import replay
+import watch_files
+from evals.agent_changes import live_eval, replay, scoring
+
+
+CORPUS_FAMILIES = {
+    "state/lifecycle",
+    "external API contract",
+    "privacy/authorization",
+    "retry/concurrency",
+    "UI/cache",
+    "CI/tooling",
+    "persistence/atomicity",
+    "performance/cost",
+}
+PRIMARY_CALIBRATION_IDS = {
+    "A01", "A04", "A06", "A09", "A11", "A14", "A17",
+    "B02", "B04", "B06", "B09", "B12",
+}
+
+
+def provider_finding(file: str, explanation: str) -> dict[str, object]:
+    return {
+        "file": file,
+        "line": 1,
+        "severity": "medium",
+        "confidence": 0.99,
+        "title": "Finding",
+        "explanation": explanation,
+        "suggested_fix": "Change the branch and add a focused regression test.",
+    }
+
+
+def raw_run(cases: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "run_id": "run-1",
+        "configuration": {"fixture": {"revision": 2}},
+        "cases": cases,
+    }
 
 
 class AgentChangeReplayTests(unittest.TestCase):
-    def test_manifest_declares_obvious_subtle_and_clean_cases(self) -> None:
+    def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
-        difficulties = {case["difficulty"] for case in manifest["cases"]}
-        self.assertIn("obvious", difficulties)
-        self.assertIn("subtle", difficulties)
-        self.assertIn("sophisticated", difficulties)
-        self.assertIn("clean-control", difficulties)
+        self.assertEqual(manifest["version"], 2)
+        covered_families: set[str] = set()
 
         for case in manifest["cases"]:
-            fixture_names = sorted(
-                path.name for path in (replay.CASES_ROOT / case["id"]).iterdir()
-            )
-            self.assertEqual(sorted(case["files"]), fixture_names)
+            with self.subTest(case=case["id"]):
+                for field in (
+                    "failure_families", "scope", "expected_evidence_depth",
+                    "evaluation_split", "provenance",
+                ):
+                    self.assertIn(field, case)
+                self.assertIn(case["evaluation_split"], scoring.EVALUATION_SPLITS)
+                self.assertIn(case["scope"], {"narrow", "cross-file"})
+                fixture_names = sorted(
+                    path.name for path in (replay.CASES_ROOT / case["id"]).iterdir()
+                )
+                self.assertEqual(sorted(case["files"]), fixture_names)
+                covered_families.update(case["failure_families"])
+
+        self.assertEqual(covered_families, CORPUS_FAMILIES)
+
+    def test_calibration_provenance_cannot_reference_sealed_ids(self) -> None:
+        manifest = replay.load_manifest()
+        for case in manifest["cases"]:
+            ids = set(case["provenance"]["calibration_ids"])
+            self.assertLessEqual(ids, PRIMARY_CALIBRATION_IDS)
+            if case["evaluation_split"] == "holdout":
+                self.assertEqual(ids, set())
+
+    def test_has_matched_clean_controls_at_multiple_sizes_and_depths(self) -> None:
+        controls = [
+            case for case in replay.load_manifest()["cases"]
+            if case["evaluation_split"] == "clean-control"
+        ]
+        self.assertGreaterEqual(len(controls), 4)
+        self.assertGreaterEqual({len(case["files"]) for case in controls}, {1, 2})
+        self.assertGreaterEqual({case["scope"] for case in controls}, {"narrow", "cross-file"})
+        self.assertTrue(all(case["expected_findings"] == [] for case in controls))
 
     def test_replay_writes_related_files_to_one_case_directory(self) -> None:
-        manifest = replay.load_manifest()
-        case = replay.case_by_id(manifest, "03_cross_file_units")
-
+        case = replay.case_by_id(replay.load_manifest(), "10_aggregate_cache_fingerprint")
         with tempfile.TemporaryDirectory() as temporary_directory:
             destination = Path(temporary_directory)
-            written = replay.replay_case(
-                case,
-                destination=destination,
-                inter_file_delay=0,
-            )
-
-            self.assertEqual(
-                [path.name for path in written],
-                ["token_model.py", "token_service.py"],
-            )
-            self.assertTrue(all(path.is_file() for path in written))
-            expected_parent = destination.resolve() / case["id"]
-            self.assertTrue(all(path.parent == expected_parent for path in written))
-
+            written = replay.replay_case(case, destination=destination, inter_file_delay=0)
+            self.assertEqual([path.name for path in written], ["cache.py", "dashboard.py"])
+            self.assertTrue(all(path.parent == destination.resolve() / case["id"] for path in written))
             first_contents = [path.read_bytes() for path in written]
-            replayed = replay.replay_case(
-                case,
-                destination=destination,
-                inter_file_delay=0,
-            )
-            self.assertNotEqual(
-                first_contents,
-                [path.read_bytes() for path in replayed],
-            )
+            replayed = replay.replay_case(case, destination=destination, inter_file_delay=0)
+            self.assertNotEqual(first_contents, [path.read_bytes() for path in replayed])
 
-    def test_live_eval_scores_expected_finding_files_and_clean_control(self) -> None:
+    def test_sealed_empty_splits_are_selectable_without_exposing_fixtures(self) -> None:
         manifest = replay.load_manifest()
-        defect_case = replay.case_by_id(manifest, "03_cross_file_units")
-        clean_case = replay.case_by_id(manifest, "08_clean_related_change")
+        self.assertEqual(live_eval.select_cases(manifest, "temporal"), [])
+        self.assertEqual(live_eval.select_cases(manifest, "confirmation"), [])
 
-        defect_result = live_eval.score_response(
-            defect_case,
-            {"findings": [{"file": "03_cross_file_units/token_service.py"}]},
-        )
-        clean_result = live_eval.score_response(clean_case, {"findings": []})
-
-        self.assertTrue(defect_result.passed)
-        self.assertTrue(clean_result.passed)
-
-    def test_live_eval_rejects_missing_or_extra_finding_files(self) -> None:
-        case = replay.case_by_id(replay.load_manifest(), "03_cross_file_units")
-
-        missing = live_eval.score_response(case, {"findings": []})
-        extra = live_eval.score_response(
-            case,
-            {
-                "findings": [
-                    {"file": "token_service.py"},
-                    {"file": "token_model.py"},
-                ]
-            },
-        )
-
-        self.assertFalse(missing.passed)
-        self.assertFalse(extra.passed)
-
-    def test_live_eval_records_model_prompt_and_fixture_revision(self) -> None:
+    def test_live_configuration_records_exact_model_options_prompt_schema_and_fixture(self) -> None:
         manifest = replay.load_manifest()
         cases = manifest["cases"][:2]
-
-        provenance = live_eval.evaluation_provenance(
-            model="test-model",
-            prompt="frozen prompt",
-            fixture_revision=manifest["version"],
-            cases=cases,
+        configuration = live_eval.evaluation_configuration(
+            model="test-model", reasoning_effort="high", prompt="frozen prompt",
+            fixture_revision=manifest["version"], cases=cases,
         )
-
-        self.assertEqual(provenance["model"], "test-model")
+        self.assertEqual(configuration["model"], "test-model")
+        self.assertEqual(configuration["model_options"], {"reasoning_effort": "high"})
+        self.assertEqual(configuration["prompt"]["text"], "frozen prompt")
         self.assertEqual(
-            provenance["prompt_sha256"],
+            configuration["prompt"]["sha256"],
             hashlib.sha256(b"frozen prompt").hexdigest(),
         )
-        self.assertEqual(provenance["fixture_revision"], manifest["version"])
-        self.assertEqual(
-            provenance["case_ids"],
-            [case["id"] for case in cases],
+        self.assertEqual(configuration["prompt"]["revision"], watch_files.PROMPT_REVISION)
+        self.assertEqual(configuration["schema"]["value"], watch_files.REVIEW_SCHEMA)
+        self.assertEqual(configuration["schema"]["revision"], watch_files.REVIEW_SCHEMA_REVISION)
+        self.assertEqual(configuration["fixture"]["revision"], 2)
+        self.assertEqual(configuration["fixture"]["case_ids"], [case["id"] for case in cases])
+
+    def test_wait_for_outcome_retains_raw_schema_valid_response_and_latency(self) -> None:
+        output: queue.Queue[str] = queue.Queue()
+        response = {"findings": [provider_finding("service.py", "Concrete failure path.")]}
+        raw_response = json.dumps(response) + "\n"
+        output.put("Reviewing 1 changed file(s): service.py\n")
+        output.put(json.dumps({"quodet_evaluation_event": {
+            "status": "success", "returncode": 0,
+            "raw_response": raw_response, "stderr": "",
+        }}) + "\n")
+        outcome = live_eval.wait_for_outcome(output, timeout=1)
+        self.assertEqual(outcome.status, "schema-valid")
+        self.assertEqual(outcome.raw_response, raw_response)
+        self.assertEqual(outcome.parsed_response, response)
+        self.assertGreaterEqual(outcome.latency_ms, 0)
+
+    def test_filename_match_is_diagnostic_not_true_positive(self) -> None:
+        case = replay.case_by_id(replay.load_manifest(), "12_semantically_invalid_external_value")
+        provider = live_eval.ProviderOutcome(
+            status="schema-valid", latency_ms=12, transcript="", raw_response="{}",
+            parsed_response={"findings": [provider_finding("provider.py", "Wrong diagnosis")]},
+            error=None,
         )
+        outcome = live_eval.case_outcome(case, provider)
+        self.assertTrue(outcome["diagnostics"]["filename_match"])
+
+        run = raw_run([outcome])
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 2,
+            "cases": {case["id"]: {"findings": [{
+                "finding_index": 0, "verdict": "false-positive",
+                "expected_finding_id": None, "rationale": "Right file, wrong failure path",
+            }]}},
+        }
+        metrics = scoring.score_run(run, adjudication)
+        self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (0, 1, 1))
+
+    def test_adjudicated_metrics_include_splits_families_schema_and_control_rate(self) -> None:
+        defect = {
+            "case_id": "defect", "evaluation_split": "holdout",
+            "failure_families": ["external API contract"],
+            "expected_finding_ids": ["expected-1"], "status": "schema-valid",
+            "parsed_response": {"findings": [provider_finding("a.py", "Correct path")]},
+        }
+        clean = {
+            "case_id": "clean", "evaluation_split": "clean-control",
+            "failure_families": ["external API contract"],
+            "expected_finding_ids": [], "status": "schema-valid",
+            "parsed_response": {"findings": [provider_finding("b.py", "False alarm")]},
+        }
+        run = raw_run([defect, clean])
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 2,
+            "cases": {
+                "defect": {"findings": [{
+                    "finding_index": 0, "verdict": "true-positive",
+                    "expected_finding_id": "expected-1", "rationale": "Matches behavior",
+                }]},
+                "clean": {"findings": [{
+                    "finding_index": 0, "verdict": "false-positive",
+                    "expected_finding_id": None, "rationale": "Control is correct",
+                }]},
+            },
+        }
+        metrics = scoring.score_run(run, adjudication)
+        self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (1, 1, 0))
+        self.assertEqual(metrics["schema_valid_rate"], 1.0)
+        self.assertEqual(metrics["by_split"]["holdout"]["tp"], 1)
+        self.assertEqual(metrics["by_split"]["temporal"], {"tp": 0, "fp": 0, "fn": 0})
+        self.assertEqual(
+            metrics["clean_control_false_positive_rate_by_family"]["external API contract"],
+            1.0,
+        )
+
+    def test_schema_failure_counts_expected_findings_as_misses(self) -> None:
+        failed = {
+            "case_id": "failed", "evaluation_split": "calibration",
+            "failure_families": ["state/lifecycle"],
+            "expected_finding_ids": ["one", "two"], "status": "schema-error",
+            "parsed_response": None,
+        }
+        run = raw_run([failed])
+        adjudication = {"run_id": "run-1", "fixture_revision": 2, "cases": {}}
+        metrics = scoring.score_run(run, adjudication)
+        self.assertEqual(metrics["schema_valid_rate"], 0.0)
+        self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (0, 0, 2))
+
+    def test_adjudication_template_does_not_guess_semantic_matches(self) -> None:
+        case = {
+            "case_id": "case", "evaluation_split": "holdout",
+            "failure_families": ["state/lifecycle"], "expected_finding_ids": ["expected"],
+            "status": "schema-valid",
+            "parsed_response": {"findings": [provider_finding("a.py", "Maybe")]},
+        }
+        template = scoring.adjudication_template(raw_run([case]))
+        entry = template["cases"]["case"]["findings"][0]
+        self.assertEqual(entry["verdict"], "REPLACE_ME")
+        self.assertIsNone(entry["expected_finding_id"])
 
 
 if __name__ == "__main__":

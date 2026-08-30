@@ -120,11 +120,20 @@ so dependency installation churn cannot trigger or delay a review batch.
 
 ## Agent-change evaluation
 
-The evaluation corpus under `evals/agent_changes` models coding-agent changes
-from obvious single-file mistakes through subtle multi-file authorization,
-concurrency, cleanup, unit-contract, and deduplication defects. Each scenario
-declares its expected findings, and related source/test files are replayed
-within the three-second quiet window:
+The frozen synthetic corpus under `evals/agent_changes` models coding-agent
+changes from obvious single-file mistakes through subtle lifecycle, external
+contract, authorization, concurrency, cache, tooling, atomicity, and cost
+failures. [The coverage map](evals/agent_changes/COVERAGE.md) records how every
+case maps to those families, its scope, evidence depth, and evaluation split.
+
+The taxonomy comes from the independently verified public review corpus at
+`sagacious-heritage/cocos-story@6b98bae67bae4056c4567187454e24cca78b9467`.
+Only its 12 primary calibration answers influenced answer-bearing fixture
+design. Holdout, temporal, clean-control, and confirmation answers remain
+sealed. Quodet contains repository-neutral synthetic scenarios, not Cocos Story
+application code, identifiers, secrets, or sealed answer text.
+
+Related source and test files are replayed within the three-second quiet window:
 
 ```sh
 uv run quodet prompt_eval_workspace/agent_replay --log
@@ -136,13 +145,51 @@ instead of a case ID to replay every scenario sequentially.
 Add `--poll` when running across a container, sandbox, network mount, or another
 environment where native filesystem events do not cross process boundaries.
 
-For a scored live run, start the watcher and replay in one process tree. This
-avoids cross-sandbox event delivery problems and checks the returned finding
-files against the manifest, including the clean control:
+For prompt development, run only the calibration split:
 
 ```sh
-uv run python -m evals.agent_changes.live_eval all --log
+uv run python -m evals.agent_changes.live_eval calibration --log
 ```
+
+Freeze the prompt and fixture revision before a one-shot evaluation. Then run
+the pre-existing holdout and matched clean controls without iterating on their
+answers:
+
+```sh
+uv run python -m evals.agent_changes.live_eval holdout --log
+uv run python -m evals.agent_changes.live_eval clean-control --log
+```
+
+`temporal` and `confirmation` are explicit reserved/sealed boundaries with no
+answer-bearing fixtures in this repository. Do not convert their source answers
+into fixtures after seeing results. A full `all` run is useful for a frozen
+comparison, but it is not permission to tune against non-calibration cases.
+
+The live runner starts the watcher and replay in one process tree to avoid
+cross-sandbox event delivery problems. Every raw artifact under the ignored
+`eval-results/` directory retains the exact model and options, complete prompt
+and schema with revisions and hashes, fixture revision and manifest hash, raw
+provider response, parsed response, transcript, schema/provider/timeout state,
+and per-case latency. Malformed output and timeouts remain failed samples; the
+runner neither repairs them nor silently substitutes an unrecorded retry.
+
+Raw findings require independent semantic adjudication. Generate a template,
+judge every finding's explanation and demonstrated failure path, then score it:
+
+```sh
+uv run python -m evals.agent_changes.scoring \
+  eval-results/RUN.raw.json --write-template /tmp/RUN.adjudication.json
+# Edit every REPLACE_ME verdict and explain the rationale.
+uv run python -m evals.agent_changes.scoring \
+  eval-results/RUN.raw.json \
+  --adjudication /tmp/RUN.adjudication.json \
+  --output eval-results/RUN.scored.json
+```
+
+The scored report includes TP, FP, FN, schema-valid rate, split and family
+breakdowns, and clean-control false-positive rate by family. Filename equality
+is diagnostic only: a finding on the expected file with the wrong explanation
+is an FP and leaves the expected defect as an FN.
 
 The watcher sees changes made by every process, not only a coding agent. Add
 generated output paths with `--exclude` to prevent noisy reviews or feedback
@@ -154,8 +201,8 @@ a complete expected finding, and the code-element, failure-path, and validation
 characteristics its recommendation must contain. Unit tests check this fixture
 deterministically without contacting a provider. Live-model runs remain an
 explicit, separate evaluation through `evals.agent_changes.live_eval`, which
-records the selected model, a SHA-256 digest of the prompt, the fixture revision,
-and the evaluated case IDs in its output.
+records exact run provenance and raw outcomes. Normal unit tests are
+deterministic and never contact a provider.
 
 ## Privacy
 
