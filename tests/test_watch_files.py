@@ -595,8 +595,16 @@ class WatchFilesTests(unittest.TestCase):
                     "output_exceeded": False,
                 },
             )()
-            with mock.patch("watch_files.run_bounded_command", return_value=malformed):
+            rejection = io.StringIO()
+            with (
+                mock.patch("watch_files.run_bounded_command", return_value=malformed),
+                contextlib.redirect_stderr(rejection),
+            ):
                 self.assertIsNone(watch_files.review_files(**common))
+            self.assertIn("Review discarded", rejection.getvalue())
+            self.assertIn(
+                "no console or agent feedback was published", rejection.getvalue()
+            )
 
             failed = type(
                 "Result",

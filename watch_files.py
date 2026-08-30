@@ -1067,7 +1067,11 @@ def _execute_review_command(
             provider_completed_at=provider_completed_at,
         )
     except ReviewValidationError as error:
-        print(f"Rejected invalid llm response: {error}", file=sys.stderr)
+        print(
+            f"Rejected invalid llm response: {error}. "
+            "Review discarded; no console or agent feedback was published.",
+            file=sys.stderr,
+        )
         return None
 
     fresh_batch = fresh_findings(batch)
