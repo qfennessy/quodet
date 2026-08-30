@@ -612,10 +612,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     for name in ("debounce", "review_timeout", "settle"):
-        if getattr(args, name) <= 0:
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be greater than zero")
-    if args.inter_file_delay < 0:
-        parser.error("--inter-file-delay cannot be negative")
+    if not math.isfinite(args.inter_file_delay) or args.inter_file_delay < 0:
+        parser.error("--inter-file-delay must be finite and non-negative")
     if args.attempts < 1:
         parser.error("--attempts must be at least one")
     return args

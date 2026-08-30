@@ -518,6 +518,34 @@ class AgentChangeReplayTests(unittest.TestCase):
         runtime_attestation.assert_not_called()
         watcher.assert_not_called()
 
+    def test_non_finite_runner_values_fail_before_runtime_work(self) -> None:
+        invalid_values = (
+            ("--debounce", "nan"),
+            ("--debounce", "inf"),
+            ("--review-timeout", "nan"),
+            ("--settle", "inf"),
+            ("--inter-file-delay", "nan"),
+            ("--inter-file-delay", "inf"),
+        )
+        for option, value in invalid_values:
+            with (
+                self.subTest(option=option, value=value),
+                mock.patch(
+                    "evals.agent_changes.live_eval.benchmark_cost_preflight"
+                ) as cost_preflight,
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime"
+                ) as runtime_attestation,
+                mock.patch(
+                    "evals.agent_changes.live_eval.subprocess.Popen"
+                ) as watcher,
+                self.assertRaises(SystemExit),
+            ):
+                live_eval.main(["challenge-development", option, value])
+            cost_preflight.assert_not_called()
+            runtime_attestation.assert_not_called()
+            watcher.assert_not_called()
+
     def test_ordinary_benchmark_plan_cannot_authorize_challenge_bytes(self) -> None:
         plan = plan_with_approved_qwen_artifact()
         config = approved_qwen_config(plan)
