@@ -206,6 +206,11 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         for recommendation in (
             "Update API_SPEC to require tenant_id.",
             "Change request_spec to include tenant_id.",
+            "Update API_SPEC to require tenant_id without changing tests.",
+            (
+                "Update API_SPEC to require tenant_id without changing "
+                "missing_spec in the RSpec suite."
+            ),
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
@@ -245,6 +250,7 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
             "Edit missing_spec in the spec suite to assert the boundary.",
             "Extend missing_spec in the spec folder with a boundary assertion.",
             "Edit missing_spec in the specs directory to assert the boundary.",
+            "Edit missing_spec in specs/ to assert the boundary.",
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
