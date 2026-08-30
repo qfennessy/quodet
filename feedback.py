@@ -17,7 +17,9 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Protocol, Sequence
+from typing import Protocol, Sequence, TextIO
+
+from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_review
 
 try:
     import fcntl
@@ -281,10 +283,23 @@ def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
 
 
 class ConsoleSink:
-    """Preserve the historical JSON result printed in the terminal."""
+    """Render validated results for a person or a machine on stdout."""
+
+    def __init__(
+        self,
+        *,
+        mode: str = DEFAULT_OUTPUT_MODE,
+        stream: TextIO | None = None,
+    ) -> None:
+        if mode not in OUTPUT_MODES:
+            raise ValueError(f"unsupported output mode: {mode}")
+        self.mode = mode
+        self.stream = stream
 
     def publish(self, batch: ReviewBatch) -> bool:
-        print(json.dumps({"findings": [asdict(item) for item in batch.findings]}, indent=2))
+        import sys
+
+        print(render_review(batch, self.mode), file=self.stream or sys.stdout)
         return True
 
 

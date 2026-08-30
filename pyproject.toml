@@ -21,6 +21,7 @@ quodet-agent = "agent_integration:main"
 py-modules = [
     "watch_files",
     "feedback",
+    "review_output",
     "codex_feedback_hook",
     "agent_integration",
     "model_runner",
