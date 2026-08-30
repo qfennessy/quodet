@@ -561,6 +561,50 @@ class AgentIntegrationTests(unittest.TestCase):
                 reviewed_files=self._batch(route).reviewed_files,
             )
 
+    def test_malformed_hint_metadata_is_pruned_before_valid_hint(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        hints = self.spool / "flush-hints"
+        now = time.time()
+        malformed_paths: list[Path] = []
+        for index, reviewed_files in enumerate((None, 7)):
+            path = hints / f"000-malformed-{index}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "root": os.fspath(self.root),
+                        "session_id": route.session_id,
+                        "agent_session_id": "live-agent-session",
+                        "created_at": now,
+                        "expires_at": now + 60,
+                        "reviewed_files": reviewed_files,
+                    }
+                )
+            )
+            os.utime(path, (now - 10, now - 10))
+            malformed_paths.append(path)
+        valid_path = publish_flush_hint(
+            self.spool,
+            root=self.root,
+            session_id=route.session_id,
+            agent_session_id="live-agent-session",
+            reviewed_files=self._batch(route).reviewed_files,
+        )
+
+        hint = sink.consume_flush_hint()
+
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint.path, valid_path)  # type: ignore[union-attr]
+        self.assertTrue(all(not path.exists() for path in malformed_paths))
+
     def test_completed_review_retires_late_digest_matched_hint(self) -> None:
         route, _ = self._route()
         codex_feedback_hook.verify_session_lease(

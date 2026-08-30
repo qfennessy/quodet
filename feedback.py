@@ -513,39 +513,44 @@ def consume_flush_hint(
         created_at = value["created_at"]
         expires_at = value["expires_at"]
         raw_reviewed_files = value["reviewed_files"]
+        if (
+            not isinstance(raw_reviewed_files, list)
+            or not 0 < len(raw_reviewed_files) <= MAX_REVIEWED_FILES
+        ):
+            path.unlink(missing_ok=True)
+            continue
         reviewed_files: list[ReviewedFile] = []
-        if isinstance(raw_reviewed_files, list) and len(raw_reviewed_files) <= MAX_REVIEWED_FILES:
-            for item in raw_reviewed_files:
-                if (
-                    not isinstance(item, dict)
-                    or set(item) != {"path", "sha256", "size"}
-                    or not isinstance(item["path"], str)
-                    or not isinstance(item["sha256"], str)
-                    or isinstance(item["size"], bool)
-                    or not isinstance(item["size"], int)
-                ):
-                    reviewed_files = []
-                    break
-                try:
-                    normalized_path = _normalize_finding_path(
-                        item["path"], root.resolve(), {item["path"]}
-                    )
-                except ReviewValidationError:
-                    reviewed_files = []
-                    break
-                if (
-                    len(item["sha256"]) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in item["sha256"]
-                    )
-                    or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
-                ):
-                    reviewed_files = []
-                    break
-                reviewed_files.append(
-                    ReviewedFile(normalized_path, item["sha256"], item["size"])
+        for item in raw_reviewed_files:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"path", "sha256", "size"}
+                or not isinstance(item["path"], str)
+                or not isinstance(item["sha256"], str)
+                or isinstance(item["size"], bool)
+                or not isinstance(item["size"], int)
+            ):
+                reviewed_files = []
+                break
+            try:
+                normalized_path = _normalize_finding_path(
+                    item["path"], root.resolve(), {item["path"]}
                 )
+            except ReviewValidationError:
+                reviewed_files = []
+                break
+            if (
+                len(item["sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in item["sha256"]
+                )
+                or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
+            ):
+                reviewed_files = []
+                break
+            reviewed_files.append(
+                ReviewedFile(normalized_path, item["sha256"], item["size"])
+            )
         valid = (
             value["version"] == 1
             and value["root"] == expected_root
