@@ -33,6 +33,7 @@ from feedback import (
     validate_spooled_payload,
     write_session_state,
 )
+from redaction import redact_path, redact_text
 
 
 MAX_DELIVERY_FINDINGS = 10
@@ -72,6 +73,10 @@ def _hint_reviewed_files(
             path = canonical_root / path
         try:
             relative = path.resolve(strict=False).relative_to(canonical_root)
+            if redact_path(relative).total:
+                # This hint is retained before attachment sanitization runs.
+                # Omit secret-bearing paths instead of persisting the filename.
+                continue
             raw = read_bounded_beneath_root(
                 canonical_root, relative, max_bytes=MAX_HINT_FILE_BYTES
             )
@@ -79,9 +84,15 @@ def _hint_reviewed_files(
             continue
         if len(raw) > MAX_HINT_FILE_BYTES:
             continue
+        try:
+            sanitized = redact_text(raw.decode("utf-8")).text.encode()
+        except UnicodeDecodeError:
+            continue
         reviewed.append(
             ReviewedFile(
-                relative.as_posix(), hashlib.sha256(raw).hexdigest(), len(raw)
+                relative.as_posix(),
+                hashlib.sha256(sanitized).hexdigest(),
+                MAX_HINT_FILE_BYTES,
             )
         )
         if len(reviewed) == 100:

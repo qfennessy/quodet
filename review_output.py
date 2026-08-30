@@ -46,6 +46,21 @@ class ReviewBatchLike(Protocol):
     provider_started_at: float
     provider_completed_at: float
     published_at: float
+    redactions: RedactionSummaryLike
+
+
+class RedactionNoticeLike(Protocol):
+    file: str | None
+    line: int | None
+    category: str
+    masked_identifier: str | None
+    disposition: str
+
+
+class RedactionSummaryLike(Protocol):
+    total: int
+    notices: Sequence[RedactionNoticeLike]
+    omitted: int
 
 
 def _reviewed_file_document(reviewed: ReviewedFileLike) -> dict[str, object]:
@@ -65,6 +80,23 @@ def _finding_document(finding: ReviewFindingLike) -> dict[str, object]:
         "title": finding.title,
         "explanation": finding.explanation,
         "suggested_fix": finding.suggested_fix,
+    }
+
+
+def _redaction_document(summary: RedactionSummaryLike) -> dict[str, object]:
+    return {
+        "total": summary.total,
+        "notices": [
+            {
+                "file": notice.file,
+                "line": notice.line,
+                "category": notice.category,
+                "masked_identifier": notice.masked_identifier,
+                "disposition": notice.disposition,
+            }
+            for notice in summary.notices
+        ],
+        "omitted": summary.omitted,
     }
 
 
@@ -96,6 +128,7 @@ def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
             "provider_ms": batch.provider_ms,
             "published_at": batch.published_at,
         },
+        "redactions": _redaction_document(batch.redactions),
     }
 
 
@@ -129,16 +162,37 @@ def _count(value: int, singular: str, plural: str | None = None) -> str:
     return f"{value} {singular if value == 1 else plural or singular + 's'}"
 
 
+def render_redaction_summary(summary: RedactionSummaryLike) -> str:
+    """Render only bounded, value-free redaction hints."""
+    if not summary.total:
+        return ""
+    noun = "potential secret" if summary.total == 1 else "potential secrets"
+    lines = [f"Redacted {summary.total} {noun} before provider upload:"]
+    for notice in summary.notices:
+        if notice.file is None:
+            location = "review prompt"
+        else:
+            location = _terminal_text(notice.file, maximum=1_024)
+        if notice.line is not None:
+            location += f":{notice.line}"
+        category = notice.category.replace("-", " ")
+        identifier = f" {notice.masked_identifier}" if notice.masked_identifier else ""
+        disposition = "sent sanitized" if notice.disposition == "sent" else "excluded"
+        lines.append(f"  {location} {category}{identifier} ({disposition})")
+    if summary.omitted:
+        lines.append(f"  … and {summary.omitted} more")
+    return "\n".join(lines)
+
+
 def render_human_review(batch: ReviewBatchLike) -> str:
     """Render a compact deterministic summary for a person watching a terminal."""
     reviewed = _count(len(batch.reviewed_files), "file")
     finding_count = len(batch.findings)
-    if finding_count == 0:
-        return f"Quodet reviewed {reviewed}: no confident findings"
-
-    heading = (
-        f"Quodet reviewed {reviewed}: "
-        f"{_count(finding_count, 'likely defect')}"
+    heading = f"Quodet reviewed {reviewed}: "
+    heading += (
+        _count(finding_count, "likely defect")
+        if finding_count
+        else "no confident findings"
     )
     lines = [heading]
     for finding in batch.findings:
@@ -158,6 +212,9 @@ def render_human_review(batch: ReviewBatchLike) -> str:
                 f"  Suggested action: {suggested_fix}",
             ]
         )
+    redactions = batch.redactions
+    if redactions.total:
+        lines.append(render_redaction_summary(redactions))
     return "\n".join(lines)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -489,12 +490,12 @@ class WatchFilesTests(unittest.TestCase):
     def test_review_sends_only_sanitized_temporary_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
-            filename_secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
-            source = root / f"{filename_secret}.env"
+            source = root / "source.env"
             secret = "aB3dE5gH7jK9mN2pQ4sT6vW8yZ1cF0iL"
             source.write_text(f"API_KEY={secret}\nname=safe\n")
             observed_path: Path | None = None
             prompt_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+            terminal = io.StringIO()
 
             def fake_run(command: list[str], **_: object) -> object:
                 nonlocal observed_path
@@ -507,13 +508,12 @@ class WatchFilesTests(unittest.TestCase):
                 self.assertTrue(observed_path.is_file())
                 uploaded = observed_path.read_text()
                 self.assertNotIn(secret, uploaded)
-                self.assertNotIn(filename_secret, uploaded)
                 self.assertIn(watch_files.REDACTED, uploaded)
                 self.assertFalse(
                     any(
                         secret_value in argument
                         for argument in command
-                        for secret_value in (filename_secret, prompt_secret)
+                        for secret_value in (secret, prompt_secret)
                     )
                 )
                 return type(
@@ -538,10 +538,139 @@ class WatchFilesTests(unittest.TestCase):
                     log=False,
                     review_timeout=60,
                     reasoning_effort="high",
+                    sink=watch_files.ConsoleSink(mode="json", stream=terminal),
                 )
 
             self.assertIsNotNone(observed_path)
             self.assertFalse(observed_path.exists())
+            rendered = terminal.getvalue()
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(prompt_secret, rendered)
+            redactions = json.loads(rendered)["redactions"]
+            self.assertEqual(redactions["total"], 2)
+            self.assertEqual(
+                {notice["disposition"] for notice in redactions["notices"]},
+                {"sent"},
+            )
+
+    def test_sensitive_filename_is_excluded_without_retaining_its_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            filename_secret = "ghp_" + "a1B2" * 8
+            source = root / f"{filename_secret}.env"
+            source.write_text("name=safe\n", encoding="utf-8")
+            sink = mock.Mock()
+            sink.publish.return_value = True
+
+            with mock.patch("watch_files.run_bounded_command") as provider:
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="gpt-5.6-luna",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort="high",
+                    sink=sink,
+                )
+
+            provider.assert_not_called()
+            self.assertIsNotNone(batch)
+            assert batch is not None
+            self.assertEqual(batch.reviewed_files, ())
+            self.assertEqual(batch.redactions.total, 1)
+            self.assertEqual(batch.redactions.notices[0].disposition, "excluded")
+            retained = json.dumps(batch.to_dict())
+            self.assertNotIn(filename_secret, retained)
+            self.assertNotIn(filename_secret[:10], retained)
+
+    def test_retained_freshness_digest_uses_only_sanitized_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            first_secret = "ghp_" + "a1B2" * 8
+            second_secret = "ghp_" + "c3D4" * 8
+            source.write_text(f"API_KEY={first_secret}\n", encoding="utf-8")
+            max_bytes = 2_000_000
+            attachments = watch_files.collect_attachments(
+                [source], root=root, exclude_patterns=[], max_bytes=max_bytes
+            )
+
+            snapshot = watch_files.snapshot_attachments(
+                attachments, root=root, max_bytes=max_bytes
+            )[0]
+
+            raw_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            self.assertNotEqual(snapshot.sha256, raw_digest)
+            self.assertEqual(snapshot.size, max_bytes)
+            source.write_text(f"API_KEY={second_secret}\n", encoding="utf-8")
+            reviewed = (
+                watch_files.ReviewedFile(
+                    path="app.py", sha256=snapshot.sha256, size=snapshot.size
+                ),
+            )
+            batch = watch_files.parse_review_output(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "file": "app.py",
+                                "line": 1,
+                                "severity": "medium",
+                                "confidence": 0.99,
+                                "title": "Synthetic finding",
+                                "explanation": "Synthetic evidence.",
+                                "suggested_fix": "Use a synthetic replacement and test it.",
+                            }
+                        ]
+                    }
+                ),
+                root=root,
+                reviewed_files=reviewed,
+            )
+            self.assertEqual(len(watch_files.fresh_findings(batch).findings), 1)
+
+    def test_failed_review_still_reports_only_safe_redaction_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            secret = "ghp_" + "a1B2" * 8
+            source.write_text(f"OPENAI_API_KEY={secret}\n", encoding="utf-8")
+            failure = type(
+                "Result",
+                (),
+                {
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": "synthetic provider failure",
+                    "output_exceeded": False,
+                },
+            )()
+            errors = io.StringIO()
+
+            with (
+                mock.patch("watch_files.run_bounded_command", return_value=failure),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="gpt-5.6-luna",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort="high",
+                )
+
+            self.assertIsNone(result)
+            diagnostic = errors.getvalue()
+            self.assertIn("app.py:1 assignment key OPEN…KEY", diagnostic)
+            self.assertNotIn(secret, diagnostic)
+            self.assertNotIn(secret[:10], diagnostic)
 
     def test_evaluation_event_preserves_provider_streams_and_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

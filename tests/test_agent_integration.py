@@ -708,8 +708,43 @@ class AgentIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(reviewed), 1)
         self.assertEqual(reviewed[0].path, "src/app.py")
-        self.assertEqual(reviewed[0].size, self.source.stat().st_size)
+        self.assertEqual(reviewed[0].size, codex_feedback_hook.MAX_HINT_FILE_BYTES)
         self.assertEqual(len(reviewed[0].sha256), 64)
+
+    def test_direct_edit_hook_never_hashes_detected_secret_values(self) -> None:
+        first_secret = "ghp_" + "a1B2" * 8
+        second_secret = "ghp_" + "c3D4" * 8
+        event = {
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": "*** Begin Patch\n*** Update File: src/app.py\n"
+            },
+        }
+        self.source.write_text(f"API_KEY={first_secret}\n", encoding="utf-8")
+        first = codex_feedback_hook._hint_reviewed_files(event, root=self.root)
+        raw_digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
+
+        self.source.write_text(f"API_KEY={second_secret}\n", encoding="utf-8")
+        second = codex_feedback_hook._hint_reviewed_files(event, root=self.root)
+
+        self.assertEqual(first[0].sha256, second[0].sha256)
+        self.assertNotEqual(first[0].sha256, raw_digest)
+        self.assertNotIn(first_secret[:10], json.dumps(first[0].__dict__))
+
+    def test_direct_edit_hook_excludes_sensitive_filename_from_hint(self) -> None:
+        filename_secret = "ghp_" + "a1B2" * 8
+        source = self.root / "src" / f"{filename_secret}.env"
+        source.write_text("name=safe\n", encoding="utf-8")
+
+        reviewed = codex_feedback_hook._hint_reviewed_files(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": os.fspath(source)},
+            },
+            root=self.root,
+        )
+
+        self.assertEqual(reviewed, ())
 
     def test_wrong_session_flush_hint_is_rejected(self) -> None:
         route, _ = self._route()

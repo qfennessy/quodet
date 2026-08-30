@@ -31,6 +31,7 @@ from feedback import (
     ReviewValidationError,
     ReviewedFile,
     SpoolSink,
+    _sha256_inside_root,
     fresh_findings,
     parse_review_output,
     read_bounded_beneath_root,
@@ -43,7 +44,14 @@ from model_runner import (
     model_run_config_sha256,
     run_model,
 )
-from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES
+from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_redaction_summary
+from redaction import (
+    REDACTED,
+    RedactionSummary,
+    RedactionSummaryBuilder,
+    redact_path,
+    redact_text,
+)
 
 try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -153,7 +161,6 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 REVIEW_SCHEMA_JSON = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
-REDACTED = "[REDACTED]"
 DEFAULT_IGNORED_PARTS = frozenset(
     {
         ".git",
@@ -188,46 +195,6 @@ DEFAULT_IGNORED_PART_SEQUENCES = (
     ("vendor", "bundle"),
     ("vendor", "cache"),
 )
-PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----.*?"
-    r"-----END (?P=label)-----",
-    re.DOTALL,
-)
-SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?(?:"
-    r"api[_-]?key|secret(?:[_-]?key)?|access[_-]?key|private[_-]?key|"
-    r"client[_-]?secret|signing[_-]?key|encryption[_-]?key|"
-    r"auth(?:entication)?[_-]?token|access[_-]?token|refresh[_-]?token|"
-    r"token|password|passwd|credential(?:s)?|connection[_-]?string|database[_-]?url"
-    r")[\"']?\s*(?:=|:)\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;#}\]}]+)"
-)
-AUTHORIZATION_RE = re.compile(
-    r"(?i)(?P<prefix>\bauthorization\b\s*(?::|=)\s*[\"']?"
-    r"(?:bearer|basic)\s+)(?P<value>[^\s\"',;]+)"
-)
-URL_CREDENTIAL_RE = re.compile(
-    r"(?i)(?P<prefix>\b[a-z][a-z0-9+.-]*://[^:/\s]+:)(?P<value>[^@\s/]+)(?=@)"
-)
-QUERY_SECRET_RE = re.compile(
-    r"(?i)(?P<prefix>[?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|"
-    r"client[_-]?secret|password|secret)=)(?P<value>[^&#\s]+)"
-)
-KNOWN_SECRET_PATTERNS = (
-    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9])"),
-    re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
-    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"),
-    re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9])"),
-    re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(
-        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\."
-        r"[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
-    ),
-)
-HIGH_ENTROPY_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])"
-)
 CONFIG_SECRET_FIELD_RE = re.compile(
     r"(?i)(?:^|[_-])(?:"
     r"api[_-]?key|secret(?:[_-]?key)?|access[_-]?key|private[_-]?key|"
@@ -237,8 +204,6 @@ CONFIG_SECRET_FIELD_RE = re.compile(
     r")(?:$|[_-])"
 )
 LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
-
-
 @dataclass(frozen=True)
 class Attachment:
     path: Path
@@ -252,6 +217,13 @@ class SourceSnapshot:
     contents: str
     sha256: str
     size: int
+
+
+@dataclass(frozen=True)
+class SanitizedBatch:
+    attachments: tuple[Attachment, ...]
+    snapshots: tuple[SourceSnapshot, ...]
+    redactions: RedactionSummary
 
 
 @dataclass(frozen=True)
@@ -511,69 +483,20 @@ def is_utf8_text(root: Path, relative_path: Path, *, max_bytes: int) -> bool:
     return "\x00" not in contents
 
 
-def _redact_match_value(match: re.Match[str]) -> str:
-    value = match.group("value")
-    if value.startswith(('"', "'")) and value.endswith(value[0]):
-        replacement = f"{value[0]}{REDACTED}{value[0]}"
-    else:
-        replacement = REDACTED
-    return f"{match.group('prefix')}{replacement}"
-
-
-def _entropy(value: str) -> float:
-    frequencies = {character: value.count(
-        character) for character in set(value)}
-    return -sum(
-        (count / len(value)) * math.log2(count / len(value))
-        for count in frequencies.values()
-    )
-
-
-def _looks_like_high_entropy_secret(value: str) -> bool:
-    character_classes = sum(
-        bool(re.search(pattern, value))
-        for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[_+/=-]")
-    )
-    return character_classes >= 2 and _entropy(value) >= 3.5
-
-
 def redact_sensitive_values(text: str) -> tuple[str, int]:
     """Redact likely credentials, returning sanitized text and replacement count."""
-    redacted, count = PRIVATE_KEY_BLOCK_RE.subn("[REDACTED PRIVATE KEY]", text)
-
-    for pattern in (
-        SENSITIVE_ASSIGNMENT_RE,
-        AUTHORIZATION_RE,
-        URL_CREDENTIAL_RE,
-        QUERY_SECRET_RE,
-    ):
-        redacted, replacements = pattern.subn(_redact_match_value, redacted)
-        count += replacements
-
-    for pattern in KNOWN_SECRET_PATTERNS:
-        redacted, replacements = pattern.subn(REDACTED, redacted)
-        count += replacements
-
-    def redact_high_entropy(match: re.Match[str]) -> str:
-        nonlocal count
-        value = match.group(0)
-        if not _looks_like_high_entropy_secret(value):
-            return value
-        count += 1
-        return REDACTED
-
-    return HIGH_ENTROPY_TOKEN_RE.sub(redact_high_entropy, redacted), count
+    redacted = redact_text(text)
+    return redacted.text, redacted.total
 
 
 def redact_sensitive_path(path: Path) -> tuple[str, int]:
     """Redact path components without treating separators as token characters."""
-    sanitized_parts: list[str] = []
-    total_redactions = 0
-    for part in path.parts:
-        sanitized, redaction_count = redact_sensitive_values(part)
-        sanitized_parts.append(sanitized)
-        total_redactions += redaction_count
-    return "/".join(sanitized_parts), total_redactions
+    redacted = redact_path(path)
+    return redacted.text, redacted.total
+
+
+def _safe_path_label(path: Path) -> str:
+    return redact_path(path).text
 
 
 def collect_attachments(
@@ -604,7 +527,7 @@ def collect_attachments(
 
         if size > max_bytes:
             print(
-                f"Skipping {relative_path}: {size} bytes exceeds --max-bytes {max_bytes}",
+                f"Skipping {_safe_path_label(relative_path)}: file exceeds --max-bytes",
                 file=sys.stderr,
             )
             continue
@@ -612,7 +535,7 @@ def collect_attachments(
         if not is_utf8_text(root, relative_path, max_bytes=max_bytes):
             print(
                 f"Skipping non-UTF-8 or unreadable file (cannot safely redact): "
-                f"{relative_path}",
+                f"{_safe_path_label(relative_path)}",
                 file=sys.stderr,
             )
             continue
@@ -641,14 +564,18 @@ def snapshot_attachments(
             )
             if len(source_bytes) > max_bytes:
                 print(
-                    f"Skipping {relative_path}: exact snapshot exceeds "
-                    f"--max-bytes {max_bytes}",
+                    f"Skipping {_safe_path_label(relative_path)}: exact snapshot "
+                    "exceeds --max-bytes",
                     file=sys.stderr,
                 )
                 continue
             contents = source_bytes.decode("utf-8")
         except (OSError, UnicodeDecodeError) as error:
-            print(f"Skipping {relative_path}: could not snapshot: {error}", file=sys.stderr)
+            print(
+                f"Skipping {_safe_path_label(relative_path)}: could not snapshot: "
+                f"{type(error).__name__}",
+                file=sys.stderr,
+            )
             continue
         if "\x00" in contents:
             continue
@@ -657,8 +584,10 @@ def snapshot_attachments(
                 path=attachment.path,
                 relative_path=relative_path,
                 contents=contents,
-                sha256=hashlib.sha256(source_bytes).hexdigest(),
-                size=len(source_bytes),
+                # The retained digest is computed only from provider-safe text.
+                # The read bound is the configured cap, not the exact source size.
+                sha256=hashlib.sha256(redact_text(contents).text.encode()).hexdigest(),
+                size=max_bytes,
             )
         )
     return snapshots
@@ -666,17 +595,37 @@ def snapshot_attachments(
 
 def sanitize_attachments(
     snapshots: Sequence[SourceSnapshot], *, destination: Path
-) -> tuple[list[Attachment], int]:
+) -> SanitizedBatch:
     """Create provider-safe copies; a source file is never used as an attachment."""
     sanitized_attachments: list[Attachment] = []
-    total_redactions = 0
+    sent_snapshots: list[SourceSnapshot] = []
+    summary = RedactionSummaryBuilder()
 
     for index, snapshot in enumerate(snapshots, start=1):
         relative_path = snapshot.relative_path
-        sanitized, redaction_count = redact_sensitive_values(snapshot.contents)
-        sanitized_relative_path, path_redactions = redact_sensitive_path(relative_path)
+        redacted_contents = redact_text(snapshot.contents)
+        redacted_path = redact_path(relative_path)
+        sanitized_relative_path = redacted_path.text
+
+        # A sensitive filename cannot be retained in a review batch for later
+        # freshness checks. Exclude it and report only its sanitized display path.
+        if redacted_path.total:
+            summary.add(
+                redacted_path,
+                file=sanitized_relative_path,
+                disposition="excluded",
+                line_available=False,
+            )
+            summary.add(
+                redacted_contents,
+                file=sanitized_relative_path,
+                disposition="excluded",
+            )
+            continue
+
         provider_contents = (
-            f"Original relative path: {sanitized_relative_path}\n\n{sanitized}"
+            f"Original relative path: {sanitized_relative_path}\n\n"
+            f"{redacted_contents.text}"
         )
         sanitized_path = destination / f"changed-file-{index:04d}.txt"
         try:
@@ -684,15 +633,32 @@ def sanitize_attachments(
             sanitized_path.chmod(0o600)
         except OSError as error:
             print(
-                f"Skipping {relative_path}: could not stage safely: {error}", file=sys.stderr)
+                f"Skipping {sanitized_relative_path}: could not stage safely: "
+                f"{type(error).__name__}",
+                file=sys.stderr,
+            )
+            summary.add(
+                redacted_contents,
+                file=sanitized_relative_path,
+                disposition="excluded",
+            )
             continue
 
-        total_redactions += redaction_count + path_redactions
+        summary.add(
+            redacted_contents,
+            file=sanitized_relative_path,
+            disposition="sent",
+        )
         sanitized_attachments.append(
             Attachment(path=sanitized_path, media_type="text/plain")
         )
+        sent_snapshots.append(snapshot)
 
-    return sanitized_attachments, total_redactions
+    return SanitizedBatch(
+        attachments=tuple(sanitized_attachments),
+        snapshots=tuple(sent_snapshots),
+        redactions=summary.build(),
+    )
 
 
 def build_llm_command(
@@ -725,6 +691,12 @@ def _subprocess_output_text(value: str | bytes | None) -> str | None:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _report_failed_review_redactions(summary: RedactionSummary) -> None:
+    rendered = render_redaction_summary(summary)
+    if rendered:
+        print(rendered, file=sys.stderr)
 
 
 def run_bounded_command(
@@ -832,33 +804,65 @@ def review_files(
     if not snapshots:
         return None
 
-    labels = [str(snapshot.relative_path) for snapshot in snapshots]
-    print(
-        f"\nReviewing {len(labels)} changed file(s): {', '.join(labels)}",
-        file=sys.stderr,
-        flush=True,
-    )
-
     with tempfile.TemporaryDirectory(prefix="quodet-sanitized-") as temporary_directory:
-        sanitized_attachments, redaction_count = sanitize_attachments(
+        sanitized_batch = sanitize_attachments(
             snapshots,
             destination=Path(temporary_directory),
         )
-        if not sanitized_attachments:
-            return None
-        sanitized_prompt, prompt_redactions = redact_sensitive_values(prompt)
-        redaction_count += prompt_redactions
-        if redaction_count:
-            print(
-                f"Redacted {redaction_count} potential secret(s) before provider upload.",
-                file=sys.stderr,
+        summary = RedactionSummaryBuilder()
+        summary.extend(sanitized_batch.redactions)
+        if not sanitized_batch.attachments:
+            redactions = summary.build()
+            if not redactions.total:
+                return None
+            batch = parse_review_output(
+                '{"findings":[]}',
+                root=root,
+                reviewed_files=(),
+                session_id=session_id,
+                feedback_round=feedback_round,
+                debounce_ms=debounce_ms,
+                provider_ms=0.0,
+                first_observed_at=first_observed_at,
+                redactions=redactions,
             )
+            (sink or ConsoleSink()).publish(batch)
+            if review_coordinator is not None:
+                review_coordinator.retire_reviewed_flush_hints(
+                    tuple(
+                        ReviewedFile(
+                            snapshot.relative_path.as_posix(),
+                            snapshot.sha256,
+                            snapshot.size,
+                        )
+                        for snapshot in snapshots
+                    )
+                )
+            return batch
+
+        labels = [
+            _safe_path_label(snapshot.relative_path)
+            for snapshot in sanitized_batch.snapshots
+        ]
+        print(
+            f"\nReviewing {len(labels)} changed file(s): {', '.join(labels)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        sanitized_prompt = redact_text(prompt)
+        summary.add(
+            sanitized_prompt,
+            file=None,
+            disposition="sent",
+        )
+        redactions = summary.build()
 
         command = (
             build_llm_command(
-                sanitized_attachments,
+                sanitized_batch.attachments,
                 model=model,
-                prompt=sanitized_prompt,
+                prompt=sanitized_prompt.text,
                 log=log,
                 reasoning_effort=reasoning_effort,
             )
@@ -878,7 +882,7 @@ def review_files(
         try:
             return _execute_review_command(
                 command,
-                snapshots=snapshots,
+                snapshots=sanitized_batch.snapshots,
                 root=root,
                 review_timeout=review_timeout,
                 evaluation_events=evaluation_events,
@@ -890,8 +894,9 @@ def review_files(
                 session_generation=session_generation,
                 batch_flushed_at=batch_flushed_at,
                 model_run_config=model_run_config,
-                sanitized_attachments=sanitized_attachments,
-                sanitized_prompt=sanitized_prompt,
+                sanitized_attachments=sanitized_batch.attachments,
+                sanitized_prompt=sanitized_prompt.text,
+                redactions=redactions,
                 log=log,
             )
         finally:
@@ -926,6 +931,7 @@ def _execute_review_command(
     model_run_config: ModelRunConfig | None,
     sanitized_attachments: Sequence[Attachment],
     sanitized_prompt: str,
+    redactions: RedactionSummary,
     log: bool,
 ) -> ReviewBatch | None:
     provider_started_at = time.time()
@@ -969,6 +975,7 @@ def _execute_review_command(
                 output_limit=MAX_PROVIDER_OUTPUT_BYTES,
             )
     except subprocess.TimeoutExpired as error:
+        _report_failed_review_redactions(redactions)
         if evaluation_events:
             safe_stdout, _ = redact_sensitive_values(
                 _subprocess_output_text(error.stdout) or ""
@@ -988,7 +995,10 @@ def _execute_review_command(
                 file=sys.stderr,
             )
         return None
+
     except (OSError, ValueError) as error:
+        _report_failed_review_redactions(redactions)
+
         if evaluation_events:
             safe_error, _ = redact_sensitive_values(str(error))
             print(json.dumps({"quodet_evaluation_event": {
@@ -1017,6 +1027,7 @@ def _execute_review_command(
         model_result_payload["stdout"] = safe_stdout
         model_result_payload["stderr"] = safe_stderr
         if model_result.status != "success":
+            _report_failed_review_redactions(redactions)
             if evaluation_events:
                 print(json.dumps({"quodet_evaluation_event": {
                     "status": model_result.status,
@@ -1031,6 +1042,7 @@ def _execute_review_command(
             return None
 
     if result.output_exceeded:
+        _report_failed_review_redactions(redactions)
         diagnostic = (
             f"Rejected llm response: output exceeded "
             f"{MAX_PROVIDER_OUTPUT_BYTES} bytes"
@@ -1057,6 +1069,7 @@ def _execute_review_command(
             "runtime_attestation": runtime_attestation,
         }}), flush=True)
     if result.returncode != 0:
+        _report_failed_review_redactions(redactions)
         if not evaluation_events:
             diagnostic = result.stderr.strip()
             if diagnostic:
@@ -1086,8 +1099,10 @@ def _execute_review_command(
             batch_flushed_at=batch_flushed_at,
             provider_started_at=provider_started_at,
             provider_completed_at=provider_completed_at,
+            redactions=redactions,
         )
     except ReviewValidationError as error:
+        _report_failed_review_redactions(redactions)
         print(
             f"Rejected invalid llm response: {error}. "
             "Review discarded; no console or agent feedback was published.",
@@ -1220,11 +1235,13 @@ class MaterializedPathSuppression:
             return False
         try:
             relative = canonical.relative_to(self.root)
-            raw = read_bounded_beneath_root(self.root, relative, max_bytes=size)
+            current_digest = _sha256_inside_root(
+                self.root, relative.as_posix(), max_bytes=size
+            )
         except (OSError, ValueError):
             self.entries.pop(canonical, None)
             return False
-        if len(raw) == size and hashlib.sha256(raw).hexdigest() == digest:
+        if current_digest == digest:
             return True
         self.entries.pop(canonical, None)
         return False
