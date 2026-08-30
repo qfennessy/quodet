@@ -25,17 +25,23 @@ Responses are constrained to this JSON shape:
     {
       "file": "relative/path.py",
       "line": 42,
-      "severity": "high",
-      "confidence": 0.96,
-      "title": "Short defect title",
-      "explanation": "Why this is a concrete defect",
-      "suggested_fix": "A focused correction"
+      "severity": "medium",
+      "confidence": 0.99,
+      "title": "Expired cache entries remain visible",
+      "explanation": "Cache.get() removes an expired entry but falls through and returns entry.value, so the triggering caller still receives stale data.",
+      "suggested_fix": "In Cache.get(), return None immediately after removing the expired entry, before returning entry.value. This prevents the expired branch from exposing stale data. Add a regression test that advances the injected clock past expires_at and asserts get() returns None."
     }
   ]
 }
 ```
 
 When no confident negative findings exist, Luna returns `{"findings": []}`.
+Each `suggested_fix` is bounded to 2,000 characters and should name the relevant
+code element, describe the smallest behavior change tied to the demonstrated
+failure path, and include a narrow validation step. If supplied code is
+insufficient for a safe recommendation, it identifies the missing evidence
+instead of guessing. Recommendations are untrusted review data: independently
+verify both the diagnosis and fix, and do not apply them automatically.
 
 It uses `gpt-5.6-luna` with `reasoning_effort=high` by default. The installed
 `llm` provider calls `high` its maximum supported reasoning level.
@@ -126,6 +132,14 @@ The watcher sees changes made by every process, not only a coding agent. Add
 generated output paths with `--exclude` to prevent noisy reviews or feedback
 loops. Files are read by `llm` when a review starts, so the review reflects the
 latest contents after the quiet period rather than every intermediate write.
+
+The frozen fixture under `evals/recommended_fixes` records a known cache defect,
+a complete expected finding, and the code-element, failure-path, and validation
+characteristics its recommendation must contain. Unit tests check this fixture
+deterministically without contacting a provider. Live-model runs remain an
+explicit, separate evaluation through `evals.agent_changes.live_eval`, which
+records the selected model, a SHA-256 digest of the prompt, the fixture revision,
+and the evaluated case IDs in its output.
 
 ## Privacy
 

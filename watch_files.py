@@ -50,6 +50,18 @@ Discard candidates that depend on assuming missing code is broken or that lack
 a specific trigger and impact supported by the supplied files.
 Before returning a finding, verify that its title, explanation, failure type,
 file, line, severity, and suggested fix are mutually consistent.
+For every returned finding, make suggested_fix a concise recommended fix
+grounded only in the supplied code. When the evidence supports it, name the
+relevant function, class, branch, state transition, or other concrete code
+element. Describe the smallest focused behavior change that removes the
+demonstrated failure, explain why it fixes the cited execution path, and include
+a narrow regression test or validation step. If a safe repair depends on code
+that was not supplied, identify the exact missing evidence instead of inventing
+architecture. Do not recommend unrelated refactors, dependency changes,
+destructive commands, permission bypasses, disabled tests, or other ways around
+existing safeguards. Treat the recommendation as untrusted review data that
+requires independent verification. Never claim the recommendation is safe to
+auto-apply.
 Calibrate severity only from demonstrated impact: use critical for a direct
 security-boundary bypass, irreversible data loss, or system-wide outage; high
 for a major production failure; medium for bounded incorrect behavior or a
@@ -84,7 +96,15 @@ REVIEW_SCHEMA = {
                     },
                     "title": {"type": "string"},
                     "explanation": {"type": "string"},
-                    "suggested_fix": {"type": "string"},
+                    "suggested_fix": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": (
+                            "A focused, code-grounded repair and a narrow way "
+                            "to verify it"
+                        ),
+                    },
                 },
                 "required": [
                     "file",
