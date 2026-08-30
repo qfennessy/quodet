@@ -22,6 +22,25 @@ def finding(confidence: object) -> dict[str, object]:
     }
 
 
+CALIBRATION_CASE_IDS = tuple(
+    case["id"] for case in replay.load_manifest()["cases"]
+    if case["evaluation_split"] == calibration.FIT_SPLIT
+)
+
+
+def calibration_cases(
+    *findings_by_case: list[tuple[object, str]],
+) -> list[tuple[str, str, list[tuple[object, str]]]]:
+    if len(findings_by_case) > len(CALIBRATION_CASE_IDS):
+        raise ValueError("test requested more findings than frozen calibration cases")
+    supplied = list(findings_by_case)
+    supplied.extend([] for _ in range(len(CALIBRATION_CASE_IDS) - len(supplied)))
+    return [
+        (case_id, calibration.FIT_SPLIT, provider_findings)
+        for case_id, provider_findings in zip(CALIBRATION_CASE_IDS, supplied)
+    ]
+
+
 def scored_run(
     cases: list[tuple[str, str, list[tuple[object, str]]]],
     *, model: str = "fixture-model",
@@ -128,10 +147,10 @@ def fit(run: dict[str, object], **overrides: object) -> dict[str, object]:
 
 class ConfidenceCalibrationTests(unittest.TestCase):
     def test_cli_fits_and_applies_private_json_artifacts(self) -> None:
-        calibration_run = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-            ("two", "calibration", [(0.98, "true-positive")]),
-        ])
+        calibration_run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
         evaluation_run = scored_run([
             ("holdout", "holdout", [(0.99, "true-positive")]),
         ])
@@ -205,11 +224,11 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         asyncio.run(exercise())
 
     def test_fit_keeps_raw_confidence_distinct_and_reports_controls(self) -> None:
-        calibration_run = scored_run([
-            ("cal-one", "calibration", [(0.99, "true-positive")]),
-            ("cal-two", "calibration", [(0.98, "true-positive")]),
-            ("cal-low", "calibration", [(0.90, "false-positive")]),
-        ])
+        calibration_run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+            [(0.90, "false-positive")],
+        ))
         evaluation_run = scored_run([
             ("holdout", "holdout", [(0.99, "true-positive")]),
             ("clean", "clean-control", [(0.99, "false-positive")]),
@@ -243,21 +262,57 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         )
 
     def test_fit_refuses_non_calibration_answers(self) -> None:
-        run = scored_run([
-            ("cal-one", "calibration", [(0.99, "true-positive")]),
-            ("cal-two", "calibration", [(0.98, "true-positive")]),
+        run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ) + [
             ("holdout", "holdout", [(0.99, "true-positive")]),
         ])
 
         with self.assertRaisesRegex(ValueError, "calibration-only"):
             fit(run)
 
+    def test_fit_requires_exact_frozen_calibration_split(self) -> None:
+        complete = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
+        artifact = fit(complete)
+        self.assertEqual(
+            artifact["fit_boundary"]["case_ids"], list(CALIBRATION_CASE_IDS)
+        )
+
+        invalid_runs: dict[str, tuple[dict[str, object], str]] = {}
+        missing = copy.deepcopy(complete)
+        missing["cases"].pop()
+        invalid_runs["missing"] = (missing, CALIBRATION_CASE_IDS[-1])
+
+        unexpected = copy.deepcopy(complete)
+        unexpected["cases"].append({
+            "case_id": "not-in-frozen-manifest",
+            "evaluation_split": calibration.FIT_SPLIT,
+        })
+        invalid_runs["unexpected"] = (unexpected, "not-in-frozen-manifest")
+
+        duplicate = copy.deepcopy(complete)
+        duplicate["cases"].append(copy.deepcopy(duplicate["cases"][0]))
+        invalid_runs["duplicates"] = (duplicate, CALIBRATION_CASE_IDS[0])
+
+        for expected_kind, (run, expected_case_id) in invalid_runs.items():
+            with self.subTest(kind=expected_kind):
+                with self.assertRaisesRegex(
+                    ValueError, "complete exact frozen calibration split"
+                ) as raised:
+                    fit(run)
+                self.assertIn(expected_kind, str(raised.exception))
+                self.assertIn(expected_case_id, str(raised.exception))
+
     def test_threshold_is_lowest_value_meeting_frozen_target(self) -> None:
-        run = scored_run([
-            ("one", "calibration", [(0.90, "true-positive")]),
-            ("two", "calibration", [(0.80, "true-positive")]),
-            ("three", "calibration", [(0.70, "false-positive")]),
-        ])
+        run = scored_run(calibration_cases(
+            [(0.90, "true-positive")],
+            [(0.80, "true-positive")],
+            [(0.70, "false-positive")],
+        ))
         artifact = fit(
             run, bucket_edges=(0.0, 0.8, 1.0), minimum_bucket_samples=1,
         )
@@ -270,9 +325,7 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         })
 
     def test_sparse_evidence_is_explicitly_uncalibrated(self) -> None:
-        run = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-        ])
+        run = scored_run(calibration_cases([(0.99, "true-positive")]))
         artifact = fit(run)
         self.assertEqual(artifact["status"], "uncalibrated")
         self.assertIsNone(artifact["publication_threshold"])
@@ -283,10 +336,10 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         self.assertIsNone(report["findings"][0]["calibrated_score"])
 
     def test_missing_exact_model_revision_is_uncalibrated(self) -> None:
-        run = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-            ("two", "calibration", [(0.98, "true-positive")]),
-        ], model_revision=None)
+        run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ), model_revision=None)
         artifact = fit(run)
         self.assertEqual(artifact["status"], "uncalibrated")
         self.assertIn("model.revision", artifact["status_reasons"][0])
@@ -298,17 +351,17 @@ class ConfidenceCalibrationTests(unittest.TestCase):
     def test_malformed_confidence_values_fail_closed(self) -> None:
         for malformed in (True, -0.1, 1.1, float("nan"), "0.99"):
             with self.subTest(value=malformed):
-                run = scored_run([
-                    ("one", "calibration", [(malformed, "true-positive")]),
-                ])
+                run = scored_run(calibration_cases(
+                    [(malformed, "true-positive")],
+                ))
                 with self.assertRaisesRegex(ValueError, "malformed raw confidence"):
                     fit(run, minimum_publication_samples=1, minimum_bucket_samples=1)
 
     def test_identity_changes_invalidate_without_reusing_scores(self) -> None:
-        base = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-            ("two", "calibration", [(0.98, "true-positive")]),
-        ])
+        base = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
         artifact = fit(base)
 
         def change_fixture_revision(run: dict[str, object]) -> None:
@@ -385,10 +438,10 @@ class ConfidenceCalibrationTests(unittest.TestCase):
                 )
 
     def test_legacy_missing_and_malformed_identities_fail_closed(self) -> None:
-        run = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-            ("two", "calibration", [(0.98, "true-positive")]),
-        ])
+        run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
         artifact = fit(run)
 
         def resign(value: dict[str, object]) -> None:
@@ -424,10 +477,10 @@ class ConfidenceCalibrationTests(unittest.TestCase):
             calibration.calibration_report(run, malformed_limit)
 
     def test_tampered_artifact_is_rejected(self) -> None:
-        run = scored_run([
-            ("one", "calibration", [(0.99, "true-positive")]),
-            ("two", "calibration", [(0.98, "true-positive")]),
-        ])
+        run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
         artifact = fit(run)
         artifact["publication_threshold"]["raw_confidence"] = 0.0
         with self.assertRaisesRegex(ValueError, "artifact hash"):

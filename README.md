@@ -264,9 +264,11 @@ uv run python -m evals.agent_changes.calibration fit \
 
 The fitter mechanically reads findings and adjudications from the
 `calibration` split and rejects runs exposing holdout, temporal, clean-control,
-confirmation, or challenge labels. It selects the lowest observed
-raw-confidence threshold
-that satisfies every predeclared target. Sparse evidence produces an
+confirmation, or challenge labels. It also requires every calibration case in
+the frozen fixture manifest exactly once; selected subsets, unknown cases, and
+duplicate case results fail closed before any labels are fitted. It selects the
+lowest observed raw-confidence threshold that satisfies every predeclared
+target. Sparse evidence produces an
 `uncalibrated` artifact with no publication threshold.
 
 Freeze that artifact before applying it to a separately adjudicated holdout or
