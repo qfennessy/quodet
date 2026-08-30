@@ -14,6 +14,7 @@ from unittest import mock
 
 import codex_feedback_hook
 from feedback import (
+    MAX_FINDINGS,
     MAX_PROVIDER_OUTPUT_BYTES,
     MAX_SPOOL_PAYLOAD_BYTES,
     MAX_TITLE_LENGTH,
@@ -28,6 +29,7 @@ from feedback import (
     validate_spooled_payload,
 )
 from redaction import RedactionNotice, RedactionSummary
+from review_lifecycle import FindingLifecycle
 
 
 def valid_output(file: str = "src/app.py") -> str:
@@ -300,6 +302,63 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(fresh["stale_files"], ["src/app.py"])
         self.assertEqual(fresh["lifecycle"][0]["status"], "stale")
         self.assertEqual(fresh["lifecycle"][0]["reason"], "source_changed")
+
+    def test_consumer_invalidates_omission_for_changed_reviewed_file(self) -> None:
+        quiet = self.root / "src" / "quiet.py"
+        quiet.write_text("old = True\n", encoding="utf-8")
+        import hashlib
+
+        reviewed = (
+            *self.reviewed,
+            ReviewedFile(
+                "src/quiet.py",
+                hashlib.sha256(quiet.read_bytes()).hexdigest(),
+                quiet.stat().st_size,
+            ),
+        )
+        current = parse_review_output(
+            valid_output(),
+            root=self.root,
+            reviewed_files=reviewed,
+            session_id="agent-a",
+        )
+        batch = replace(
+            current,
+            published_at=current.created_at,
+            lifecycle=(
+                FindingLifecycle(
+                    "new", "a" * 64, "src/app.py", 7,
+                ),
+                FindingLifecycle(
+                    "no_longer_reported",
+                    "b" * 64,
+                    "src/quiet.py",
+                    3,
+                    previous_fingerprint="b" * 64,
+                ),
+            ),
+        )
+        payload = json.loads(json.dumps(batch.to_dict()))
+        payload["notice"] = UNTRUSTED_NOTICE
+        validated = validate_spooled_payload(
+            payload, root=self.root, session_id="agent-a"
+        )
+
+        quiet.write_text("new = True\n", encoding="utf-8")
+        fresh = fresh_spooled_payload(validated, root=self.root)
+
+        self.assertEqual([item["file"] for item in fresh["findings"]], ["src/app.py"])
+        self.assertEqual(fresh["stale_files"], ["src/quiet.py"])
+        lifecycle_by_file = {item["file"]: item for item in fresh["lifecycle"]}
+        self.assertEqual(lifecycle_by_file["src/app.py"]["status"], "new")
+        self.assertEqual(lifecycle_by_file["src/quiet.py"]["status"], "stale")
+        self.assertEqual(
+            lifecycle_by_file["src/quiet.py"]["reason"], "source_changed"
+        )
+        self.assertNotIn(
+            "no_longer_reported",
+            {item["status"] for item in fresh["lifecycle"]},
+        )
 
     def test_console_sink_defaults_to_human_and_supports_json(self) -> None:
         batch = self.parse(valid_output())
@@ -649,6 +708,88 @@ class FeedbackTests(unittest.TestCase):
             )
         )
         self.assertEqual(message.count("  Suggested fix:"), 3)
+
+    def test_stale_refresh_at_lifecycle_limit_survives_chunk_requeue(self) -> None:
+        import hashlib
+
+        quiet = self.root / "src" / "quiet.py"
+        quiet.write_text("old = True\n", encoding="utf-8")
+        reviewed = (
+            *self.reviewed,
+            ReviewedFile(
+                "src/quiet.py",
+                hashlib.sha256(quiet.read_bytes()).hexdigest(),
+                quiet.stat().st_size,
+            ),
+        )
+        raw = json.loads(valid_output())
+        template = raw["findings"][0]
+        raw["findings"] = [
+            {**template, "line": line, "title": f"Finding {line}"}
+            for line in range(1, 13)
+        ]
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            session_id="agent-a",
+        )
+        lifecycle = tuple(
+            FindingLifecycle(
+                "new",
+                f"{index:064x}",
+                "src/app.py" if index else "src/quiet.py",
+                index + 1,
+            )
+            for index in range(MAX_FINDINGS * 2)
+        )
+        spool = self.base / "lifecycle-limit" / "feedback"
+        SpoolSink(spool, root=self.root, session_id="agent-a").publish(
+            replace(batch, lifecycle=lifecycle)
+        )
+        quiet.write_text("new = True\n", encoding="utf-8")
+        event_input = json.dumps(
+            {"session_id": "real-lifecycle-limit", "cwd": os.fspath(self.root)}
+        )
+
+        messages: list[str] = []
+        for expected_pending in (1, 0):
+            output = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(event_input)), mock.patch(
+                "sys.stdout", output
+            ):
+                self.assertEqual(
+                    codex_feedback_hook.main(
+                        [
+                            "--event", "PostToolUse",
+                            "--spool-dir", os.fspath(spool),
+                            "--session-id", "agent-a",
+                            "--root", os.fspath(self.root),
+                        ]
+                    ),
+                    0,
+                )
+            response = json.loads(output.getvalue())
+            messages.append(
+                response["hookSpecificOutput"]["additionalContext"]
+            )
+            self.assertEqual(
+                len(list((spool / "pending").glob("*.json"))), expected_pending
+            )
+
+        self.assertEqual(messages[0].count("  Suggested fix:"), 10)
+        self.assertEqual(messages[1].count("  Suggested fix:"), 2)
+        self.assertEqual(len(list((spool / "rejected").glob("*.json"))), 0)
+        acknowledged = json.loads(
+            next((spool / "acknowledged").glob("*.json")).read_text()
+        )
+        self.assertEqual(len(acknowledged["lifecycle"]), MAX_FINDINGS * 2)
+        stale = [
+            item for item in acknowledged["lifecycle"]
+            if item["file"] == "src/quiet.py"
+        ]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["status"], "stale")
 
     def test_delivery_character_limit_retains_whole_findings(self) -> None:
         raw = json.loads(valid_output())

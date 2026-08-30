@@ -1682,14 +1682,16 @@ def fresh_spooled_payload(payload: dict[str, object], *, root: Path) -> dict[str
         seen: set[tuple[str, str, int]] = set()
         for raw_event in payload.get("lifecycle", []):
             event = dict(raw_event)  # type: ignore[arg-type]
-            if event.get("file") in stale_paths:
-                event.update(
-                    {
-                        "status": "stale",
-                        "previous_fingerprint": None,
-                        "reason": "source_changed",
-                    }
-                )
+            if event.get("file") not in stale_paths:
+                lifecycle.append(event)
+                continue
+            event.update(
+                {
+                    "status": "stale",
+                    "previous_fingerprint": None,
+                    "reason": "source_changed",
+                }
+            )
             key = (
                 str(event.get("fingerprint")),
                 str(event.get("file")),
