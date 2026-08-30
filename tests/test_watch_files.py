@@ -5,6 +5,8 @@ import contextlib
 import io
 import json
 import queue
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +16,15 @@ import watch_files
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_review_batches_retain_every_path_beyond_the_provider_cap(self) -> None:
+        paths = [Path(f"/tmp/source-{index}.py") for index in range(205)]
+        batches = list(watch_files.bounded_review_batches(paths))
+
+        self.assertEqual([len(batch) for batch in batches], [100, 100, 5])
+        self.assertEqual(
+            [path for batch in batches for path in batch], sorted(paths)
+        )
+
     def test_default_debounce_groups_related_agent_changes(self) -> None:
         args = watch_files.parse_args(["."])
         self.assertEqual(args.debounce, 3.0)
@@ -90,7 +101,9 @@ class WatchFilesTests(unittest.TestCase):
             "properties"
         ]["confidence"]
         self.assertEqual(confidence["minimum"], 0.95)
-        self.assertNotIn("additionalProperties", watch_files.REVIEW_SCHEMA_JSON)
+        item_schema = watch_files.REVIEW_SCHEMA["properties"]["findings"]["items"]
+        self.assertIn("line", item_schema["required"])
+        self.assertFalse(item_schema["additionalProperties"])
 
     def test_default_prompt_requires_actionable_untrusted_recommendations(self) -> None:
         prompt = watch_files.DEFAULT_PROMPT.lower()
@@ -186,6 +199,49 @@ class WatchFilesTests(unittest.TestCase):
                 [watch_files.Attachment(regular, "text/plain")],
             )
 
+    def test_exact_snapshot_rechecks_size_after_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "growing.py"
+            source.write_text("x = 1\n")
+            attachments = watch_files.collect_attachments(
+                [source], root=root, exclude_patterns=[], max_bytes=10
+            )
+            self.assertEqual(len(attachments), 1)
+            source.write_text("x" * 11)
+            self.assertEqual(
+                watch_files.snapshot_attachments(
+                    attachments, root=root, max_bytes=10
+                ),
+                [],
+            )
+
+    def test_snapshot_rejects_parent_replaced_by_external_symlink(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            tempfile.TemporaryDirectory() as external_directory,
+        ):
+            root = Path(temporary_directory).resolve()
+            source_directory = root / "src"
+            source_directory.mkdir()
+            source = source_directory / "app.py"
+            source.write_text("inside = True\n")
+            attachments = watch_files.collect_attachments(
+                [source], root=root, exclude_patterns=[], max_bytes=1_000
+            )
+
+            external = Path(external_directory).resolve()
+            (external / "app.py").write_text("OUTSIDE_SECRET = 'never upload'\n")
+            source_directory.rename(root / "original-src")
+            source_directory.symlink_to(external, target_is_directory=True)
+
+            self.assertEqual(
+                watch_files.snapshot_attachments(
+                    attachments, root=root, max_bytes=1_000
+                ),
+                [],
+            )
+
     def test_redacts_sensitive_values(self) -> None:
         secrets = [
             "AIzaSyA12345678901234567890123456789012",
@@ -249,6 +305,7 @@ class WatchFilesTests(unittest.TestCase):
             def fake_run(command: list[str], **_: object) -> object:
                 nonlocal observed_path
                 self.assertEqual(_["timeout"], 60)
+                self.assertEqual(_["output_limit"], watch_files.MAX_PROVIDER_OUTPUT_BYTES)
                 attachment_index = command.index("--fragment") + 1
                 observed_path = Path(command[attachment_index])
                 self.assertNotEqual(observed_path, source)
@@ -265,9 +322,18 @@ class WatchFilesTests(unittest.TestCase):
                         for secret_value in (filename_secret, prompt_secret)
                     )
                 )
-                return type("Result", (), {"returncode": 0})()
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": '{"findings": []}',
+                        "stderr": "",
+                        "output_exceeded": False,
+                    },
+                )()
 
-            with mock.patch("watch_files.subprocess.run", side_effect=fake_run):
+            with mock.patch("watch_files.run_bounded_command", side_effect=fake_run):
                 watch_files.review_files(
                     [source],
                     root=root,
@@ -293,10 +359,13 @@ class WatchFilesTests(unittest.TestCase):
                 "returncode": 2,
                 "stdout": '{"findings": []}\n',
                 "stderr": "provider rejected request\n",
+                "output_exceeded": False,
             })()
             output = io.StringIO()
             with (
-                mock.patch("watch_files.subprocess.run", return_value=result) as run,
+                mock.patch(
+                    "watch_files.run_bounded_command", return_value=result
+                ) as run,
                 contextlib.redirect_stdout(output),
             ):
                 watch_files.review_files(
@@ -306,8 +375,10 @@ class WatchFilesTests(unittest.TestCase):
                     evaluation_events=True,
                 )
 
-            self.assertTrue(run.call_args.kwargs["capture_output"])
-            self.assertTrue(run.call_args.kwargs["text"])
+            self.assertEqual(
+                run.call_args.kwargs["output_limit"],
+                watch_files.MAX_PROVIDER_OUTPUT_BYTES,
+            )
             event = json.loads(output.getvalue().splitlines()[-1])[
                 "quodet_evaluation_event"
             ]
@@ -315,6 +386,148 @@ class WatchFilesTests(unittest.TestCase):
             self.assertEqual(event["returncode"], 2)
             self.assertEqual(event["raw_response"], '{"findings": []}\n')
             self.assertEqual(event["stderr"], "provider rejected request\n")
+
+    def test_review_handles_malformed_nonzero_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            source.write_text("print('hello')\n")
+            common = dict(
+                paths=[source],
+                root=root,
+                exclude_patterns=[],
+                max_bytes=2_000_000,
+                model="gpt-5.6-luna",
+                prompt="review",
+                log=False,
+                review_timeout=60,
+                reasoning_effort="high",
+            )
+
+            malformed = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": "not json",
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
+            )()
+            with mock.patch("watch_files.run_bounded_command", return_value=malformed):
+                self.assertIsNone(watch_files.review_files(**common))
+
+            failed = type(
+                "Result",
+                (),
+                {
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": "provider error",
+                    "output_exceeded": False,
+                },
+            )()
+            with mock.patch("watch_files.run_bounded_command", return_value=failed):
+                self.assertIsNone(watch_files.review_files(**common))
+
+            with mock.patch(
+                "watch_files.run_bounded_command",
+                side_effect=subprocess.TimeoutExpired("llm", 60),
+            ):
+                self.assertIsNone(watch_files.review_files(**common))
+
+    def test_review_returns_typed_batch_and_drops_finding_if_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            source.write_text("value = 1\n")
+            response = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "file": "app.py",
+                            "line": 1,
+                            "severity": "medium",
+                            "confidence": 0.99,
+                            "title": "Wrong value",
+                            "explanation": "This value violates the contract.",
+                            "suggested_fix": "Use the required value.",
+                        }
+                    ]
+                }
+            )
+
+            def change_during_review(*_: object, **__: object) -> object:
+                source.write_text("value = 2\n")
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": response,
+                        "stderr": "",
+                        "output_exceeded": False,
+                    },
+                )()
+
+            sink = mock.Mock()
+            with mock.patch(
+                "watch_files.run_bounded_command", side_effect=change_during_review
+            ):
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="gpt-5.6-luna",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort="high",
+                    sink=sink,
+                )
+
+            self.assertIsInstance(batch, watch_files.ReviewBatch)
+            self.assertEqual(batch.findings, ())
+            sink.publish.assert_called_once_with(batch)
+
+    def test_provider_output_is_bounded_before_memory_buffering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = watch_files.run_bounded_command(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000)"],
+                cwd=Path(temporary_directory),
+                timeout=5,
+                output_limit=1_024,
+            )
+
+        self.assertTrue(result.output_exceeded)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 1_025)
+
+    def test_provider_timeout_preserves_bounded_partial_streams(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import sys, time; "
+                "print('partial-out', flush=True); "
+                "print('partial-err', file=sys.stderr, flush=True); "
+                "time.sleep(10)"
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory, self.assertRaises(
+            subprocess.TimeoutExpired
+        ) as raised:
+            watch_files.run_bounded_command(
+                command,
+                cwd=Path(temporary_directory),
+                timeout=0.5,
+                output_limit=1_024,
+            )
+
+        self.assertIn("partial-out", raised.exception.stdout)
+        self.assertIn("partial-err", raised.exception.stderr)
+        self.assertLessEqual(len(raised.exception.stdout.encode("utf-8")), 1_025)
+        self.assertLessEqual(len(raised.exception.stderr.encode("utf-8")), 1_025)
 
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()

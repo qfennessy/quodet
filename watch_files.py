@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from feedback import (
+    CompositeSink,
+    ConsoleSink,
+    FeedbackSink,
+    MAX_PROVIDER_OUTPUT_BYTES,
+    MAX_REVIEWED_FILES,
+    ReviewBatch,
+    ReviewValidationError,
+    ReviewedFile,
+    SpoolSink,
+    fresh_findings,
+    parse_review_output,
+    read_bounded_beneath_root,
+)
 
 try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -110,16 +126,19 @@ REVIEW_SCHEMA = {
                 },
                 "required": [
                     "file",
+                    "line",
                     "severity",
                     "confidence",
                     "title",
                     "explanation",
                     "suggested_fix",
                 ],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["findings"],
+    "additionalProperties": False,
 }
 REVIEW_SCHEMA_JSON = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
 REDACTED = "[REDACTED]"
@@ -205,6 +224,23 @@ class Attachment:
     media_type: str
 
 
+@dataclass(frozen=True)
+class SourceSnapshot:
+    path: Path
+    relative_path: Path
+    contents: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    output_exceeded: bool = False
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -268,6 +304,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--evaluation-events",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--spool-dir",
+        type=Path,
+        help=(
+            "also publish validated feedback to this private directory outside "
+            "the watched tree"
+        ),
+    )
+    parser.add_argument(
+        "--session-id",
+        help="explicit coding-agent session owner required with --spool-dir",
     )
     return parser.parse_args(argv)
 
@@ -343,9 +391,12 @@ def is_excluded(
     )
 
 
-def is_utf8_text(path: Path) -> bool:
+def is_utf8_text(root: Path, relative_path: Path, *, max_bytes: int) -> bool:
     try:
-        contents = path.read_text(encoding="utf-8")
+        raw = read_bounded_beneath_root(root, relative_path, max_bytes=max_bytes)
+        if len(raw) > max_bytes:
+            return False
+        contents = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
     return "\x00" not in contents
@@ -424,7 +475,8 @@ def collect_attachments(
     max_bytes: int,
 ) -> list[Attachment]:
     attachments: list[Attachment] = []
-    for path in sorted(set(paths)):
+    ordered_paths = sorted(set(paths))
+    for index, path in enumerate(ordered_paths):
         relative_path = relative_to_root(path, root)
         if relative_path is None or is_excluded(
             relative_path,
@@ -448,7 +500,7 @@ def collect_attachments(
             )
             continue
 
-        if not is_utf8_text(resolved_path):
+        if not is_utf8_text(root, relative_path, max_bytes=max_bytes):
             print(
                 f"Skipping non-UTF-8 or unreadable file (cannot safely redact): "
                 f"{relative_path}",
@@ -457,26 +509,62 @@ def collect_attachments(
             continue
         attachments.append(Attachment(
             path=resolved_path, media_type="text/plain"))
+        if len(attachments) == MAX_REVIEWED_FILES:
+            if index + 1 < len(ordered_paths):
+                print(
+                    f"Direct review batch capped at {MAX_REVIEWED_FILES} files.",
+                    file=sys.stderr,
+                )
+            break
     return attachments
 
 
+def snapshot_attachments(
+    attachments: Sequence[Attachment], *, root: Path, max_bytes: int
+) -> list[SourceSnapshot]:
+    """Read immutable review inputs and bind them to their exact source bytes."""
+    snapshots: list[SourceSnapshot] = []
+    for attachment in attachments:
+        relative_path = attachment.path.relative_to(root)
+        try:
+            source_bytes = read_bounded_beneath_root(
+                root, relative_path, max_bytes=max_bytes
+            )
+            if len(source_bytes) > max_bytes:
+                print(
+                    f"Skipping {relative_path}: exact snapshot exceeds "
+                    f"--max-bytes {max_bytes}",
+                    file=sys.stderr,
+                )
+                continue
+            contents = source_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            print(f"Skipping {relative_path}: could not snapshot: {error}", file=sys.stderr)
+            continue
+        if "\x00" in contents:
+            continue
+        snapshots.append(
+            SourceSnapshot(
+                path=attachment.path,
+                relative_path=relative_path,
+                contents=contents,
+                sha256=hashlib.sha256(source_bytes).hexdigest(),
+                size=len(source_bytes),
+            )
+        )
+    return snapshots
+
+
 def sanitize_attachments(
-    attachments: Sequence[Attachment], *, root: Path, destination: Path
+    snapshots: Sequence[SourceSnapshot], *, destination: Path
 ) -> tuple[list[Attachment], int]:
     """Create provider-safe copies; a source file is never used as an attachment."""
     sanitized_attachments: list[Attachment] = []
     total_redactions = 0
 
-    for index, attachment in enumerate(attachments, start=1):
-        relative_path = attachment.path.relative_to(root)
-        try:
-            contents = attachment.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            print(
-                f"Skipping {relative_path}: could not sanitize: {error}", file=sys.stderr)
-            continue
-
-        sanitized, redaction_count = redact_sensitive_values(contents)
+    for index, snapshot in enumerate(snapshots, start=1):
+        relative_path = snapshot.relative_path
+        sanitized, redaction_count = redact_sensitive_values(snapshot.contents)
         sanitized_relative_path, path_redactions = redact_sensitive_path(relative_path)
         provider_contents = (
             f"Original relative path: {sanitized_relative_path}\n\n{sanitized}"
@@ -530,6 +618,75 @@ def _subprocess_output_text(value: str | bytes | None) -> str | None:
     return value
 
 
+def run_bounded_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    output_limit: int,
+) -> BoundedProcessResult:
+    """Run a command without buffering unbounded provider output in memory."""
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+    ):
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        deadline = time.monotonic() + timeout
+        output_exceeded = False
+        while process.poll() is None:
+            if (
+                os.fstat(stdout_file.fileno()).st_size > output_limit
+                or os.fstat(stderr_file.fileno()).st_size > output_limit
+            ):
+                output_exceeded = True
+                process.kill()
+                process.wait()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read(output_limit + 1).decode(
+                    "utf-8", errors="replace"
+                )
+                stderr = stderr_file.read(output_limit + 1).decode(
+                    "utf-8", errors="replace"
+                )
+                raise subprocess.TimeoutExpired(
+                    command,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+        if (
+            os.fstat(stdout_file.fileno()).st_size > output_limit
+            or os.fstat(stderr_file.fileno()).st_size > output_limit
+        ):
+            output_exceeded = True
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(output_limit + 1).decode("utf-8", errors="replace")
+        stderr = stderr_file.read(output_limit + 1).decode("utf-8", errors="replace")
+        return BoundedProcessResult(
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            output_exceeded=output_exceeded,
+        )
+
+
 def review_files(
     paths: Iterable[Path],
     *,
@@ -542,7 +699,10 @@ def review_files(
     review_timeout: float,
     reasoning_effort: str | None,
     evaluation_events: bool = False,
-) -> None:
+    sink: FeedbackSink | None = None,
+    session_id: str | None = None,
+    feedback_round: int = 1,
+) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
         root=root,
@@ -550,21 +710,23 @@ def review_files(
         max_bytes=max_bytes,
     )
     if not attachments:
-        return
+        return None
 
-    labels = [str(attachment.path.relative_to(root))
-              for attachment in attachments]
+    snapshots = snapshot_attachments(attachments, root=root, max_bytes=max_bytes)
+    if not snapshots:
+        return None
+
+    labels = [str(snapshot.relative_path) for snapshot in snapshots]
     print(
         f"\nReviewing {len(labels)} changed file(s): {', '.join(labels)}", flush=True)
 
     with tempfile.TemporaryDirectory(prefix="quodet-sanitized-") as temporary_directory:
         sanitized_attachments, redaction_count = sanitize_attachments(
-            attachments,
-            root=root,
+            snapshots,
             destination=Path(temporary_directory),
         )
         if not sanitized_attachments:
-            return
+            return None
         sanitized_prompt, prompt_redactions = redact_sensitive_values(prompt)
         redaction_count += prompt_redactions
         if redaction_count:
@@ -581,18 +743,12 @@ def review_files(
             reasoning_effort=reasoning_effort,
         )
 
-        run_options: dict[str, object] = {
-            "cwd": root,
-            "check": False,
-            "timeout": review_timeout,
-        }
-        if evaluation_events:
-            run_options.update({"capture_output": True, "text": True})
-
         try:
-            result = subprocess.run(
+            result = run_bounded_command(
                 command,
-                **run_options,
+                cwd=root,
+                timeout=review_timeout,
+                output_limit=MAX_PROVIDER_OUTPUT_BYTES,
             )
         except subprocess.TimeoutExpired as error:
             if evaluation_events:
@@ -607,7 +763,7 @@ def review_files(
                     f"llm review timed out after {review_timeout:g} seconds",
                     file=sys.stderr,
                 )
-            return
+            return None
         except OSError as error:
             if evaluation_events:
                 print(json.dumps({"quodet_evaluation_event": {
@@ -618,8 +774,23 @@ def review_files(
                 }}), flush=True)
             else:
                 print(f"Could not run llm: {error}", file=sys.stderr)
-            return
+            return None
 
+    if result.output_exceeded:
+        diagnostic = (
+            f"Rejected llm response: output exceeded "
+            f"{MAX_PROVIDER_OUTPUT_BYTES} bytes"
+        )
+        if evaluation_events:
+            print(json.dumps({"quodet_evaluation_event": {
+                "status": "provider-error",
+                "returncode": result.returncode,
+                "raw_response": result.stdout,
+                "stderr": diagnostic,
+            }}), flush=True)
+        else:
+            print(diagnostic, file=sys.stderr)
+        return None
     if evaluation_events:
         print(json.dumps({"quodet_evaluation_event": {
             "status": "success" if result.returncode == 0 else "provider-error",
@@ -627,8 +798,42 @@ def review_files(
             "raw_response": result.stdout,
             "stderr": result.stderr,
         }}), flush=True)
-    elif result.returncode != 0:
-        print(f"llm exited with status {result.returncode}", file=sys.stderr)
+    if result.returncode != 0:
+        if not evaluation_events:
+            diagnostic = result.stderr.strip()
+            if diagnostic:
+                print(diagnostic[:2_000], file=sys.stderr)
+            print(f"llm exited with status {result.returncode}", file=sys.stderr)
+        return None
+
+    reviewed_files = tuple(
+        ReviewedFile(
+            path=snapshot.relative_path.as_posix(),
+            sha256=snapshot.sha256,
+            size=snapshot.size,
+        )
+        for snapshot in snapshots
+    )
+    try:
+        batch = parse_review_output(
+            result.stdout,
+            root=root,
+            reviewed_files=reviewed_files,
+            session_id=session_id,
+            feedback_round=feedback_round,
+        )
+    except ReviewValidationError as error:
+        print(f"Rejected invalid llm response: {error}", file=sys.stderr)
+        return None
+
+    fresh_batch = fresh_findings(batch)
+    if len(fresh_batch.findings) != len(batch.findings):
+        print(
+            "Discarded stale finding(s) because source changed during review.",
+            file=sys.stderr,
+        )
+    (sink or ConsoleSink()).publish(fresh_batch)
+    return fresh_batch
 
 
 class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -689,6 +894,13 @@ def next_batch(changes: queue.Queue[Path], debounce: float) -> set[Path]:
             return batch
 
 
+def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
+    """Split a drained event set without dropping paths beyond the review cap."""
+    ordered = sorted(set(paths))
+    for index in range(0, len(ordered), MAX_REVIEWED_FILES):
+        yield tuple(ordered[index : index + MAX_REVIEWED_FILES])
+
+
 def validate_runtime(path: Path, model: str) -> Path:
     root = path.expanduser().resolve()
     if not root.is_dir():
@@ -722,6 +934,20 @@ def validate_runtime(path: Path, model: str) -> Path:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = validate_runtime(args.path, args.model)
+    if (args.spool_dir is None) != (args.session_id is None):
+        raise SystemExit("--spool-dir and --session-id must be supplied together")
+    sink: FeedbackSink = ConsoleSink()
+    spool_sink: SpoolSink | None = None
+    if args.spool_dir is not None:
+        spool_sink = SpoolSink(
+            args.spool_dir, root=root, session_id=args.session_id
+        )
+        sink = CompositeSink(
+            [
+                sink,
+                spool_sink,
+            ]
+        )
     changes: queue.Queue[Path] = queue.Queue()
     observer_class = PollingObserver if args.poll else Observer
     observer = observer_class()
@@ -736,25 +962,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Model: {args.model}; debounce: {args.debounce:g}s")
     try:
         while True:
-            review_files(
-                next_batch(changes, args.debounce),
-                root=root,
-                exclude_patterns=args.exclude,
-                max_bytes=args.max_bytes,
-                model=args.model,
-                prompt=args.prompt,
-                log=args.log,
-                review_timeout=args.review_timeout,
-                reasoning_effort=resolve_reasoning_effort(
-                    args.model, args.reasoning_effort
-                ),
-                evaluation_events=args.evaluation_events,
-            )
+            event_batch = next_batch(changes, args.debounce)
+            for review_batch in bounded_review_batches(event_batch):
+                review_files(
+                    review_batch,
+                    root=root,
+                    exclude_patterns=args.exclude,
+                    max_bytes=args.max_bytes,
+                    model=args.model,
+                    prompt=args.prompt,
+                    log=args.log,
+                    review_timeout=args.review_timeout,
+                    reasoning_effort=resolve_reasoning_effort(
+                        args.model, args.reasoning_effort
+                    ),
+                    evaluation_events=args.evaluation_events,
+                    sink=sink,
+                    session_id=args.session_id,
+                )
     except KeyboardInterrupt:
         print("\nStopping watcher.")
     finally:
         observer.stop()
         observer.join()
+        if spool_sink is not None:
+            spool_sink.close()
     return 0
 
 
