@@ -291,5 +291,23 @@ class ReviewOutputTests(unittest.TestCase):
 
         self.assertIn("1 prior finding no longer reported", rendered.splitlines()[0])
 
+    def test_mixed_findings_show_stale_reviewed_file_count(self) -> None:
+        review = replace(
+            batch(finding()),
+            lifecycle=(
+                FindingLifecycle(
+                    status="new",
+                    fingerprint="a" * 64,
+                    file="src/service.py",
+                    line=10,
+                ),
+            ),
+            stale_files=("src/repository.py",),
+        )
+
+        rendered = render_human_review(review)
+
+        self.assertIn("1 stale reviewed file discarded", rendered.splitlines()[0])
+
 if __name__ == "__main__":
     unittest.main()

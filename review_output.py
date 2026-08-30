@@ -222,11 +222,11 @@ def render_human_review(batch: ReviewBatchLike) -> str:
     lifecycle_counts: dict[str, int] = {}
     for event in batch.lifecycle:
         lifecycle_counts[event.status] = lifecycle_counts.get(event.status, 0) + 1
+    stale_paths = set(batch.stale_files) | {
+        event.file for event in batch.lifecycle if event.status == "stale"
+    }
     finding_count = len(batch.findings)
     if finding_count == 0:
-        stale_paths = set(batch.stale_files) | {
-            event.file for event in batch.lifecycle if event.status == "stale"
-        }
         reviewed_paths = {reviewed_file.path for reviewed_file in batch.reviewed_files}
         wholly_stale = bool(reviewed_paths) and reviewed_paths <= stale_paths
         if wholly_stale:
@@ -263,6 +263,8 @@ def render_human_review(batch: ReviewBatchLike) -> str:
     else:
         lifecycle_summary_parts: list[str] = []
         for status, count in sorted(lifecycle_counts.items()):
+            if status == "stale":
+                continue
             if status == "no_longer_reported":
                 lifecycle_summary_parts.append(
                     f"{_count(count, 'prior finding')} no longer reported"
@@ -271,6 +273,10 @@ def render_human_review(batch: ReviewBatchLike) -> str:
                 lifecycle_summary_parts.append(
                     f"{count} {status.replace('_', ' ')}"
                 )
+        if stale_paths:
+            lifecycle_summary_parts.append(
+                f"{_count(len(stale_paths), 'stale reviewed file')} discarded"
+            )
         lifecycle_summary = ", ".join(lifecycle_summary_parts)
         heading = (
             f"{batch_label} reviewed {reviewed} in {timing.total_ms / 1_000:.2f}s: "
