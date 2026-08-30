@@ -651,7 +651,20 @@ def run_bounded_command(
             if remaining <= 0:
                 process.kill()
                 process.wait()
-                raise subprocess.TimeoutExpired(command, timeout)
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read(output_limit + 1).decode(
+                    "utf-8", errors="replace"
+                )
+                stderr = stderr_file.read(output_limit + 1).decode(
+                    "utf-8", errors="replace"
+                )
+                raise subprocess.TimeoutExpired(
+                    command,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
             try:
                 process.wait(timeout=min(0.05, remaining))
             except subprocess.TimeoutExpired:

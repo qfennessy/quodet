@@ -503,6 +503,32 @@ class WatchFilesTests(unittest.TestCase):
         self.assertTrue(result.output_exceeded)
         self.assertLessEqual(len(result.stdout.encode("utf-8")), 1_025)
 
+    def test_provider_timeout_preserves_bounded_partial_streams(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import sys, time; "
+                "print('partial-out', flush=True); "
+                "print('partial-err', file=sys.stderr, flush=True); "
+                "time.sleep(10)"
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory, self.assertRaises(
+            subprocess.TimeoutExpired
+        ) as raised:
+            watch_files.run_bounded_command(
+                command,
+                cwd=Path(temporary_directory),
+                timeout=0.5,
+                output_limit=1_024,
+            )
+
+        self.assertIn("partial-out", raised.exception.stdout)
+        self.assertIn("partial-err", raised.exception.stderr)
+        self.assertLessEqual(len(raised.exception.stdout.encode("utf-8")), 1_025)
+        self.assertLessEqual(len(raised.exception.stderr.encode("utf-8")), 1_025)
+
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()
         root = Path("/tmp").resolve()
