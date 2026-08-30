@@ -93,6 +93,7 @@ def render_json_review(batch: ReviewBatchLike) -> str:
     """Render one deterministic JSON Lines document for machine consumers."""
     return json.dumps(
         review_output_document(batch),
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,

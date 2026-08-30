@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
+import math
 import unittest
 
 from feedback import ReviewBatch, ReviewFinding, ReviewedFile
@@ -132,6 +134,9 @@ class ReviewOutputTests(unittest.TestCase):
                 "timing",
             },
         )
+
+        with self.assertRaises(ValueError):
+            render_json_review(replace(review, provider_ms=math.nan))
 
 
 if __name__ == "__main__":

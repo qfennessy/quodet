@@ -299,7 +299,8 @@ class ConsoleSink:
     def publish(self, batch: ReviewBatch) -> bool:
         import sys
 
-        print(render_review(batch, self.mode), file=self.stream or sys.stdout)
+        stream = self.stream if self.stream is not None else sys.stdout
+        print(render_review(batch, self.mode), file=stream)
         return True
 
 
