@@ -74,8 +74,12 @@
       "runtime_artifact": {
         "status": "unregistered",
         "runtime": "llm-ollama",
+        "runtime_version": null,
+        "model": null,
         "runtime_model_id": null,
         "runtime_artifact_sha256": null,
+        "quantization": null,
+        "max_output_tokens_option": null,
         "source_binding": "requires a reviewed, reproducible conversion from the pinned model_artifact/model_revision before any run"
       }
     },
@@ -96,6 +100,7 @@
         "model": null,
         "provider_model_revision": null,
         "quantization": null,
+        "max_output_tokens_option": null,
         "source_binding": "requires reviewed provider evidence binding a version-pinned endpoint to the frozen model_artifact/model_revision before any run"
       }
     },
@@ -111,8 +116,12 @@
       "runtime_artifact": {
         "status": "unregistered",
         "runtime": "llm-ollama",
+        "runtime_version": null,
+        "model": null,
         "runtime_model_id": null,
         "runtime_artifact_sha256": null,
+        "quantization": null,
+        "max_output_tokens_option": null,
         "source_binding": "requires a reviewed, reproducible conversion from the pinned model_artifact/model_revision before any run"
       }
     }

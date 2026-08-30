@@ -325,10 +325,15 @@ and output limit. The checked-in local candidates are deliberately
 `unregistered`: no conversion artifact was installed or verified while adding
 the framework. Before preparing either local run, update its `runtime_artifact`
 entry in the benchmark plan to `approved` in a reviewed commit, binding the
-pinned source artifact/revision to the exact Ollama model ID and local blob
-SHA-256 produced by a documented reproducible conversion. Arbitrary values in
-a run config cannot satisfy this binding. After that registration, prepare the
-matching local runtime:
+pinned source artifact/revision to the exact `llm` alias, plugin version,
+Ollama model ID, local blob SHA-256, quantization, and output-limit option
+produced by a documented reproducible conversion. Arbitrary values in a run
+config cannot satisfy this binding. Before the watcher starts, live evaluation
+reconstructs and validates the complete approved plan, runtime identity, and
+execution contract. It passes canonical plan and config digests to the watcher,
+which reloads both and repeats the complete validation. A plan or config changed
+after parent validation is rejected before any model call. After that
+registration, prepare the matching local runtime:
 
 ```sh
 uv run python -m evals.agent_changes.benchmark prepare qwen35-a3b-local \
@@ -365,7 +370,8 @@ Do not describe a hosted endpoint as local merely because its weights have a
 permissive license. The checked-in hosted candidate is also `unregistered`.
 Before preparing it, a reviewed plan revision must bind the provider, plugin
 and version, exact alias, provider backend revision, quantization, and dated
-evidence that the endpoint serves the pinned source artifact/revision. If the
+evidence that the endpoint serves the pinned source artifact/revision. The
+runtime-specific output-limit option is bound as well. If the
 provider cannot make that binding, the candidate remains ineligible. Hosted
 preparation also fails closed unless both external source upload and a positive
 experiment-wide cost cap are explicit, and both input and output prices have a

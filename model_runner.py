@@ -7,6 +7,7 @@ prompt/schema they want the configured model to process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -216,6 +217,14 @@ class ModelRunConfig:
             external_upload_consent=bool(value["external_upload_consent"]),
             hardware=dict(value["hardware"]),
         )
+
+
+def model_run_config_sha256(config: ModelRunConfig) -> str:
+    """Hash the canonical execution config used across process boundaries."""
+    payload = json.dumps(
+        config.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)

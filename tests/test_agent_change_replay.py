@@ -12,7 +12,7 @@ from unittest import mock
 
 import watch_files
 from evals.agent_changes import artifacts, benchmark, live_eval, replay, scoring
-from model_runner import ModelRunConfig, Pricing
+from model_runner import ModelRunConfig, Pricing, model_run_config_sha256
 
 
 CORPUS_FAMILIES = {
@@ -57,8 +57,12 @@ def plan_with_approved_qwen_artifact() -> dict[str, object]:
     candidate["runtime_artifact"] = {
         "status": "approved",
         "runtime": "llm-ollama",
+        "runtime_version": "1.0",
+        "model": "qwen-eval",
         "runtime_model_id": "qwen3.5:35b-a3b",
         "runtime_artifact_sha256": "a" * 64,
+        "quantization": "bfloat16",
+        "max_output_tokens_option": "max_tokens",
         "source_binding": {
             "model_artifact": candidate["model_artifact"],
             "model_revision": candidate["model_revision"],
@@ -68,6 +72,34 @@ def plan_with_approved_qwen_artifact() -> dict[str, object]:
         },
     }
     return plan
+
+
+def approved_qwen_config(plan: dict[str, object]) -> ModelRunConfig:
+    return benchmark.prepare_run_config(
+        plan,
+        candidate_id="qwen35-a3b-local",
+        model="qwen-eval",
+        provider="local",
+        runtime="llm-ollama",
+        runtime_version="1.0",
+        quantization="bfloat16",
+        model_options={"temperature": 0},
+        timeout_seconds=60,
+        max_output_tokens=4096,
+        max_output_tokens_option="max_tokens",
+        max_output_bytes=262144,
+        pricing=Pricing(None, None, "not-applicable", "not-applicable"),
+        max_cost_usd=None,
+        external_upload_consent=False,
+        hardware={
+            "device": "test",
+            "amortized_hourly_cost_usd": 1.0,
+            "model_load_ms": 1,
+            "peak_memory_bytes": 1024,
+            "runtime_model_id": "qwen3.5:35b-a3b",
+            "runtime_artifact_sha256": "a" * 64,
+        },
+    )
 
 
 def plan_with_approved_hosted_artifact(
@@ -89,6 +121,7 @@ def plan_with_approved_hosted_artifact(
         "model": model,
         "provider_model_revision": provider_model_revision,
         "quantization": quantization,
+        "max_output_tokens_option": "max_tokens",
         "source_binding": {
             "model_artifact": candidate["model_artifact"],
             "model_revision": candidate["model_revision"],
@@ -99,7 +132,182 @@ def plan_with_approved_hosted_artifact(
     return plan
 
 
+def approved_hosted_config(plan: dict[str, object]) -> ModelRunConfig:
+    return benchmark.prepare_run_config(
+        plan,
+        candidate_id="deepseek-v4-flash-hosted",
+        model="hosted-deepseek",
+        provider="test-provider",
+        runtime="test-runtime",
+        runtime_version="1.0.0",
+        quantization="fp8",
+        model_options={"temperature": 0},
+        timeout_seconds=60,
+        max_output_tokens=4096,
+        max_output_tokens_option="max_tokens",
+        max_output_bytes=262144,
+        pricing=Pricing(
+            1.0, 1.0, "https://provider.example/pricing", "2026-08-30",
+        ),
+        max_cost_usd=100.0,
+        external_upload_consent=True,
+        hardware={
+            "endpoint": "fixture",
+            "provider_model_revision": "deepseek-v4-flash-test-revision",
+        },
+    )
+
+
 class AgentChangeReplayTests(unittest.TestCase):
+    def test_pre_inference_validation_accepts_only_complete_frozen_binding(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = approved_qwen_config(plan)
+        self.assertEqual(
+            benchmark.validate_model_run_config_against_plan(plan, config),
+            "qwen35-a3b-local",
+        )
+
+        mutations = (
+            {"candidate_id": "devstral-small-2-local"},
+            {"model": "other-alias"},
+            {"model_artifact": "other/model"},
+            {"model_revision": "b" * 40},
+            {"runtime": "other-runtime"},
+            {"runtime_version": "2.0"},
+            {"context_limit": config.context_limit - 1},
+            {"timeout_seconds": config.timeout_seconds + 1},
+            {"max_output_tokens": config.max_output_tokens - 1},
+            {"max_output_bytes": config.max_output_bytes - 1},
+            {"max_output_tokens_option": "unbounded_output"},
+            {"model_options": {"temperature": 0, "extra_option": True}},
+            {"model_options": {"temperature": False}},
+            {"quantization": "different"},
+            {"provider": "hosted-provider"},
+            {"external_upload_consent": True},
+            {"hardware": {
+                **config.hardware,
+                "runtime_artifact_sha256": "c" * 64,
+            }},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                tampered = ModelRunConfig.from_dict({
+                    **config.to_dict(),
+                    **mutation,
+                })
+                with self.assertRaises(ValueError):
+                    benchmark.validate_model_run_config_against_plan(plan, tampered)
+
+    def test_pre_inference_validation_rejects_hosted_binding_changes(self) -> None:
+        plan = plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        )
+        config = approved_hosted_config(plan)
+        self.assertEqual(
+            benchmark.validate_model_run_config_against_plan(plan, config),
+            "deepseek-v4-flash-hosted",
+        )
+        mutations = (
+            {"model": "gemini-3.7-flash"},
+            {"provider": "other-provider"},
+            {"runtime_version": "2.0.0"},
+            {"quantization": "different"},
+            {"max_output_tokens_option": "unbounded_output"},
+            {"model_options": {"temperature": 0, "extra_option": True}},
+            {"hardware": {
+                **config.hardware,
+                "provider_model_revision": "different-revision",
+            }},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                tampered = ModelRunConfig.from_dict({
+                    **config.to_dict(),
+                    **mutation,
+                })
+                with self.assertRaises(ValueError):
+                    benchmark.validate_model_run_config_against_plan(plan, tampered)
+
+    def test_live_eval_rejects_unregistered_config_before_any_runtime_work(self) -> None:
+        hosted_plan = plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        )
+        configs = (
+            approved_qwen_config(plan_with_approved_qwen_artifact()),
+            approved_hosted_config(hosted_plan),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for config in configs:
+                with self.subTest(locality=config.locality):
+                    config_path = root / f"{config.locality}-config.json"
+                    artifacts.write_private_json(config_path, config.to_dict())
+                    with (
+                        mock.patch(
+                            "evals.agent_changes.live_eval.benchmark_cost_preflight"
+                        ) as cost_preflight,
+                        mock.patch(
+                            "evals.agent_changes.live_eval.attest_runtime"
+                        ) as runtime_attestation,
+                        mock.patch(
+                            "evals.agent_changes.live_eval.watch_files."
+                            "validate_model_run_config_privacy"
+                        ) as privacy_validation,
+                        mock.patch(
+                            "evals.agent_changes.live_eval.subprocess.Popen"
+                        ) as watcher,
+                        self.assertRaisesRegex(
+                            ValueError, "no approved runtime artifact"
+                        ),
+                    ):
+                        live_eval.main([
+                            "temporal",
+                            "--model-run-config", str(config_path),
+                            "--destination", str(root / "replay"),
+                            "--results-directory", str(root / "results"),
+                        ])
+                    cost_preflight.assert_not_called()
+                    runtime_attestation.assert_not_called()
+                    privacy_validation.assert_not_called()
+                    watcher.assert_not_called()
+
+    def test_watcher_command_pins_the_validated_config_bytes(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = approved_qwen_config(plan)
+        args = argparse.Namespace(
+            destination=Path("replay"),
+            model=config.model,
+            debounce=3,
+            review_timeout=config.timeout_seconds,
+            reasoning_effort="auto",
+            log=False,
+            model_run_config=Path("approved.json"),
+            model_run_config_sha256=model_run_config_sha256(config),
+            benchmark_plan=Path("approved-plan.json"),
+            benchmark_plan_sha256=benchmark.plan_sha256(plan),
+        )
+
+        command = live_eval.watcher_command(args)
+
+        digest_index = command.index("--model-run-config-sha256")
+        self.assertEqual(
+            command[digest_index + 1], model_run_config_sha256(config),
+        )
+        plan_digest_index = command.index("--benchmark-plan-sha256")
+        self.assertEqual(
+            command[plan_digest_index + 1], benchmark.plan_sha256(plan),
+        )
+
     def test_private_artifact_write_does_not_repermission_existing_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -536,10 +744,10 @@ class AgentChangeReplayTests(unittest.TestCase):
         config = benchmark.prepare_run_config(
             plan,
             candidate_id="qwen35-a3b-local",
-            model="local-qwen",
+            model="qwen-eval",
             provider="local",
             runtime="llm-ollama",
-            runtime_version="1.0.0",
+            runtime_version="1.0",
             quantization="bfloat16",
             model_options={"temperature": 0},
             timeout_seconds=60,
@@ -584,8 +792,8 @@ class AgentChangeReplayTests(unittest.TestCase):
             benchmark_plan=plan,
             runtime_attestation={
                 "llm_cli_version": "fixture",
-                "runtime": {"name": "llm-ollama", "version": "1.0.0"},
-                "model_registry_entry": "Ollama: qwen3.5:35b-a3b (aliases: local-qwen)",
+                "runtime": {"name": "llm-ollama", "version": "1.0"},
+                "model_registry_entry": "Ollama: qwen3.5:35b-a3b (aliases: qwen-eval)",
                 "local_model": {
                     "runtime_model_id": "qwen3.5:35b-a3b",
                     "runtime_artifact_sha256": "a" * 64,
@@ -602,6 +810,12 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(summary["status_counts"], {"timeout": 1})
         self.assertEqual(summary["status"], "incomplete-run")
         self.assertIsNone(scorecard["decision"]["selection"])
+        boolean_temperature = json.loads(json.dumps(run))
+        boolean_temperature["configuration"]["benchmark"][
+            "model_run_config"
+        ]["model_options"]["temperature"] = False
+        with self.assertRaisesRegex(ValueError, "model options differ"):
+            benchmark.build_scorecard(plan, [boolean_temperature])
         run["metrics"] = dict(run["metrics"])
         run["metrics"]["fn"] = 0
         with self.assertRaisesRegex(ValueError, "metrics do not match"):

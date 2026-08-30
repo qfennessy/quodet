@@ -25,6 +25,7 @@ from model_runner import (
     ModelRunConfig,
     ModelRunRequest,
     load_model_run_config,
+    model_run_config_sha256,
     preflight_model_run,
 )
 
@@ -360,6 +361,11 @@ def watcher_command(args: argparse.Namespace) -> list[str]:
         command.append("--log")
     if getattr(args, "model_run_config", None) is not None:
         command.extend(["--model-run-config", str(args.model_run_config)])
+        command.extend([
+            "--model-run-config-sha256", args.model_run_config_sha256,
+            "--benchmark-plan", str(args.benchmark_plan),
+            "--benchmark-plan-sha256", args.benchmark_plan_sha256,
+        ])
     return command
 
 
@@ -565,21 +571,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     maximum_authorized_cost = None
     runtime_attestation = None
     if model_run_config is not None:
-        watch_files.validate_model_run_config_privacy(model_run_config)
         args.model_run_config = run_config_path.expanduser().resolve()
-        benchmark_plan = benchmark.load_plan(
-            getattr(args, "benchmark_plan", benchmark.DEFAULT_PLAN)
+        args.benchmark_plan = getattr(
+            args, "benchmark_plan", benchmark.DEFAULT_PLAN,
+        ).expanduser().resolve()
+        benchmark_plan = benchmark.load_plan(args.benchmark_plan)
+        benchmark.validate_model_run_config_against_plan(
+            benchmark_plan, model_run_config,
         )
-        candidate = benchmark_plan["candidates"].get(model_run_config.candidate_id)
-        if candidate is None:
-            raise ValueError("model run config candidate is absent from benchmark plan")
-        for name, expected in (
-            ("model_artifact", candidate["model_artifact"]),
-            ("model_revision", candidate["model_revision"]),
-            ("locality", candidate["required_locality"]),
-        ):
-            if getattr(model_run_config, name) != expected:
-                raise ValueError(f"model run config {name} differs from benchmark plan")
+        args.model_run_config_sha256 = model_run_config_sha256(model_run_config)
+        args.benchmark_plan_sha256 = benchmark.plan_sha256(benchmark_plan)
+        watch_files.validate_model_run_config_privacy(model_run_config)
         maximum_authorized_cost = benchmark_cost_preflight(model_run_config, cases)
         runtime_attestation = attest_runtime(model_run_config)
         args.model = model_run_config.model
