@@ -46,6 +46,7 @@ from model_runner import (
     model_run_config_sha256,
     run_model,
 )
+from recommendation_grounding import extract_test_symbols, is_test_file
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_redaction_summary
 from redaction import (
     REDACTED,
@@ -1158,6 +1159,9 @@ def _execute_review_command(
         return None
 
     reviewed_paths = set(provider_path_map.values())
+    provider_label_by_path = {
+        original: label for label, original in provider_path_map.items()
+    }
     reviewed_files = tuple(
         ReviewedFile(
             path=snapshot.relative_path.as_posix(),
@@ -1167,12 +1171,23 @@ def _execute_review_command(
         for snapshot in snapshots
         if snapshot.relative_path.as_posix() in reviewed_paths
     )
+    supplied_test_symbols = extract_test_symbols(
+        tuple(
+            redact_sensitive_values(snapshot.contents)[0]
+            for snapshot in snapshots
+            if snapshot.relative_path.as_posix() in reviewed_paths
+            and is_test_file(
+                provider_label_by_path[snapshot.relative_path.as_posix()]
+            )
+        )
+    )
     try:
         batch = parse_review_output(
             result.stdout,
             root=root,
             reviewed_files=reviewed_files,
             provider_path_map=provider_path_map,
+            supplied_test_symbols=supplied_test_symbols,
             session_id=session_id,
             feedback_round=feedback_round,
             debounce_ms=debounce_ms,

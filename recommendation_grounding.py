@@ -31,6 +31,11 @@ _TEST_WORD = re.compile(
     r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_TEST_SYMBOL = re.compile(
+    r"(?<![A-Za-z0-9_])(?:test_[A-Za-z0-9_]+|"
+    r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _MUTATION_VERB = re.compile(
     r"\b(?:preserve|retain|extend|modify|update|keep)\b", re.IGNORECASE
 )
@@ -69,9 +74,23 @@ def _clauses(value: str) -> list[str]:
     return [clause.strip() for clause in _CLAUSE_BOUNDARY.split(value) if clause.strip()]
 
 
-def _mutates_unsupplied_test(clause: str) -> bool:
+def extract_test_symbols(sources: Sequence[str]) -> tuple[str, ...]:
+    """Return test-style identifiers visibly present in supplied source text."""
+    matches = {
+        match.group(0)
+        for source in sources
+        for match in _TEST_SYMBOL.finditer(source)
+    }
+    return tuple(sorted(matches))
+
+
+def _mutates_unsupplied_test(
+    clause: str, *, supplied_test_symbols: set[str]
+) -> bool:
     """Return whether the nearest intent verb targets a generic test mention."""
     for test_match in _TEST_WORD.finditer(clause):
+        if test_match.group(0) in supplied_test_symbols:
+            continue
         preceding = clause[: test_match.start()]
         intents = [
             *((match.end(), "mutation") for match in _MUTATION_VERB.finditer(preceding)),
@@ -88,11 +107,15 @@ def _path_is_proposed(clause: str, path_start: int) -> bool:
 
 
 def evaluate_recommendation(
-    recommendation: str, *, supplied_files: Sequence[str]
+    recommendation: str,
+    *,
+    supplied_files: Sequence[str],
+    supplied_test_symbols: Sequence[str] = (),
 ) -> dict[str, object]:
     """Return machine-readable grounding failures, independent of bug detection."""
     normalized_files = {path.replace("\\", "/") for path in supplied_files}
     supplied_tests = sorted(path for path in normalized_files if is_test_file(path))
+    visible_symbols = set(supplied_test_symbols)
     violations: list[dict[str, str]] = []
     clauses = _clauses(recommendation)
     path_references = [
@@ -105,6 +128,15 @@ def evaluate_recommendation(
         for clause_index, clause in enumerate(clauses)
         for path_match in _TEST_PATH.finditer(clause)
     ]
+    for clause_index, clause in enumerate(clauses):
+        for path in supplied_tests:
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(path)}(?![A-Za-z0-9_.-])"
+            )
+            path_references.extend(
+                (clause_index, clause, path, False)
+                for _ in pattern.finditer(clause)
+            )
     supplied_references = {
         path
         for _, _, path, _ in path_references
@@ -122,7 +154,7 @@ def evaluate_recommendation(
             }
         )
     elif any(
-        _mutates_unsupplied_test(clause)
+        _mutates_unsupplied_test(clause, supplied_test_symbols=visible_symbols)
         and not any(
             reference_clause_index == clause_index and path in supplied_tests
             for reference_clause_index, _, path, _ in path_references
@@ -156,11 +188,15 @@ def evaluate_recommendation(
         "status": "grounded" if not violations else "failure",
         "violations": violations,
         "supplied_test_files": supplied_tests,
+        "supplied_test_symbols": sorted(visible_symbols),
     }
 
 
 def evaluate_findings(
-    findings: Sequence[dict[str, object]], *, supplied_files: Sequence[str]
+    findings: Sequence[dict[str, object]],
+    *,
+    supplied_files: Sequence[str],
+    supplied_test_symbols: Sequence[str] = (),
 ) -> dict[str, object]:
     """Score every provider recommendation while retaining per-finding evidence."""
     results = []
@@ -169,7 +205,9 @@ def evaluate_findings(
         if not isinstance(recommendation, str):
             continue
         result = evaluate_recommendation(
-            recommendation, supplied_files=supplied_files
+            recommendation,
+            supplied_files=supplied_files,
+            supplied_test_symbols=supplied_test_symbols,
         )
         results.append(
             {

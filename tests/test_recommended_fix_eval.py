@@ -114,6 +114,30 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "grounded")
         self.assertEqual(result["supplied_test_files"], ["__tests__/cache.js"])
 
+    def test_plain_filename_in_tests_directory_is_extractable_evidence(self) -> None:
+        result = scoring.evaluate_recommendation(
+            "Extend tests/cache.py with an expired entry.",
+            supplied_files=["cache.py", "tests/cache.py"],
+        )
+
+        self.assertEqual(result["status"], "grounded")
+        self.assertEqual(result["supplied_test_files"], ["tests/cache.py"])
+
+    def test_visible_test_symbol_is_grounded_but_an_unknown_symbol_is_not(self) -> None:
+        visible = scoring.evaluate_recommendation(
+            "Extend test_unexpired_entry with an expiry assertion.",
+            supplied_files=["tests/cache.py"],
+            supplied_test_symbols=["test_unexpired_entry"],
+        )
+        unknown = scoring.evaluate_recommendation(
+            "Extend test_missing_entry with an expiry assertion.",
+            supplied_files=["tests/cache.py"],
+            supplied_test_symbols=["test_unexpired_entry"],
+        )
+
+        self.assertEqual(visible["status"], "grounded")
+        self.assertEqual(unknown["status"], "failure")
+
     def test_unsupplied_test_symbol_is_rejected(self) -> None:
         result = scoring.evaluate_recommendation(
             "Extend test_expired_entry with a stale-value assertion.",

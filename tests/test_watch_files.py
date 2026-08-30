@@ -750,6 +750,63 @@ class WatchFilesTests(unittest.TestCase):
             self.assertNotIn(secret, diagnostic)
             self.assertNotIn(secret[:10], diagnostic)
 
+    def test_review_grounds_a_visible_symbol_from_a_supplied_test(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "tests" / "cache.py"
+            source.parent.mkdir()
+            source.write_text(
+                "def test_unexpired_entry():\n    assert True\n",
+                encoding="utf-8",
+            )
+            response = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "file": "tests/cache.py",
+                            "line": 1,
+                            "severity": "medium",
+                            "confidence": 0.99,
+                            "title": "Missing expiry coverage",
+                            "explanation": "The expiry branch is not exercised.",
+                            "suggested_fix": (
+                                "Extend test_unexpired_entry with an expiry assertion."
+                            ),
+                        }
+                    ]
+                }
+            )
+            result = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": response,
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
+            )()
+
+            with mock.patch(
+                "watch_files.run_bounded_command", return_value=result
+            ):
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="gpt-5.6-luna",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort="high",
+                    sink=mock.Mock(),
+                )
+
+            self.assertIsNotNone(batch)
+            assert batch is not None
+            self.assertEqual(batch.findings[0].file, "tests/cache.py")
+
     def test_evaluation_event_preserves_provider_streams_and_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()

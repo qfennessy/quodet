@@ -216,6 +216,7 @@ def parse_review_output(
     root: Path,
     reviewed_files: Sequence[ReviewedFile],
     provider_path_map: Mapping[str, str] | None = None,
+    supplied_test_symbols: Sequence[str] = (),
     session_id: str | None = None,
     feedback_round: int = 1,
     debounce_ms: float = 0.0,
@@ -262,9 +263,15 @@ def parse_review_output(
         suggested_fix = _bounded_string(
             raw["suggested_fix"], "suggested_fix", MAX_FIX_LENGTH
         )
+        grounding_files = (
+            tuple(provider_path_map)
+            if provider_path_map is not None
+            else tuple(reviewed)
+        )
         grounding = evaluate_recommendation(
             suggested_fix,
-            supplied_files=tuple(reviewed),
+            supplied_files=grounding_files,
+            supplied_test_symbols=supplied_test_symbols,
         )
         if grounding["status"] != "grounded":
             violations = grounding["violations"]

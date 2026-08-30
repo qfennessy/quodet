@@ -426,6 +426,51 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertIs(outcome.model_attempted, True)
         self.assertGreaterEqual(outcome.latency_ms, 0)
 
+    def test_live_schema_rejects_file_outside_the_case_enum(self) -> None:
+        output: queue.Queue[str] = queue.Queue()
+        response = {"findings": [provider_finding("service.py", "Wrong prefix.")]}
+        output.put(json.dumps({"quodet_evaluation_event": {
+            "status": "success",
+            "returncode": 0,
+            "raw_response": json.dumps(response),
+            "stderr": "",
+        }}) + "\n")
+
+        outcome = live_eval.wait_for_outcome(
+            output,
+            timeout=1,
+            allowed_files=("03_cross_file_units/service.py",),
+        )
+
+        self.assertEqual(outcome.status, "schema-error")
+        self.assertIn("per-case enum", outcome.error or "")
+
+    def test_live_grounding_uses_case_prefixed_paths_and_visible_symbols(self) -> None:
+        case = replay.case_by_id(
+            replay.load_manifest(), "02_source_and_test_boundary"
+        )
+        source_path, test_path = live_eval.case_provider_paths(case)
+        for suggested_fix in (
+            f"Extend {test_path} with a second-page assertion.",
+            "Extend test_first_page_starts_with_first_item with a second page.",
+        ):
+            finding = provider_finding(source_path, "Pagination skips an item.")
+            finding["suggested_fix"] = suggested_fix
+            provider = live_eval.ProviderOutcome(
+                status="schema-valid",
+                latency_ms=1,
+                transcript="",
+                raw_response=json.dumps({"findings": [finding]}),
+                parsed_response={"findings": [finding]},
+                error=None,
+            )
+
+            with self.subTest(suggested_fix=suggested_fix):
+                outcome = live_eval.case_outcome(case, provider)
+                grounding = outcome["diagnostics"]["recommendation_grounding"]
+                self.assertEqual(outcome["status"], "schema-valid")
+                self.assertEqual(grounding["failures"], 0)
+
     def test_live_schema_validation_matches_recorded_schema_and_strict_json(self) -> None:
         finding = provider_finding("", "")
         finding["title"] = ""
@@ -499,7 +544,9 @@ class AgentChangeReplayTests(unittest.TestCase):
         case = replay.case_by_id(replay.load_manifest(), "12_semantically_invalid_external_value")
         provider = live_eval.ProviderOutcome(
             status="schema-valid", latency_ms=12, transcript="", raw_response="{}",
-            parsed_response={"findings": [provider_finding("provider.py", "Wrong diagnosis")]},
+            parsed_response={"findings": [provider_finding(
+                live_eval.case_provider_paths(case)[0], "Wrong diagnosis"
+            )]},
             error=None,
         )
         outcome = live_eval.case_outcome(case, provider)
@@ -519,7 +566,8 @@ class AgentChangeReplayTests(unittest.TestCase):
     def test_recommendation_grounding_scores_separately_from_detection(self) -> None:
         case = replay.case_by_id(replay.load_manifest(), "01_obvious_runtime")
         finding = provider_finding(
-            "calculator.py", "The undefined name raises for non-empty input."
+            live_eval.case_provider_paths(case)[0],
+            "The undefined name raises for non-empty input.",
         )
         finding["suggested_fix"] = (
             "Use values and preserve the existing non-empty regression test."

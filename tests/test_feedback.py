@@ -237,6 +237,38 @@ class FeedbackTests(unittest.TestCase):
                 provider_path_map={provider_label: original},
             )
 
+    def test_parse_grounds_provider_visible_test_path_and_symbol(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        original = f"{secret}/tests/cache.py"
+        source = self.root / original
+        source.parent.mkdir(parents=True)
+        source.write_text("def test_unexpired_entry(): pass\n", encoding="utf-8")
+        import hashlib
+
+        reviewed = (
+            ReviewedFile(
+                original,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                source.stat().st_size,
+            ),
+        )
+        provider_label = "[REDACTED]/tests/cache.py"
+        for suggested_fix in (
+            f"Extend {provider_label} with an expiry assertion.",
+            "Extend test_unexpired_entry with an expiry assertion.",
+        ):
+            raw = json.loads(valid_output(provider_label))
+            raw["findings"][0]["suggested_fix"] = suggested_fix
+            with self.subTest(suggested_fix=suggested_fix):
+                batch = parse_review_output(
+                    json.dumps(raw),
+                    root=self.root,
+                    reviewed_files=reviewed,
+                    provider_path_map={provider_label: original},
+                    supplied_test_symbols=("test_unexpired_entry",),
+                )
+                self.assertEqual(batch.findings[0].file, original)
+
     def test_freshness_removes_finding_after_file_changes(self) -> None:
         batch = self.parse(valid_output())
         (self.root / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
