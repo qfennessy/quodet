@@ -465,8 +465,10 @@ class AgentIntegrationTests(unittest.TestCase):
                     post["hookSpecificOutput"]["hookEventName"], "PostToolUse"  # type: ignore[index]
                 )
                 message = post["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+                self.assertRegex(message, r"Batch qdt-[0-9a-f]{8} latency")
                 self.assertIn("watcher debounce 3000.0 ms", message)
                 self.assertIn("provider 125.0 ms", message)
+                self.assertIn("publication", message)
                 self.assertIn("hook delivery wait", message)
                 self.assertEqual(len(list((self.spool / "pending").glob("*.json"))), 1)
                 self.assertEqual(

@@ -6,6 +6,8 @@ import json
 import unicodedata
 from typing import Protocol, Sequence
 
+from review_lifecycle import batch_timing, short_batch_id
+
 
 OUTPUT_SCHEMA_VERSION = "quodet-review-output-v1"
 OUTPUT_MODES = ("human", "json")
@@ -30,6 +32,15 @@ class ReviewFindingLike(Protocol):
     suggested_fix: str
 
 
+class FindingLifecycleLike(Protocol):
+    status: str
+    fingerprint: str
+    file: str
+    line: int
+    previous_fingerprint: str | None
+    reason: str | None
+
+
 class ReviewBatchLike(Protocol):
     batch_id: str
     root: str
@@ -47,6 +58,8 @@ class ReviewBatchLike(Protocol):
     provider_completed_at: float
     published_at: float
     redactions: RedactionSummaryLike
+    lifecycle: Sequence[FindingLifecycleLike]
+    stale_files: Sequence[str]
 
 
 class RedactionNoticeLike(Protocol):
@@ -100,6 +113,17 @@ def _redaction_document(summary: RedactionSummaryLike) -> dict[str, object]:
     }
 
 
+def _lifecycle_document(event: FindingLifecycleLike) -> dict[str, object]:
+    return {
+        "status": event.status,
+        "fingerprint": event.fingerprint,
+        "file": event.file,
+        "line": event.line,
+        "previous_fingerprint": event.previous_fingerprint,
+        "reason": event.reason,
+    }
+
+
 def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
     """Return the complete, explicitly versioned public review document.
 
@@ -129,6 +153,8 @@ def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
             "published_at": batch.published_at,
         },
         "redactions": _redaction_document(batch.redactions),
+        "lifecycle": [_lifecycle_document(event) for event in batch.lifecycle],
+        "stale_files": list(batch.stale_files),
     }
 
 
@@ -187,34 +213,70 @@ def render_redaction_summary(summary: RedactionSummaryLike) -> str:
 def render_human_review(batch: ReviewBatchLike) -> str:
     """Render a compact deterministic summary for a person watching a terminal."""
     reviewed = _count(len(batch.reviewed_files), "file")
-    finding_count = len(batch.findings)
-    heading = f"Quodet reviewed {reviewed}: "
-    heading += (
-        _count(finding_count, "likely defect")
-        if finding_count
-        else "no confident findings"
+    timing = batch_timing(batch)
+    batch_label = short_batch_id(batch.batch_id)
+    stages = (
+        f"[debounce {timing.debounce_ms:.1f}ms, provider "
+        f"{timing.provider_ms:.1f}ms, publication {timing.publication_ms:.1f}ms]"
     )
-    lines = [heading]
-    for finding in batch.findings:
-        path = _terminal_text(finding.file, maximum=1_024)
-        severity = _terminal_text(finding.severity, maximum=32)
-        title = _terminal_text(finding.title, maximum=MAX_HUMAN_TITLE_LENGTH)
-        explanation = _terminal_text(
-            finding.explanation, maximum=MAX_HUMAN_DETAIL_LENGTH
-        )
-        suggested_fix = _terminal_text(
-            finding.suggested_fix, maximum=MAX_HUMAN_DETAIL_LENGTH
-        )
-        lines.extend(
-            [
-                f"{path}:{finding.line} [{severity}, {finding.confidence:.2f}] {title}",
-                f"  {explanation}",
-                f"  Suggested action: {suggested_fix}",
+    lifecycle_counts: dict[str, int] = {}
+    for event in batch.lifecycle:
+        lifecycle_counts[event.status] = lifecycle_counts.get(event.status, 0) + 1
+    finding_count = len(batch.findings)
+    if finding_count == 0:
+        if batch.stale_files or lifecycle_counts.get("stale"):
+            lines = [
+                f"{batch_label} discarded after {timing.total_ms / 1_000:.2f}s: "
+                f"source changed during review {stages}"
             ]
+        else:
+            omitted = lifecycle_counts.get("no_longer_reported", 0)
+            if omitted:
+                result = (
+                    f"{_count(omitted, 'prior finding')} no longer reported "
+                    "in the latest snapshot"
+                )
+            else:
+                result = "no confident findings"
+            lines = [
+                f"{batch_label} reviewed {reviewed} in "
+                f"{timing.total_ms / 1_000:.2f}s: {result} {stages}"
+            ]
+    else:
+        lifecycle_summary = ", ".join(
+            f"{count} {status.replace('_', ' ')}"
+            for status, count in sorted(lifecycle_counts.items())
+            if status != "no_longer_reported"
         )
-    redactions = batch.redactions
-    if redactions.total:
-        lines.append(render_redaction_summary(redactions))
+        heading = (
+            f"{batch_label} reviewed {reviewed} in {timing.total_ms / 1_000:.2f}s: "
+            f"{_count(finding_count, 'likely defect')}"
+        )
+        if lifecycle_summary:
+            heading += f" ({lifecycle_summary})"
+        heading += f" {stages}"
+        lines = [heading]
+        for finding in batch.findings:
+            path = _terminal_text(finding.file, maximum=1_024)
+            severity = _terminal_text(finding.severity, maximum=32)
+            title = _terminal_text(finding.title, maximum=MAX_HUMAN_TITLE_LENGTH)
+            explanation = _terminal_text(
+                finding.explanation, maximum=MAX_HUMAN_DETAIL_LENGTH
+            )
+            suggested_fix = _terminal_text(
+                finding.suggested_fix, maximum=MAX_HUMAN_DETAIL_LENGTH
+            )
+            lines.extend(
+                [
+                    f"{path}:{finding.line} "
+                    f"[{severity}, {finding.confidence:.2f}] {title}",
+                    f"  {explanation}",
+                    f"  Suggested action: {suggested_fix}",
+                ]
+            )
+    redaction_summary = render_redaction_summary(batch.redactions)
+    if redaction_summary:
+        lines.extend(["", redaction_summary])
     return "\n".join(lines)
 
 

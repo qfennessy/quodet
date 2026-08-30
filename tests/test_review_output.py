@@ -7,6 +7,7 @@ import unittest
 
 from feedback import ReviewBatch, ReviewFinding, ReviewedFile
 from redaction import RedactionNotice, RedactionSummary
+from review_lifecycle import FindingLifecycle
 from review_output import (
     OUTPUT_SCHEMA_VERSION,
     render_human_review,
@@ -61,7 +62,8 @@ class ReviewOutputTests(unittest.TestCase):
 
         self.assertEqual(
             rendered,
-            "Quodet reviewed 2 files: no confident findings",
+            "qdt-3ea14b6a reviewed 2 files in 3.60s: no confident findings "
+            "[debounce 3000.0ms, provider 425.5ms, publication 100.0ms]",
         )
         self.assertNotIn("{", rendered)
 
@@ -72,7 +74,8 @@ class ReviewOutputTests(unittest.TestCase):
             rendered,
             "\n".join(
                 [
-                    "Quodet reviewed 2 files: 1 likely defect",
+                    "qdt-3ea14b6a reviewed 2 files in 3.60s: 1 likely defect "
+                    "[debounce 3000.0ms, provider 425.5ms, publication 100.0ms]",
                     "src/service.py:10 [medium, 0.99] Failed cleanup races with a pending insert",
                     "  A delayed task can write after rollback completes.",
                     "  Suggested action: Cancel and await both tasks before deleting records.",
@@ -151,6 +154,8 @@ class ReviewOutputTests(unittest.TestCase):
                 "feedback_round",
                 "timing",
                 "redactions",
+                "lifecycle",
+                "stale_files",
             },
         )
         serialized_batch_fields = (
@@ -207,6 +212,31 @@ class ReviewOutputTests(unittest.TestCase):
             },
         )
 
+    def test_lifecycle_is_explicit_in_json_and_compact_in_human_output(self) -> None:
+        fingerprint = "a" * 64
+        omitted = replace(
+            batch(),
+            lifecycle=(
+                FindingLifecycle(
+                    status="no_longer_reported",
+                    fingerprint=fingerprint,
+                    file="src/service.py",
+                    line=10,
+                    previous_fingerprint=fingerprint,
+                ),
+            ),
+        )
+
+        rendered = render_human_review(omitted)
+        document = review_output_document(omitted)
+
+        self.assertIn(
+            "1 prior finding no longer reported in the latest snapshot",
+            rendered,
+        )
+        self.assertNotIn("resolved", rendered.lower())
+        self.assertEqual(document["lifecycle"][0]["status"], "no_longer_reported")
+        self.assertEqual(document["stale_files"], [])
 
 if __name__ == "__main__":
     unittest.main()

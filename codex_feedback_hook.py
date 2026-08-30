@@ -35,6 +35,7 @@ from feedback import (
     write_session_state,
 )
 from redaction import redact_path, redact_text
+from review_lifecycle import short_batch_id
 
 
 MAX_DELIVERY_FINDINGS = 10
@@ -132,6 +133,7 @@ def _record_delivery_metric(
     hook_wait_ms = max(0.0, (delivered_at - published_at) * 1_000)
     value = {
         "version": 1,
+        "batch_id": payload["batch_id"],
         "root": payload["root"],
         "session_id": payload["session_id"],
         "recorded_at": time.time(),
@@ -423,6 +425,12 @@ def render_feedback_chunk(
     provider_ms = payload.get("provider_ms")
     if all(isinstance(value, (int, float)) for value in (published_at, debounce_ms, provider_ms)):
         hook_wait_ms = max(0.0, (time.time() - float(published_at)) * 1_000)
+        provider_completed_at = payload.get("provider_completed_at")
+        publication_ms = (
+            max(0.0, (float(published_at) - float(provider_completed_at)) * 1_000)
+            if isinstance(provider_completed_at, (int, float))
+            else 0.0
+        )
         first_observed_at = payload.get("first_observed_at")
         total_ms = (
             max(0.0, (time.time() - float(first_observed_at)) * 1_000)
@@ -430,14 +438,29 @@ def render_feedback_chunk(
             else float(debounce_ms) + float(provider_ms) + hook_wait_ms
         )
         latency_line = (
-            "Latency: watcher debounce "
+            f"Batch {short_batch_id(str(payload['batch_id']))} latency: watcher debounce "
             f"{float(debounce_ms):.1f} ms; provider {float(provider_ms):.1f} ms; "
+            f"publication {publication_ms:.1f} ms; "
             f"hook delivery wait {hook_wait_ms:.1f} ms; "
             f"total edit-to-feedback {total_ms:.1f} ms."
         )
         lines = [ready_line, UNTRUSTED_NOTICE, AGENT_ACTION, latency_line]
     else:
         lines = [ready_line, UNTRUSTED_NOTICE, AGENT_ACTION]
+    lifecycle = payload.get("lifecycle")
+    if isinstance(lifecycle, list):
+        counts: dict[str, int] = {}
+        for item in lifecycle:
+            if isinstance(item, dict) and isinstance(item.get("status"), str):
+                status = str(item["status"])
+                counts[status] = counts.get(status, 0) + 1
+        visible = {key: value for key, value in counts.items() if key != "new"}
+        if visible:
+            summary = ", ".join(
+                f"{count} {status.replace('_', ' ')}"
+                for status, count in sorted(visible.items())
+            )
+            lines.append(f"Finding lifecycle: {summary}.")
     delivered = 0
     for index, finding in enumerate(findings):
         if not isinstance(finding, dict):

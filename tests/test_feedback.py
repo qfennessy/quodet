@@ -295,16 +295,21 @@ class FeedbackTests(unittest.TestCase):
             payload, root=self.root, session_id="agent-a"
         )
         (self.root / "src" / "app.py").write_text("changed\n")
-        self.assertEqual(
-            fresh_spooled_payload(validated, root=self.root)["findings"], []
-        )
+        fresh = fresh_spooled_payload(validated, root=self.root)
+        self.assertEqual(fresh["findings"], [])
+        self.assertEqual(fresh["stale_files"], ["src/app.py"])
+        self.assertEqual(fresh["lifecycle"][0]["status"], "stale")
+        self.assertEqual(fresh["lifecycle"][0]["reason"], "source_changed")
 
     def test_console_sink_defaults_to_human_and_supports_json(self) -> None:
         batch = self.parse(valid_output())
         human_output = io.StringIO()
         with mock.patch("sys.stdout", human_output):
             ConsoleSink().publish(batch)
-        self.assertIn("Quodet reviewed 1 file: 1 likely defect", human_output.getvalue())
+        self.assertRegex(
+            human_output.getvalue(),
+            r"qdt-[0-9a-f]{8} reviewed 1 file in [0-9.]+s: 1 likely defect",
+        )
         self.assertNotIn('"findings"', human_output.getvalue())
 
         json_output = io.StringIO()
