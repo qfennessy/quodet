@@ -412,12 +412,14 @@ class AgentChangeReplayTests(unittest.TestCase):
             "status": "success", "returncode": 0,
             "raw_response": raw_response, "stderr": "",
             "runtime_attestation": runtime_attestation,
+            "model_attempted": True,
         }}) + "\n")
         outcome = live_eval.wait_for_outcome(output, timeout=1)
         self.assertEqual(outcome.status, "schema-valid")
         self.assertEqual(outcome.raw_response, raw_response)
         self.assertEqual(outcome.parsed_response, response)
         self.assertEqual(outcome.runtime_attestation, runtime_attestation)
+        self.assertIs(outcome.model_attempted, True)
         self.assertGreaterEqual(outcome.latency_ms, 0)
 
     def test_live_schema_validation_matches_recorded_schema_and_strict_json(self) -> None:
@@ -791,6 +793,17 @@ class AgentChangeReplayTests(unittest.TestCase):
             },
         )
         fixture_case = replay.load_manifest()["cases"][0]
+        runtime_attestation = {
+            "llm_cli_version": "fixture",
+            "runtime": {"name": "llm-ollama", "version": "1.0"},
+            "model_registry_entry": (
+                "Ollama: qwen3.5:35b-a3b (aliases: qwen-eval)"
+            ),
+            "local_model": {
+                "runtime_model_id": "qwen3.5:35b-a3b",
+                "runtime_artifact_sha256": "a" * 64,
+            },
+        }
         cases = [
             {
                 "case_id": fixture_case["id"],
@@ -803,6 +816,10 @@ class AgentChangeReplayTests(unittest.TestCase):
                 "status": "timeout",
                 "latency_ms": 30000, "parsed_response": None,
                 "input_tokens": None, "output_tokens": None, "cost_usd": None,
+                "model_attempted": True,
+                "model_attempt_count": 1,
+                "effective_model_config": config.to_dict(),
+                "runtime_attestation": runtime_attestation,
             }
         ]
         run = raw_run(cases)
@@ -816,15 +833,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             inter_file_delay_seconds=0.25,
             model_run_config=config,
             benchmark_plan=plan,
-            runtime_attestation={
-                "llm_cli_version": "fixture",
-                "runtime": {"name": "llm-ollama", "version": "1.0"},
-                "model_registry_entry": "Ollama: qwen3.5:35b-a3b (aliases: qwen-eval)",
-                "local_model": {
-                    "runtime_model_id": "qwen3.5:35b-a3b",
-                    "runtime_artifact_sha256": "a" * 64,
-                },
-            },
+            runtime_attestation=runtime_attestation,
         )
         adjudication = {"run_id": "run-1", "fixture_revision": 3, "cases": {}}
         run["metrics"] = scoring.score_run(run, adjudication)
@@ -842,6 +851,41 @@ class AgentChangeReplayTests(unittest.TestCase):
         ]["model_options"]["temperature"] = False
         with self.assertRaisesRegex(ValueError, "model options differ"):
             benchmark.build_scorecard(plan, [boolean_temperature])
+        missing_case_attestation = json.loads(json.dumps(run))
+        del missing_case_attestation["cases"][0]["runtime_attestation"]
+        with self.assertRaisesRegex(ValueError, "missing live runtime attestation"):
+            benchmark.build_scorecard(plan, [missing_case_attestation])
+        tampered_case_attestation = json.loads(json.dumps(run))
+        tampered_case_attestation["cases"][0]["runtime_attestation"][
+            "local_model"
+        ]["runtime_artifact_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "local-model attestation differs"):
+            benchmark.build_scorecard(plan, [tampered_case_attestation])
+        wrong_effective_config = json.loads(json.dumps(run))
+        wrong_effective_config["cases"][0]["effective_model_config"][
+            "runtime_version"
+        ] = "different"
+        with self.assertRaisesRegex(ValueError, "effective model config differs"):
+            benchmark.build_scorecard(plan, [wrong_effective_config])
+        boolean_attempt_count = json.loads(json.dumps(run))
+        boolean_attempt_count["cases"][0]["model_attempt_count"] = True
+        with self.assertRaisesRegex(ValueError, "single model attempt"):
+            benchmark.build_scorecard(plan, [boolean_attempt_count])
+        startup_only = json.loads(json.dumps(run))
+        del startup_only["cases"][0]["model_attempted"]
+        with self.assertRaisesRegex(ValueError, "missing model-attempt provenance"):
+            benchmark.build_scorecard(plan, [startup_only])
+        pre_inference_failure = json.loads(json.dumps(run))
+        pre_inference_case = pre_inference_failure["cases"][0]
+        pre_inference_case["status"] = "provider-error"
+        pre_inference_case["model_attempted"] = False
+        pre_inference_case["model_attempt_count"] = None
+        pre_inference_case["runtime_attestation"] = None
+        pre_inference_case["effective_model_config"] = None
+        pre_inference_failure["metrics"] = scoring.score_run(
+            pre_inference_failure, adjudication
+        )
+        benchmark.validate_run_against_plan(plan, pre_inference_failure)
         run["metrics"] = dict(run["metrics"])
         run["metrics"]["fn"] = 0
         with self.assertRaisesRegex(ValueError, "metrics do not match"):

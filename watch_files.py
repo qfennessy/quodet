@@ -996,6 +996,7 @@ def _execute_review_command(
                 "returncode": None,
                 "raw_response": None,
                 "stderr": safe_error,
+                "model_attempted": False,
             }}), flush=True)
         else:
             print(f"Could not run llm: {error}", file=sys.stderr)

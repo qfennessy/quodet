@@ -659,6 +659,7 @@ class WatchFilesTests(unittest.TestCase):
             ]
             self.assertIsNone(result)
             self.assertEqual(event["status"], "provider-error")
+            self.assertIs(event["model_attempted"], False)
             self.assertIn("runtime blob changed", event["stderr"])
             runtime_attestation.assert_called_once_with(model_config)
             model_call.assert_not_called()

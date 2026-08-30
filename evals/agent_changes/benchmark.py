@@ -436,6 +436,46 @@ def validate_model_run_config_against_plan(
     return config.candidate_id
 
 
+def _validate_runtime_attestation(
+    model_config: Mapping[str, Any],
+    attestation: object,
+    *,
+    label: str,
+) -> None:
+    """Bind a recorded runtime observation to the exact effective config."""
+    if not isinstance(attestation, Mapping):
+        raise ValueError(f"{label} is missing live runtime attestation")
+    runtime_entry = attestation.get("runtime")
+    if not isinstance(runtime_entry, Mapping) or (
+        runtime_entry.get("name") != model_config.get("runtime")
+        or str(runtime_entry.get("version")) != model_config.get("runtime_version")
+    ):
+        raise ValueError(f"{label} runtime attestation differs from exact config")
+    llm_cli_version = attestation.get("llm_cli_version")
+    if not isinstance(llm_cli_version, str) or not llm_cli_version.strip():
+        raise ValueError(f"{label} is missing its exact llm CLI version")
+    registry_entry = attestation.get("model_registry_entry")
+    if not isinstance(registry_entry, str) or (
+        model_config.get("model") not in watch_files._listed_model_entries(
+            registry_entry
+        )
+    ):
+        raise ValueError(
+            f"{label} model registry entry differs from exact config"
+        )
+    if model_config.get("locality") == "local":
+        local_model = attestation.get("local_model")
+        hardware = model_config.get("hardware", {})
+        if not isinstance(local_model, Mapping) or (
+            local_model.get("runtime_model_id") != hardware.get("runtime_model_id")
+            or local_model.get("runtime_artifact_sha256")
+            != hardware.get("runtime_artifact_sha256")
+        ):
+            raise ValueError(
+                f"{label} local-model attestation differs from exact config"
+            )
+
+
 def validate_run_against_plan(
     plan: Mapping[str, Any], run: Mapping[str, Any]
 ) -> str:
@@ -508,26 +548,11 @@ def validate_run_against_plan(
             raise ValueError(
                 "run hosted identity differs from the frozen candidate binding"
             )
-    attestation = benchmark.get("runtime_attestation")
-    if not isinstance(attestation, Mapping):
-        raise ValueError("run is missing live runtime attestation")
-    runtime_entry = attestation.get("runtime")
-    if not isinstance(runtime_entry, Mapping) or (
-        runtime_entry.get("name") != model_config.get("runtime")
-        or str(runtime_entry.get("version")) != model_config.get("runtime_version")
-    ):
-        raise ValueError("run runtime attestation differs from exact config")
-    if not isinstance(attestation.get("model_registry_entry"), str):
-        raise ValueError("run is missing its exact llm model registry entry")
-    if model_config.get("locality") == "local":
-        local_model = attestation.get("local_model")
-        hardware = model_config.get("hardware", {})
-        if not isinstance(local_model, Mapping) or (
-            local_model.get("runtime_model_id") != hardware.get("runtime_model_id")
-            or local_model.get("runtime_artifact_sha256")
-            != hardware.get("runtime_artifact_sha256")
-        ):
-            raise ValueError("run local-model attestation differs from exact config")
+    _validate_runtime_attestation(
+        model_config,
+        benchmark.get("runtime_attestation"),
+        label="run",
+    )
     fixture = configuration.get("fixture", {})
     if fixture.get("revision") != plan["fixture"]["revision"]:
         raise ValueError("run fixture revision does not match the frozen plan")
@@ -573,6 +598,60 @@ def validate_run_against_plan(
                 raise ValueError(f"scored run case {case_id} has altered {key}")
         if outcome.get("status") not in valid_statuses:
             raise ValueError(f"scored run case {case_id} has invalid status")
+        model_attempted = outcome.get("model_attempted")
+        if model_attempted is True:
+            attempt_count = outcome.get("model_attempt_count")
+            if (
+                isinstance(attempt_count, bool)
+                or not isinstance(attempt_count, int)
+                or attempt_count != 1
+            ):
+                raise ValueError(
+                    f"scored run case {case_id} must retain its single model attempt"
+                )
+            if outcome.get("effective_model_config") != model_config:
+                raise ValueError(
+                    f"scored run case {case_id} effective model config differs "
+                    "from the approved run config"
+                )
+            _validate_runtime_attestation(
+                model_config,
+                outcome.get("runtime_attestation"),
+                label=f"scored run case {case_id}",
+            )
+        elif model_attempted is False:
+            if outcome.get("model_attempt_count") is not None:
+                raise ValueError(
+                    f"scored run case {case_id} records a contradictory model attempt"
+                )
+            if outcome.get("runtime_attestation") is not None:
+                raise ValueError(
+                    f"scored run case {case_id} records an unattached runtime attestation"
+                )
+            if outcome.get("effective_model_config") is not None:
+                raise ValueError(
+                    f"scored run case {case_id} records an unattached effective config"
+                )
+            if outcome.get("status") not in {"provider-error", "timeout"}:
+                raise ValueError(
+                    f"scored run case {case_id} has an invalid pre-inference status"
+                )
+        elif model_attempted is not None:
+            raise ValueError(
+                f"scored run case {case_id} has invalid model-attempt provenance"
+            )
+        elif outcome.get("status") not in {"harness-error", "interrupted"}:
+            raise ValueError(
+                f"scored run case {case_id} is missing model-attempt provenance"
+            )
+        elif (
+            outcome.get("model_attempt_count") is not None
+            or outcome.get("runtime_attestation") is not None
+            or outcome.get("effective_model_config") is not None
+        ):
+            raise ValueError(
+                f"scored run case {case_id} has contradictory attempt provenance"
+            )
     return str(candidate_id)
 
 

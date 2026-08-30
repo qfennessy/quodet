@@ -57,6 +57,7 @@ class ProviderOutcome:
     model_latency_ms: int | None = None
     model_attempt_count: int | None = None
     runtime_attestation: dict[str, Any] | None = None
+    model_attempted: bool | None = None
 
 
 def sha256_text(value: str) -> str:
@@ -122,7 +123,10 @@ def evaluation_configuration(
 def _model_result_fields(event: dict[str, Any]) -> dict[str, Any]:
     result = event.get("model_run_result")
     if not isinstance(result, dict):
-        return {"runtime_attestation": event.get("runtime_attestation")}
+        return {
+            "runtime_attestation": event.get("runtime_attestation"),
+            "model_attempted": event.get("model_attempted"),
+        }
     return {
         "input_tokens": result.get("input_tokens"),
         "output_tokens": result.get("output_tokens"),
@@ -133,6 +137,7 @@ def _model_result_fields(event: dict[str, Any]) -> dict[str, Any]:
         "model_latency_ms": result.get("latency_ms"),
         "model_attempt_count": result.get("attempt_count"),
         "runtime_attestation": event.get("runtime_attestation"),
+        "model_attempted": True,
     }
 
 
@@ -233,6 +238,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                 "timeout", round((time.monotonic() - started) * 1000),
                 "".join(transcript), "".join(raw_lines) or None, None,
                 f"timed out waiting for {phase}",
+                model_attempted=review_started,
             )
 
         print(line, end="", flush=True)
@@ -344,6 +350,7 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         "model_latency_ms": provider.model_latency_ms,
         "model_attempt_count": provider.model_attempt_count,
         "runtime_attestation": provider.runtime_attestation,
+        "model_attempted": provider.model_attempted,
         "diagnostics": {
             "expected_files": expected_files,
             "reported_files": reported_files,
