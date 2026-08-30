@@ -10,6 +10,7 @@ import queue
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -561,6 +562,9 @@ class WatchFilesTests(unittest.TestCase):
             source.write_text("name=safe\n", encoding="utf-8")
             sink = mock.Mock()
             sink.publish.return_value = True
+            review_coordinator = mock.Mock()
+            review_coordinator.capture_session_generation.return_value = 7
+            batch_flushed_at = time.time()
 
             with mock.patch("watch_files.run_bounded_command") as provider:
                 batch = watch_files.review_files(
@@ -574,6 +578,9 @@ class WatchFilesTests(unittest.TestCase):
                     review_timeout=60,
                     reasoning_effort="high",
                     sink=sink,
+                    session_id="synthetic-session",
+                    batch_flushed_at=batch_flushed_at,
+                    review_coordinator=review_coordinator,
                 )
 
             provider.assert_not_called()
@@ -582,6 +589,12 @@ class WatchFilesTests(unittest.TestCase):
             self.assertEqual(batch.reviewed_files, ())
             self.assertEqual(batch.redactions.total, 1)
             self.assertEqual(batch.redactions.notices[0].disposition, "excluded")
+            self.assertEqual(batch.session_generation, 7)
+            self.assertEqual(batch.batch_flushed_at, batch_flushed_at)
+            self.assertGreaterEqual(batch.published_at, batch.created_at)
+            sink.publish.assert_called_once_with(batch)
+            review_coordinator.capture_session_generation.assert_called_once_with()
+            review_coordinator.retire_reviewed_flush_hints.assert_called_once()
             retained = json.dumps(batch.to_dict())
             self.assertNotIn(filename_secret, retained)
             self.assertNotIn(filename_secret[:10], retained)
