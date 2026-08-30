@@ -14,12 +14,29 @@ _TEST_PATH = re.compile(
     re.IGNORECASE,
 )
 _EXISTING_TEST_CLAIM = re.compile(
-    r"\b(?:existing|current|already[- ]present|present)\b.{0,48}\btests?\b|"
-    r"\btests?\b.{0,48}\b(?:already exists?|is present)\b",
+    r"\b(?:existing|current|already[- ]present)\s+"
+    r"(?:(?:[A-Za-z0-9_-]+)\s+){0,3}tests?\b|"
+    r"\btests?\s+(?:already exists?|is present)\b",
     re.IGNORECASE,
 )
-_MUTATE_TEST_CLAIM = re.compile(
-    r"\b(?:preserve|retain|extend|modify|update|keep)\b.{0,48}\btests?\b",
+_CLAUSE_BOUNDARY = re.compile(
+    r"\.(?=\s+|$)|[;\n]+|,?\s+then\s+|"
+    r"\s+and\s+(?=(?:add|create|write|introduce|"
+    r"preserve|retain|extend|modify|update|keep)\b)",
+    re.IGNORECASE,
+)
+_TEST_WORD = re.compile(r"\btests?\b", re.IGNORECASE)
+_MUTATION_VERB = re.compile(
+    r"\b(?:preserve|retain|extend|modify|update|keep)\b", re.IGNORECASE
+)
+_CREATION_VERB = re.compile(
+    r"\b(?:add|create|write|introduce)\b", re.IGNORECASE
+)
+_PROPOSED_PATH_PREFIX = re.compile(
+    r"\b(?:add|create|write|introduce)\s+"
+    r"(?:(?:a|an)\s+)?(?:new\s+)?"
+    r"(?:(?:(?:regression|unit|integration)\s+)?test(?:\s+file)?\s+"
+    r"(?:(?:at|named|as)\s+)?)?$",
     re.IGNORECASE,
 )
 
@@ -37,6 +54,28 @@ def is_test_file(path: str) -> bool:
     )
 
 
+def _clauses(value: str) -> list[str]:
+    return [clause.strip() for clause in _CLAUSE_BOUNDARY.split(value) if clause.strip()]
+
+
+def _mutates_unsupplied_test(clause: str) -> bool:
+    """Return whether the nearest intent verb targets a generic test mention."""
+    for test_match in _TEST_WORD.finditer(clause):
+        preceding = clause[: test_match.start()]
+        intents = [
+            *((match.end(), "mutation") for match in _MUTATION_VERB.finditer(preceding)),
+            *((match.end(), "creation") for match in _CREATION_VERB.finditer(preceding)),
+        ]
+        if intents and max(intents)[1] == "mutation":
+            return True
+    return False
+
+
+def _path_is_proposed(clause: str, path_start: int) -> bool:
+    """Recognize a missing path only when it is the object of creation intent."""
+    return _PROPOSED_PATH_PREFIX.search(clause[:path_start]) is not None
+
+
 def evaluate_recommendation(
     recommendation: str, *, supplied_files: Sequence[str]
 ) -> dict[str, object]:
@@ -44,6 +83,7 @@ def evaluate_recommendation(
     normalized_files = {path.replace("\\", "/") for path in supplied_files}
     supplied_tests = sorted(path for path in normalized_files if is_test_file(path))
     violations: list[dict[str, str]] = []
+    clauses = _clauses(recommendation)
 
     if not supplied_tests:
         if _EXISTING_TEST_CLAIM.search(recommendation):
@@ -53,7 +93,7 @@ def evaluate_recommendation(
                     "message": "recommendation claims a test exists but no test was supplied",
                 }
             )
-        elif _MUTATE_TEST_CLAIM.search(recommendation):
+        elif any(_mutates_unsupplied_test(clause) for clause in clauses):
             violations.append(
                 {
                     "code": "unsupported-test-mutation",
@@ -61,15 +101,23 @@ def evaluate_recommendation(
                 }
             )
 
-    for referenced_path in sorted(set(_TEST_PATH.findall(recommendation))):
-        normalized = referenced_path.replace("\\", "/")
-        if normalized not in normalized_files:
-            violations.append(
-                {
-                    "code": "unsupplied-test-path",
-                    "message": f"recommendation names unsupplied test path {normalized}",
-                }
-            )
+    seen_paths: set[str] = set()
+    for clause in clauses:
+        for path_match in _TEST_PATH.finditer(clause):
+            normalized = path_match.group(1).replace("\\", "/")
+            if normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+            if (
+                normalized not in normalized_files
+                and not _path_is_proposed(clause, path_match.start())
+            ):
+                violations.append(
+                    {
+                        "code": "unsupplied-test-path",
+                        "message": f"recommendation names unsupplied test path {normalized}",
+                    }
+                )
 
     return {
         "status": "grounded" if not violations else "failure",

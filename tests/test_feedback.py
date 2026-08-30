@@ -116,6 +116,18 @@ class FeedbackTests(unittest.TestCase):
         ):
             self.parse(json.dumps(raw))
 
+    def test_parse_accepts_source_change_followed_by_a_new_test(self) -> None:
+        for suggested_fix in (
+            "Modify Cache.get(), then add a regression test for tenant isolation.",
+            "Modify Cache.get(), then add tests/test_cache.py for tenant isolation.",
+        ):
+            raw = json.loads(valid_output())
+            raw["findings"][0]["suggested_fix"] = suggested_fix
+
+            with self.subTest(suggested_fix=suggested_fix):
+                batch = self.parse(json.dumps(raw))
+                self.assertEqual(batch.findings[0].suggested_fix, suggested_fix)
+
     def test_parse_accepts_recommendation_that_names_a_supplied_test(self) -> None:
         import hashlib
 

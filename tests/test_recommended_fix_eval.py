@@ -67,6 +67,35 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
             {"unsupported-test-mutation", "unsupplied-test-path"},
         )
 
+    def test_production_change_followed_by_new_test_is_grounded(self) -> None:
+        for recommendation in (
+            "Modify Cache.get(), then add a regression test for expired entries.",
+            "Update Cache.get() and add tests/test_cache.py for expired entries.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["expired_cache.py"],
+                )
+                self.assertEqual(result["status"], "grounded")
+
+    def test_new_test_path_is_allowed_but_mutating_unsupplied_path_is_not(self) -> None:
+        proposed = scoring.evaluate_recommendation(
+            "Add tests/test_cache.py to cover expiry.",
+            supplied_files=["expired_cache.py"],
+        )
+        mutation = scoring.evaluate_recommendation(
+            "Add an expiry assertion to tests/test_cache.py.",
+            supplied_files=["expired_cache.py"],
+        )
+
+        self.assertEqual(proposed["status"], "grounded")
+        self.assertEqual(mutation["status"], "failure")
+        self.assertEqual(
+            mutation["violations"][0]["code"],
+            "unsupplied-test-path",
+        )
+
     def _case(self, case_id: str) -> dict[str, object]:
         return next(case for case in self.fixture["cases"] if case["id"] == case_id)
 
