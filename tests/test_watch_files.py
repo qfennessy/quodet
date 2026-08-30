@@ -662,6 +662,25 @@ class WatchFilesTests(unittest.TestCase):
         )
         self.assertEqual(batch.findings[0].file, provider_path)
 
+        for escaped_path in (
+            '"qd_case_3f936e457da9\\/profile_service\\u002epy"',
+            '"qd\\u005fcase_3f936e457da9\\/profile\\u005fservice\\u002epy"',
+        ):
+            with self.subTest(escaped_path=escaped_path):
+                escaped_response = response.replace(
+                    json.dumps(provider_path), escaped_path, 1
+                )
+                escaped_sanitized, _ = watch_files.redact_provider_response(
+                    escaped_response,
+                    provider_paths=(provider_path,),
+                )
+                self.assertIn(escaped_path, escaped_sanitized)
+                self.assertEqual(
+                    json.loads(escaped_sanitized)["findings"][0]["file"],
+                    provider_path,
+                )
+                self.assertNotIn(provider_secret, escaped_sanitized)
+
     def test_path_redaction_preserves_descriptive_paths_but_removes_keys(self) -> None:
         ordinary = Path("03_cross_file_units/token_service.py")
         secret = Path("src/ghp_abcdefghijklmnopqrstuvwxyz1234567890.py")
