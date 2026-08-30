@@ -138,6 +138,25 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         self.assertEqual(visible["status"], "grounded")
         self.assertEqual(unknown["status"], "failure")
 
+    def test_existing_test_claim_accepts_a_visible_symbol(self) -> None:
+        visible = scoring.evaluate_recommendation(
+            "Extend the existing test test_unexpired_entry with an expiry assertion.",
+            supplied_files=["tests/cache.py"],
+            supplied_test_symbols=["test_unexpired_entry"],
+        )
+        unknown = scoring.evaluate_recommendation(
+            "Extend the existing test test_missing_entry with an expiry assertion.",
+            supplied_files=["tests/cache.py"],
+            supplied_test_symbols=["test_unexpired_entry"],
+        )
+
+        self.assertEqual(visible["status"], "grounded")
+        self.assertEqual(unknown["status"], "failure")
+        self.assertEqual(
+            unknown["violations"][0]["code"],
+            "unsupported-existing-test-claim",
+        )
+
     def test_adding_to_unknown_symbol_is_not_creation_of_a_test(self) -> None:
         created = scoring.evaluate_recommendation(
             "Add a new regression test named test_expired_entry.",
@@ -166,6 +185,22 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
             result["violations"][0]["code"],
             "unsupported-test-mutation",
         )
+
+    def test_change_and_edit_of_unsupplied_test_symbols_are_rejected(self) -> None:
+        for recommendation in (
+            "Change test_missing_entry to assert None.",
+            "Edit test_missing_entry to assert None.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["expired_cache.py"],
+                )
+                self.assertEqual(result["status"], "failure")
+                self.assertEqual(
+                    result["violations"][0]["code"],
+                    "unsupported-test-mutation",
+                )
 
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (

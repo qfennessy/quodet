@@ -23,7 +23,7 @@ _EXISTING_TEST_CLAIM = re.compile(
 _CLAUSE_BOUNDARY = re.compile(
     r"\.(?=\s+|$)|[;\n]+|,?\s+then\s+|"
     r"\s+and\s+(?=(?:add|create|write|introduce|"
-    r"preserve|retain|extend|modify|update|keep)\b)",
+    r"preserve|retain|extend|modify|update|keep|change|edit)\b)",
     re.IGNORECASE,
 )
 _TEST_WORD = re.compile(
@@ -37,7 +37,8 @@ _TEST_SYMBOL = re.compile(
     re.IGNORECASE,
 )
 _MUTATION_VERB = re.compile(
-    r"\b(?:preserve|retain|extend|modify|update|keep)\b", re.IGNORECASE
+    r"\b(?:preserve|retain|extend|modify|update|keep|change|edit)\b",
+    re.IGNORECASE,
 )
 _CREATION_VERB = re.compile(
     r"\b(?:add|create|write|introduce)\b", re.IGNORECASE
@@ -93,6 +94,11 @@ def _mutates_unsupplied_test(
     clause: str, *, supplied_test_symbols: set[str]
 ) -> bool:
     """Return whether the nearest intent verb targets a generic test mention."""
+    visible_clause_symbols = {
+        match.group(0)
+        for match in _TEST_SYMBOL.finditer(clause)
+        if match.group(0) in supplied_test_symbols
+    }
     proposed_path_spans = [
         (match.start(), match.end())
         for match in _TEST_PATH.finditer(clause)
@@ -100,6 +106,11 @@ def _mutates_unsupplied_test(
     ]
     for test_match in _TEST_WORD.finditer(clause):
         if test_match.group(0) in supplied_test_symbols:
+            continue
+        if (
+            test_match.group(0).lower() in {"test", "tests"}
+            and visible_clause_symbols
+        ):
             continue
         if any(
             start <= test_match.start() < end
@@ -160,13 +171,22 @@ def evaluate_recommendation(
                 (clause_index, clause, path, False)
                 for _ in pattern.finditer(clause)
             )
-    supplied_references = {
-        path
-        for _, _, path, _ in path_references
-        if path in supplied_tests
-    }
-
-    if _EXISTING_TEST_CLAIM.search(recommendation) and not supplied_references:
+    unsupported_existing_claim = any(
+        _EXISTING_TEST_CLAIM.search(clause)
+        and not any(
+            reference_clause_index == clause_index and path in supplied_tests
+            for reference_clause_index, _, path, _ in path_references
+        )
+        and not (
+            {
+                match.group(0)
+                for match in _TEST_SYMBOL.finditer(clause)
+            }
+            & visible_symbols
+        )
+        for clause_index, clause in enumerate(clauses)
+    )
+    if unsupported_existing_claim:
         violations.append(
             {
                 "code": "unsupported-existing-test-claim",
