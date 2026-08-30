@@ -28,7 +28,7 @@ _CLAUSE_BOUNDARY = re.compile(
 )
 _TEST_WORD = re.compile(
     r"\btests?\b|(?<![A-Za-z0-9_])(?:test_[A-Za-z0-9_]+|"
-    r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
+    r"[A-Za-z0-9_]+_test)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _TEST_SYMBOL = re.compile(

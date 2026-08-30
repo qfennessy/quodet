@@ -202,6 +202,18 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                     "unsupported-test-mutation",
                 )
 
+    def test_spec_suffixed_production_symbols_are_not_assumed_to_be_tests(self) -> None:
+        for recommendation in (
+            "Update API_SPEC to require tenant_id.",
+            "Change request_spec to include tenant_id.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["request.py"],
+                )
+                self.assertEqual(result["status"], "grounded")
+
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
             "Preserve the existing cache regression test.",
