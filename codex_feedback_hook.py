@@ -44,29 +44,52 @@ MAX_HOOK_INPUT_BYTES = 1_048_576
 DEFAULT_STOP_GRACE_SECONDS = 2.0
 STOP_POLL_SECONDS = 0.025
 MAX_HINT_FILE_BYTES = 2_000_000
+MAX_AGENT_TURN_ID_LENGTH = 200
+
+
+def _agent_turn_id(event_input: dict[str, object]) -> str | None:
+    """Return the provider's stable identity for one agent turn, when present."""
+    for field in ("turn_id", "prompt_id"):
+        value = event_input.get(field)
+        if isinstance(value, str) and 0 < len(value) <= MAX_AGENT_TURN_ID_LENGTH:
+            return value
+    return None
 
 
 def _hint_reviewed_files(
     event_input: dict[str, object], *, root: Path
 ) -> tuple[ReviewedFile, ...]:
     """Snapshot only path/digest metadata for files named by a direct edit hook."""
-    tool_input = event_input.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return ()
     candidates: set[str] = set()
-    file_path = tool_input.get("file_path")
-    if isinstance(file_path, str):
-        candidates.add(file_path)
-    command = tool_input.get("command")
-    if isinstance(command, str):
-        candidates.update(
-            match.group(1).strip()
-            for match in re.finditer(
-                r"^\*\*\* (?:Add|Update|Delete) File: (.+)$",
-                command,
-                flags=re.MULTILINE,
+    tool_calls = event_input.get("tool_calls")
+    calls: Sequence[object]
+    if isinstance(tool_calls, list):
+        calls = tool_calls
+    else:
+        calls = (event_input,)
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        if isinstance(tool_calls, list) and call.get("tool_name") not in {
+            "Write", "Edit", "apply_patch"
+        }:
+            continue
+        tool_input = call.get("tool_input")
+        if not isinstance(tool_input, dict):
+            continue
+        file_path = tool_input.get("file_path")
+        if isinstance(file_path, str):
+            candidates.add(file_path)
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            candidates.update(
+                match.group(1).strip()
+                for match in re.finditer(
+                    r"^\*\*\* (?:Add|Update|Delete) File: (.+)$",
+                    command,
+                    flags=re.MULTILINE,
+                )
             )
-        )
     reviewed: list[ReviewedFile] = []
     canonical_root = root.resolve()
     for candidate in sorted(candidates):
@@ -489,7 +512,9 @@ def render_feedback(payload: dict[str, object]) -> str | None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event", choices=("PostToolUse", "Stop"))
+    parser.add_argument(
+        "--event", choices=("PostToolUse", "PostToolBatch", "Stop")
+    )
     parser.add_argument("--spool-dir", type=Path, required=True)
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--root", type=Path, required=True)
@@ -563,7 +588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(event_input, dict):
         event_input = {}
     event = args.event or event_input.get("hook_event_name")
-    if event not in {"PostToolUse", "Stop"}:
+    if event not in {"PostToolUse", "PostToolBatch", "Stop"}:
         return 0
     if (
         not 0 <= args.stop_grace <= 10
@@ -594,7 +619,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     assert isinstance(agent_session_id, str)
 
-    if event == "PostToolUse":
+    if event in {"PostToolUse", "PostToolBatch"}:
         reviewed_files = _hint_reviewed_files(event_input, root=args.root)
         try:
             if reviewed_files:
@@ -605,7 +630,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     agent_session_id=agent_session_id,
                     ttl_seconds=args.flush_hint_ttl,
                     reviewed_files=reviewed_files,
+                    agent_turn_id=_agent_turn_id(event_input),
                 )
+                if event == "PostToolBatch":
+                    # Claude has declared the exact parallel tool-call boundary;
+                    # wake the watcher without waiting for a heuristic window.
+                    request_flush_hint(
+                        args.spool_dir,
+                        root=args.root,
+                        session_id=args.session_id,
+                        agent_session_id=agent_session_id,
+                        ttl_seconds=min(10.0, args.flush_hint_ttl),
+                    )
         except (OSError, ValueError) as error:
             print(f"Could not publish watcher flush hint: {error}", file=sys.stderr)
 
@@ -674,10 +710,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("{}")
         return 0
 
-    if event == "PostToolUse":
+    if event in {"PostToolUse", "PostToolBatch"}:
         response = {
             "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
+                "hookEventName": event,
                 "additionalContext": message,
             }
         }

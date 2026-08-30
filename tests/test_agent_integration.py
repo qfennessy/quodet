@@ -159,6 +159,13 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(route.spool_dir, os.fspath(self.spool))
                 self.assertEqual(route_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(self.spool.stat().st_mode & 0o777, 0o700)
+                configured_hooks = json.loads(settings.read_text())["hooks"]
+                if agent == "claude":
+                    self.assertIn("PostToolBatch", configured_hooks)
+                    self.assertNotIn("PostToolUse", configured_hooks)
+                    self.assertNotIn("matcher", configured_hooks["PostToolBatch"][0])
+                else:
+                    self.assertIn("PostToolUse", configured_hooks)
                 # An exact rerun is validation-only and remains successful.
                 agent_integration.initialize(
                     agent,
@@ -431,6 +438,94 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertFalse(route_path.exists())
         self.assertEqual(json.loads(settings_path.read_text()), legacy_settings)
 
+    def test_legacy_claude_post_tool_use_route_remains_loadable(self) -> None:
+        hook_command = self._executable("legacy-claude-hook")
+        agent_command = self._executable("legacy-claude-agent")
+        route_file, settings_file = agent_integration.initialize(
+            "claude",
+            root=self.root,
+            spool_dir=self.spool,
+            session_id="claude-route",
+            hook_command=hook_command,
+            agent_command=agent_command,
+        )
+        route = agent_integration.load_route(route_file)
+        payload = json.loads(route_file.read_text())
+        payload["contract"] = "claude-code-hooks-2026-08-30"
+        route_file.write_text(json.dumps(payload), encoding="utf-8")
+        route_file.chmod(0o600)
+        legacy_route = agent_integration.load_route(route_file)
+        common = (
+            f"{hook_command} --spool-dir {self.spool} "
+            f"--session-id claude-route --root {self.root}"
+        )
+        legacy_settings = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": "^(Write|Edit)$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{common} --event PostToolUse",
+                                "timeout": 10,
+                                "statusMessage": "Delivering Quodet feedback",
+                            }
+                        ],
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{common} --event Stop --stop-grace 2",
+                                "timeout": 10,
+                            }
+                        ]
+                    }
+                ],
+                "SessionEnd": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    f"{agent_command} cleanup --config "
+                                    f"{agent_integration.route_path(self.spool)} "
+                                    "--from-hook"
+                                ),
+                                "timeout": 3,
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+        settings_file.write_text(json.dumps(legacy_settings), encoding="utf-8")
+        settings_file.chmod(0o600)
+        route_before = route_file.read_bytes()
+        settings_before = settings_file.read_bytes()
+
+        rerun = agent_integration.initialize(
+            "claude",
+            root=self.root,
+            spool_dir=self.spool,
+            session_id="claude-route",
+            hook_command=hook_command,
+            agent_command=agent_command,
+        )
+        loaded = agent_integration.load_route(route_file)
+
+        self.assertEqual(rerun, (route_file, settings_file))
+        self.assertEqual(route_file.read_bytes(), route_before)
+        self.assertEqual(settings_file.read_bytes(), settings_before)
+        self.assertEqual(loaded.agent, "claude")
+        self.assertEqual(loaded.contract, "claude-code-hooks-2026-08-30")
+        self.assertEqual(loaded.root, route.root)
+        self.assertIn("PostToolUse", legacy_settings["hooks"])
+        self.assertNotIn("PostToolBatch", legacy_settings["hooks"])
+
     def test_init_cannot_overwrite_concurrently_created_settings(self) -> None:
         settings = self.root / ".codex" / "hooks.json"
         original_create = agent_integration._create_settings_json
@@ -458,11 +553,17 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.spool = self.base / f"contract-{agent}" / "feedback"
                 route, _ = self._route(agent)
                 sink = self._publish(route, count=12)
+                event = "PostToolUse" if agent == "codex" else "PostToolBatch"
+                fixture = (
+                    "post_tool_use.input.json"
+                    if agent == "codex"
+                    else "post_tool_batch.input.json"
+                )
                 post = self._invoke(
-                    route, "PostToolUse", self._fixture(agent, "post_tool_use.input.json")
+                    route, event, self._fixture(agent, fixture)
                 )
                 self.assertEqual(
-                    post["hookSpecificOutput"]["hookEventName"], "PostToolUse"  # type: ignore[index]
+                    post["hookSpecificOutput"]["hookEventName"], event  # type: ignore[index]
                 )
                 message = post["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
                 self.assertRegex(message, r"Batch qdt-[0-9a-f]{8} latency")
@@ -541,7 +642,7 @@ class AgentIntegrationTests(unittest.TestCase):
             "live-agent-session",
         )
 
-    def test_three_sequential_claude_write_events_form_one_review_batch(self) -> None:
+    def test_claude_post_tool_batch_forms_one_three_file_review_batch(self) -> None:
         route, _ = self._route("claude")
         sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
         self.addCleanup(sink.close)
@@ -549,22 +650,17 @@ class AgentIntegrationTests(unittest.TestCase):
             self.root / "scratch" / "challenging" / name
             for name in ("__init__.py", "repository.py", "service.py")
         )
-        for index, (path, created_at) in enumerate(
-            zip(paths, (100.0, 100.08, 100.16), strict=True), start=1
-        ):
+        for index, path in enumerate(paths, start=1):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f"value = {index}\n", encoding="utf-8")
-            event = self._fixture("claude", "post_tool_use.input.json")
-            event["tool_name"] = "Write"
-            event["tool_input"] = {"file_path": os.fspath(path)}
-            event["tool_use_id"] = f"tool-{index}"
-            with mock.patch("feedback.time.time", return_value=created_at):
-                self.assertIsNone(self._invoke(route, "PostToolUse", event))
+        event = self._fixture("claude", "post_tool_batch.input.json")
+        with mock.patch("feedback.time.time", return_value=100.0):
+            self.assertIsNone(self._invoke(route, "PostToolBatch", event))
 
         changes: queue.Queue[Path] = queue.Queue()
         for path in paths:
             changes.put(path)
-        with mock.patch("feedback.time.time", return_value=100.42):
+        with mock.patch("feedback.time.time", return_value=100.01):
             triggered = watch_files.next_triggered_batch(
                 changes,
                 3.0,
@@ -584,7 +680,112 @@ class AgentIntegrationTests(unittest.TestCase):
                 "scratch/challenging/service.py",
             },
         )
+        self.assertEqual(len(hint.paths), 1)  # type: ignore[union-attr]
+        self.assertEqual(hint.agent_turn_id, "prompt-1")  # type: ignore[union-attr]
+
+    def test_legacy_claude_post_tool_use_turn_waits_for_stop(self) -> None:
+        route, _ = self._route("claude")
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        paths = tuple(self.root / "src" / f"legacy-{index}.py" for index in range(3))
+        for path, created_at in zip(
+            paths, (100.0, 100.8, 101.6), strict=True
+        ):
+            path.write_text("value = 1\n", encoding="utf-8")
+            event = self._fixture("claude", "post_tool_use.input.json")
+            event["tool_input"] = {"file_path": os.fspath(path)}
+            with mock.patch("feedback.time.time", return_value=created_at):
+                self.assertIsNone(self._invoke(route, "PostToolUse", event))
+
+        with mock.patch("feedback.time.time", return_value=101.7):
+            self.assertIsNone(
+                sink.consume_flush_hint(
+                    quiet_seconds=0.25, max_age_seconds=1.0
+                )
+            )
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(hint)
         self.assertEqual(len(hint.paths), 3)  # type: ignore[union-attr]
+        self.assertEqual(hint.agent_turn_id, "prompt-1")  # type: ignore[union-attr]
+
+    def test_agent_turn_hints_flush_by_max_age_without_stop(self) -> None:
+        route, _ = self._route("claude")
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        event = self._fixture("claude", "post_tool_use.input.json")
+        with mock.patch("feedback.time.time", return_value=100.0):
+            self.assertIsNone(self._invoke(route, "PostToolUse", event))
+        with mock.patch("feedback.time.time", return_value=102.99):
+            self.assertIsNone(
+                sink.consume_flush_hint(
+                    quiet_seconds=0.25, max_age_seconds=1.0
+                )
+            )
+        with mock.patch("feedback.time.time", return_value=103.0):
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint.agent_turn_id, "prompt-1")  # type: ignore[union-attr]
+
+    def test_different_agent_turns_do_not_coalesce(self) -> None:
+        route, _ = self._route("claude")
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        paths = (self.source, self.root / "src" / "second.py")
+        for index, (path, turn_id) in enumerate(
+            zip(paths, ("prompt-1", "prompt-2"), strict=True), start=1
+        ):
+            path.write_text(f"value = {index}\n", encoding="utf-8")
+            event = self._fixture("claude", "post_tool_use.input.json")
+            event["prompt_id"] = turn_id
+            event["tool_input"] = {"file_path": os.fspath(path)}
+            with mock.patch("feedback.time.time", return_value=100.0 + index / 10):
+                self.assertIsNone(self._invoke(route, "PostToolUse", event))
+
+        with mock.patch("feedback.time.time", return_value=100.3):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            first = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(first)
+        self.assertEqual(first.agent_turn_id, "prompt-1")  # type: ignore[union-attr]
+        self.assertEqual(
+            {item.path for item in first.reviewed_files},  # type: ignore[union-attr]
+            {"src/app.py"},
+        )
+        for hint_path in first.paths:  # type: ignore[union-attr]
+            hint_path.unlink()
+
+        with mock.patch("feedback.time.time", return_value=100.31):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            second = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(second)
+        self.assertEqual(second.agent_turn_id, "prompt-2")  # type: ignore[union-attr]
+        self.assertEqual(
+            {item.path for item in second.reviewed_files},  # type: ignore[union-attr]
+            {"src/second.py"},
+        )
 
     def test_single_agent_edit_flushes_before_filesystem_debounce(self) -> None:
         route, _ = self._route()
@@ -1788,6 +1989,14 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.assertNotIn("tool_input", event)
                 self.assertNotIn("tool_response", event)
                 self.assertEqual(len(event["response_sha256"]), 64)
+                batch_capture = capture / "post_tool_batch.event.json"
+                if batch_capture.exists():
+                    batch = json.loads(batch_capture.read_text())
+                    self.assertEqual(batch["event"], "PostToolBatch")
+                    self.assertEqual(batch["tool_call_count"], 3)
+                    self.assertEqual(batch["tool_names"], ["Write"] * 3)
+                    self.assertTrue(batch["prompt_id_present"])
+                    self.assertNotIn("tool_calls", batch)
 
 
 if __name__ == "__main__":

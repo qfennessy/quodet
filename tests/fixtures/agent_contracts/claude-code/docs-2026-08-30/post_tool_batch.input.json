@@ -1,0 +1,34 @@
+{
+  "session_id": "live-agent-session",
+  "prompt_id": "prompt-1",
+  "transcript_path": "/tmp/transcript.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolBatch",
+  "tool_calls": [
+    {
+      "tool_name": "Read",
+      "tool_input": {"file_path": "${ROOT}/README.md"},
+      "tool_use_id": "tool-0",
+      "tool_response": "     1\t# Quodet"
+    },
+    {
+      "tool_name": "Write",
+      "tool_input": {"file_path": "${ROOT}/scratch/challenging/__init__.py"},
+      "tool_use_id": "tool-1",
+      "tool_response": "Wrote file"
+    },
+    {
+      "tool_name": "Write",
+      "tool_input": {"file_path": "${ROOT}/scratch/challenging/repository.py"},
+      "tool_use_id": "tool-2",
+      "tool_response": "Wrote file"
+    },
+    {
+      "tool_name": "Write",
+      "tool_input": {"file_path": "${ROOT}/scratch/challenging/service.py"},
+      "tool_use_id": "tool-3",
+      "tool_response": "Wrote file"
+    }
+  ]
+}

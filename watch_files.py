@@ -26,6 +26,7 @@ from feedback import (
     ConsoleSink,
     DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
     DEFAULT_AGENT_EDIT_QUIET_SECONDS,
+    DEFAULT_AGENT_TURN_MAX_AGE_SECONDS,
     FeedbackSink,
     FlushHint,
     MAX_PROVIDER_OUTPUT_BYTES,
@@ -314,7 +315,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
         metavar="SECONDS",
         help=(
-            "flush continuous direct agent edits by this age (default: 1)"
+            "safety cap for unidentified direct agent edits (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--agent-turn-max-age",
+        type=positive_float,
+        default=DEFAULT_AGENT_TURN_MAX_AGE_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "safety cap for one identified agent turn (default: 3)"
         ),
     )
     parser.add_argument(
@@ -1403,6 +1413,7 @@ def next_triggered_batch(
     suppression: MaterializedPathSuppression | None = None,
     agent_edit_quiet: float = DEFAULT_AGENT_EDIT_QUIET_SECONDS,
     agent_edit_max_age: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+    agent_turn_max_age: float = DEFAULT_AGENT_TURN_MAX_AGE_SECONDS,
 ) -> TriggeredBatch:
     """Collect a filesystem batch or a bounded group of direct agent edits."""
     suppressed_paths: set[Path] = set()
@@ -1429,6 +1440,7 @@ def next_triggered_batch(
             hint = hint_source.consume_flush_hint(
                 quiet_seconds=agent_edit_quiet,
                 max_age_seconds=agent_edit_max_age,
+                turn_max_age_seconds=agent_turn_max_age,
             )
             if hint is not None:
                 return materialize_hint(hint, set())
@@ -1451,6 +1463,7 @@ def next_triggered_batch(
                 tuple(batch),
                 quiet_seconds=agent_edit_quiet,
                 max_age_seconds=agent_edit_max_age,
+                turn_max_age_seconds=agent_turn_max_age,
             )
             if hint_source is not None
             else None
@@ -1541,10 +1554,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return agent_main(raw_argv)
     args = parse_args(raw_argv)
-    if args.agent_edit_quiet > 10 or args.agent_edit_max_age > 30:
+    if (
+        args.agent_edit_quiet > 10
+        or args.agent_edit_max_age > 30
+        or args.agent_turn_max_age > 30
+    ):
         raise SystemExit(
             "--agent-edit-quiet must be at most 10 seconds and "
-            "--agent-edit-max-age at most 30 seconds"
+            "agent edit age limits at most 30 seconds"
         )
     benchmark_arguments = (
         args.model_run_config,
@@ -1562,8 +1579,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.agent_edit_quiet > args.agent_edit_max_age:
         raise SystemExit("--agent-edit-quiet must not exceed --agent-edit-max-age")
+    if args.agent_edit_max_age > args.agent_turn_max_age:
+        raise SystemExit(
+            "--agent-edit-max-age must not exceed --agent-turn-max-age"
+        )
     if args.debounce < args.agent_edit_quiet:
         raise SystemExit("--debounce must not be shorter than --agent-edit-quiet")
+    if args.debounce < args.agent_turn_max_age:
+        raise SystemExit("--debounce must not be shorter than --agent-turn-max-age")
     model_run_config = (
         load_model_run_config(args.model_run_config)
         if args.model_run_config is not None
@@ -1654,6 +1677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 suppression=suppression,
                 agent_edit_quiet=args.agent_edit_quiet,
                 agent_edit_max_age=args.agent_edit_max_age,
+                agent_turn_max_age=args.agent_turn_max_age,
             )
             event_batch = triggered.paths
             batch_flushed_at = time.time()
