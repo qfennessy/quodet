@@ -970,6 +970,21 @@ class TriggeredBatch:
     suppressed_paths: set[Path]
 
 
+def consume_first_observed_at(
+    triggered: TriggeredBatch,
+    observed_at: dict[Path, float],
+    *,
+    fallback: float,
+) -> float:
+    """Consume timing for this batch without dropping retained-path observations."""
+    for path in triggered.suppressed_paths - triggered.paths:
+        observed_at.pop(path, None)
+    return min(
+        (observed_at.pop(path, fallback) for path in triggered.paths),
+        default=fallback,
+    )
+
+
 class MaterializedPathSuppression:
     """Suppress delayed watchdog events only while their reviewed bytes match."""
 
@@ -1179,13 +1194,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             event_batch = triggered.paths
             batch_flushed_at = time.time()
             with observed_at_lock:
-                for path in triggered.suppressed_paths:
-                    observed_at.pop(path, None)
-                first_observed_at = min(
-                    (observed_at.pop(path, time.time()) for path in event_batch),
-                    default=time.time(),
+                first_observed_at = consume_first_observed_at(
+                    triggered,
+                    observed_at,
+                    fallback=batch_flushed_at,
                 )
-            measured_debounce_ms = max(0.0, (time.time() - first_observed_at) * 1_000)
+            measured_debounce_ms = max(
+                0.0, (batch_flushed_at - first_observed_at) * 1_000
+            )
             marker = (
                 spool_sink.begin_review(
                     agent_session_id=triggered.flush_hint.agent_session_id,

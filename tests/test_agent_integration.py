@@ -368,6 +368,70 @@ class AgentIntegrationTests(unittest.TestCase):
             "live-agent-session",
         )
 
+    def test_duplicate_hint_event_preserves_original_observation_timing(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        publish_flush_hint(
+            self.spool,
+            root=self.root,
+            session_id=route.session_id,
+            agent_session_id="live-agent-session",
+            reviewed_files=self._batch(route).reviewed_files,
+        )
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(self.source)
+        changes.put(self.source)
+        suppression = watch_files.MaterializedPathSuppression(
+            self.root, ttl_seconds=1.0
+        )
+
+        triggered = watch_files.next_triggered_batch(
+            changes, 1.0, hint_source=sink, suppression=suppression
+        )
+
+        self.assertEqual(triggered.paths, {self.source})
+        self.assertEqual(triggered.suppressed_paths, {self.source})
+        original_observation = 100.0
+        observed_at = {self.source: original_observation}
+        self.assertEqual(
+            watch_files.consume_first_observed_at(
+                triggered, observed_at, fallback=200.0
+            ),
+            original_observation,
+        )
+        self.assertEqual(observed_at, {})
+
+    def test_suppression_only_timestamp_does_not_affect_next_batch(self) -> None:
+        delayed_duplicate = self.root / "src" / "old.py"
+        current = self.root / "src" / "current.py"
+        unrelated = self.root / "src" / "unrelated.py"
+        observed_at = {
+            delayed_duplicate: 100.0,
+            current: 150.0,
+            unrelated: 75.0,
+        }
+        triggered = watch_files.TriggeredBatch(
+            paths={current},
+            flush_hint=None,
+            suppressed_paths={delayed_duplicate},
+        )
+
+        first_observed_at = watch_files.consume_first_observed_at(
+            triggered, observed_at, fallback=200.0
+        )
+
+        self.assertEqual(first_observed_at, 150.0)
+        self.assertNotIn(delayed_duplicate, observed_at)
+        self.assertNotIn(current, observed_at)
+        self.assertEqual(observed_at, {unrelated: 75.0})
+
     def test_multi_file_hint_keeps_one_logical_edit_in_one_batch(self) -> None:
         route, _ = self._route()
         codex_feedback_hook.verify_session_lease(
