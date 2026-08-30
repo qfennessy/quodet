@@ -6,11 +6,11 @@ import argparse
 import hashlib
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from evals.agent_changes import artifacts, scoring
+from evals.agent_changes import artifacts, replay, scoring
 
 
 FORMAT_VERSION = 1
@@ -240,6 +240,82 @@ def _validate_scored_run(run: Mapping[str, Any]) -> Mapping[str, Any]:
     return adjudication
 
 
+def _complete_fit_case_ids(run: Mapping[str, Any]) -> list[str]:
+    """Require the exact frozen calibration split before using any labels."""
+    manifest = _require_mapping(replay.load_manifest(), "fixture manifest")
+    configuration = _require_mapping(run.get("configuration"), "run.configuration")
+    fixture = _require_mapping(configuration.get("fixture"), "configuration.fixture")
+    manifest_sha256 = hashlib.sha256(replay.MANIFEST_PATH.read_bytes()).hexdigest()
+    if fixture.get("manifest_sha256") != manifest_sha256:
+        raise ValueError(
+            "calibration run fixture manifest hash does not match the frozen manifest"
+        )
+    if fixture.get("revision") != manifest.get("version"):
+        raise ValueError(
+            "calibration run fixture revision does not match the frozen manifest"
+        )
+    manifest_cases = manifest.get("cases")
+    if not isinstance(manifest_cases, list):
+        raise ValueError("fixture manifest cases must be an array")
+
+    required: list[str] = []
+    for index, case_value in enumerate(manifest_cases):
+        case = _require_mapping(case_value, f"fixture manifest case {index}")
+        if case.get("evaluation_split") != FIT_SPLIT:
+            continue
+        case_id = case.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError("fixture manifest calibration case IDs must be strings")
+        required.append(case_id)
+    required_duplicates = sorted(
+        case_id for case_id, count in Counter(required).items() if count > 1
+    )
+    if not required or required_duplicates:
+        raise ValueError(
+            "fixture manifest must define unique calibration cases; duplicates "
+            f"{required_duplicates}"
+        )
+
+    run_cases = run.get("cases")
+    if not isinstance(run_cases, list):
+        raise ValueError("run.cases must be an array")
+    observed: list[str] = []
+    invalid_ids: list[str] = []
+    for index, outcome_value in enumerate(run_cases):
+        outcome = _require_mapping(outcome_value, f"run case {index}")
+        if outcome.get("evaluation_split") != FIT_SPLIT:
+            continue
+        case_id = outcome.get("case_id")
+        if not isinstance(case_id, str) or not case_id:
+            invalid_ids.append(f"index {index}: {case_id!r}")
+        else:
+            observed.append(case_id)
+
+    observed_counts = Counter(observed)
+    observed_set = set(observed)
+    required_set = set(required)
+    missing = sorted(required_set - observed_set)
+    unexpected = sorted(observed_set - required_set)
+    duplicates = sorted(
+        case_id for case_id, count in observed_counts.items() if count > 1
+    )
+    if missing or unexpected or duplicates or invalid_ids:
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unexpected:
+            details.append(f"unexpected {unexpected}")
+        if duplicates:
+            details.append(f"duplicates {duplicates}")
+        if invalid_ids:
+            details.append(f"invalid IDs {invalid_ids}")
+        raise ValueError(
+            "calibration fit requires the complete exact frozen calibration "
+            f"split; {'; '.join(details)}"
+        )
+    return required
+
+
 def _finding_rows(
     run: Mapping[str, Any], adjudication: Mapping[str, Any],
     *, splits: set[str] | None = None,
@@ -384,6 +460,7 @@ def fit_calibration(
             "calibration fit accepts calibration-only runs; refusing exposed "
             f"splits {sorted(str(split) for split in forbidden_splits)}"
         )
+    calibration_case_ids = _complete_fit_case_ids(run)
     edges = _validate_edges(bucket_edges)
     adjudication = _validate_scored_run(run)
     identity = calibration_identity(
@@ -391,10 +468,6 @@ def fit_calibration(
     )
     missing_identity = _identity_missing(identity)
     rows = _finding_rows(run, adjudication, splits={FIT_SPLIT})
-    calibration_case_ids = [
-        outcome.get("case_id") for outcome in run.get("cases", [])
-        if outcome.get("evaluation_split") == FIT_SPLIT
-    ]
     adjudicated_cases = _require_mapping(
         adjudication.get("cases"), "adjudication.cases"
     )
