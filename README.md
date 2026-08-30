@@ -130,13 +130,14 @@ uv run quodet . --output json
 uv run quodet . --json
 ```
 
-In JSON mode, stdout contains only validated review documents. Startup,
-progress, provider errors, redaction notices, and shutdown diagnostics go to
-stderr, so a consumer can parse stdout without stripping terminal prose. Each
-document includes `schema_version: "quodet-review-output-v1"`, batch and
-snapshot metadata, complete findings, feedback-round ownership, and available
-timing fields. Agent spool payloads and the hidden evaluation-event stream keep
-their existing validated contracts; they do not parse the human formatter.
+In JSON mode, stdout is JSON Lines: every completed review is one validated JSON
+document on one line. Startup, progress, provider errors, redaction notices,
+and shutdown diagnostics go to stderr, so a consumer can parse stdout without
+stripping terminal prose or guessing where adjacent reviews end. Each document
+includes `schema_version: "quodet-review-output-v1"`, batch and snapshot
+metadata, complete findings, feedback-round ownership, and available timing
+fields. Agent spool payloads and the hidden evaluation-event stream keep their
+existing validated contracts; they do not parse the human formatter.
 
 Set `QUODET_OUTPUT=json` in a shell or service environment to persist the mode.
 An explicit `--output human` or `--output json` takes precedence over that

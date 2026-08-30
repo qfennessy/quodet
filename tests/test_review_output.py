@@ -102,6 +102,7 @@ class ReviewOutputTests(unittest.TestCase):
         document = json.loads(first)
 
         self.assertEqual(first, second)
+        self.assertNotIn("\n", first)
         self.assertEqual(document, review_output_document(review))
         self.assertEqual(document["schema_version"], OUTPUT_SCHEMA_VERSION)
         self.assertEqual(

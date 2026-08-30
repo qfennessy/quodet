@@ -90,11 +90,11 @@ def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
 
 
 def render_json_review(batch: ReviewBatchLike) -> str:
-    """Render deterministic, complete JSON for hooks, CI, evals, and scripts."""
+    """Render one deterministic JSON Lines document for machine consumers."""
     return json.dumps(
         review_output_document(batch),
         ensure_ascii=False,
-        indent=2,
+        separators=(",", ":"),
         sort_keys=True,
     )
 
