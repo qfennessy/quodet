@@ -111,6 +111,15 @@ def approved_qwen_config(plan: dict[str, object]) -> ModelRunConfig:
     )
 
 
+def bind_challenge_plan(
+    plan: dict[str, object], cases: list[dict[str, object]], *, attempts: int = 3,
+) -> dict[str, object]:
+    plan["evaluation_scope"] = benchmark.CHALLENGE_PLAN_SCOPE
+    plan["challenge_fixture"] = live_eval.challenge_plan_binding(cases)
+    plan["review_contract"]["attempts_per_case"] = attempts
+    return plan
+
+
 def plan_with_approved_hosted_artifact(
     *,
     model: str,
@@ -325,6 +334,139 @@ class AgentChangeReplayTests(unittest.TestCase):
             runtime_attestation.assert_not_called()
             watcher.assert_not_called()
 
+    def test_plan_scopes_keep_ordinary_and_challenge_attempts_disjoint(self) -> None:
+        ordinary_plan = benchmark.load_plan()
+        self.assertEqual(
+            ordinary_plan["evaluation_scope"], benchmark.ORDINARY_PLAN_SCOPE
+        )
+        repeated_ordinary = json.loads(json.dumps(ordinary_plan))
+        repeated_ordinary["review_contract"]["attempts_per_case"] = 3
+        with self.assertRaisesRegex(ValueError, "ordinary benchmark"):
+            benchmark.validate_plan(repeated_ordinary)
+
+        challenge_cases = challenge.model_cases("challenge-development")[:1]
+        for attempts in (1, 2):
+            with self.subTest(attempts=attempts):
+                invalid = bind_challenge_plan(
+                    json.loads(json.dumps(ordinary_plan)),
+                    challenge_cases,
+                    attempts=attempts,
+                )
+                with self.assertRaisesRegex(ValueError, "exactly three attempts"):
+                    benchmark.validate_plan(invalid)
+
+        qualification = bind_challenge_plan(
+            json.loads(json.dumps(ordinary_plan)), challenge_cases
+        )
+        benchmark.validate_plan(qualification)
+        live_eval.validate_plan_for_cases(qualification, challenge_cases, 3)
+        with self.assertRaisesRegex(ValueError, "must match the frozen"):
+            live_eval.validate_plan_for_cases(qualification, challenge_cases, 2)
+        with self.assertRaisesRegex(ValueError, "cannot authorize ordinary"):
+            live_eval.validate_plan_for_cases(
+                qualification, replay.load_manifest()["cases"][:1], 3
+            )
+        with self.assertRaisesRegex(ValueError, "cannot mix ordinary"):
+            live_eval.validate_plan_for_cases(
+                qualification,
+                [*challenge_cases, replay.load_manifest()["cases"][0]],
+                3,
+            )
+
+    def test_challenge_plan_digest_and_attempts_are_retained_in_provenance(
+        self,
+    ) -> None:
+        cases = challenge.model_cases("challenge-development")[:1]
+        plan = bind_challenge_plan(plan_with_approved_qwen_artifact(), cases)
+        config = approved_qwen_config(plan)
+        runtime_attestation = {
+            "llm_cli_version": "fixture",
+            "runtime": {"name": "llm-ollama", "version": "1.0"},
+            "model_registry_entry": "Ollama: qwen-eval",
+            "local_model": {
+                "runtime_model_id": "qwen3.5:35b-a3b",
+                "runtime_artifact_sha256": "a" * 64,
+            },
+        }
+        configuration = live_eval.evaluation_configuration(
+            model=config.model,
+            reasoning_effort=None,
+            prompt=watch_files.DEFAULT_PROMPT,
+            fixture_revision=3,
+            cases=cases,
+            debounce_seconds=3.0,
+            inter_file_delay_seconds=0.25,
+            attempts=3,
+            model_run_config=config,
+            benchmark_plan=plan,
+            runtime_attestation=runtime_attestation,
+        )
+
+        self.assertEqual(configuration["attempts_per_case"], 3)
+        self.assertEqual(
+            configuration["benchmark"]["plan_sha256"], benchmark.plan_sha256(plan)
+        )
+        self.assertEqual(
+            configuration["benchmark"]["runtime_attestation"], runtime_attestation
+        )
+        self.assertEqual(
+            benchmark.validate_model_run_config_against_plan(plan, config),
+            "qwen35-a3b-local",
+        )
+
+    def test_challenge_cost_preflight_budgets_every_frozen_attempt(self) -> None:
+        cases = challenge.model_cases("challenge-development")[:1]
+        plan = bind_challenge_plan(plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        ), cases)
+        config = approved_hosted_config(plan)
+        allowed = mock.Mock(allowed=True, maximum_cost_usd=40.0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plan_path = root / "plan.json"
+            config_path = root / "config.json"
+            artifacts.write_private_json(plan_path, plan)
+            artifacts.write_private_json(config_path, config.to_dict())
+            with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.preflight_model_run",
+                    return_value=allowed,
+                ) as preflight,
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime"
+                ) as runtime_attestation,
+                mock.patch(
+                    "evals.agent_changes.live_eval.subprocess.Popen"
+                ) as watcher,
+                self.assertRaisesRegex(ValueError, "experiment cap"),
+            ):
+                live_eval.main([
+                    cases[0]["id"],
+                    "--attempts", "3",
+                    "--model-run-config", str(config_path),
+                    "--benchmark-plan", str(plan_path),
+                    "--destination", str(root / "replay"),
+                    "--results-directory", str(root / "results"),
+                ])
+
+        preflight.assert_called_once()
+        runtime_attestation.assert_not_called()
+        watcher.assert_not_called()
+        with mock.patch(
+            "evals.agent_changes.live_eval.preflight_model_run",
+            return_value=allowed,
+        ):
+            self.assertEqual(
+                live_eval.benchmark_cost_preflight(config, cases, attempts=1),
+                40.0,
+            )
+
     def test_ordinary_benchmark_plan_cannot_authorize_challenge_bytes(self) -> None:
         plan = plan_with_approved_qwen_artifact()
         config = approved_qwen_config(plan)
@@ -375,6 +517,75 @@ class AgentChangeReplayTests(unittest.TestCase):
             [document.path for document in request.documents],
             [source_root / filename for filename in case["files"]],
         )
+
+    def test_challenge_provider_binding_hashes_selected_provider_visible_bytes(
+        self,
+    ) -> None:
+        cases = challenge.model_cases("challenge-development")[:2]
+        provider_hash = benchmark.provider_fixture_payload_sha256(cases=cases)
+        configuration = live_eval.evaluation_configuration(
+            model="test-model",
+            reasoning_effort=None,
+            prompt=watch_files.DEFAULT_PROMPT,
+            fixture_revision=3,
+            cases=cases,
+            debounce_seconds=3.0,
+            inter_file_delay_seconds=0.25,
+        )
+        binding = live_eval.challenge_plan_binding(cases)
+
+        self.assertIsNotNone(binding)
+        self.assertEqual(
+            configuration["fixture"]["provider_payload_sha256"], provider_hash
+        )
+        self.assertEqual(binding["provider_payload_sha256"], provider_hash)
+        self.assertNotEqual(
+            provider_hash, benchmark.provider_fixture_payload_sha256()
+        )
+        for case in cases:
+            for filename in case["files"]:
+                _, redactions = watch_files.redact_sensitive_path(
+                    replay.replay_relative_directory(case) / filename
+                )
+                self.assertEqual(redactions, 0)
+
+        unsafe_case = replay.case_by_id(
+            replay.load_manifest(), "12_semantically_invalid_external_value"
+        )
+        self.assertNotEqual(
+            replay.replay_relative_directory(unsafe_case), Path(unsafe_case["id"])
+        )
+        _, redactions = watch_files.redact_sensitive_path(
+            replay.replay_relative_directory(unsafe_case) / unsafe_case["files"][0]
+        )
+        self.assertEqual(redactions, 0)
+
+    def test_provider_payload_hash_tracks_redacted_payload_not_raw_secret(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source_root = Path(temporary_directory)
+            source = source_root / "service.py"
+            case = {
+                "id": "qd_fixture",
+                "files": ["service.py"],
+                "_source_root": source_root,
+            }
+            source.write_text(
+                'API_KEY = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"\n',
+                encoding="utf-8",
+            )
+            first = benchmark.provider_fixture_payload_sha256(cases=[case])
+            source.write_text(
+                'API_KEY = "sk-proj-zyxwvutsrqponmlkjihgfedcba654321"\n',
+                encoding="utf-8",
+            )
+            second = benchmark.provider_fixture_payload_sha256(cases=[case])
+            source.write_text("enabled = False\n", encoding="utf-8")
+            visible_change = benchmark.provider_fixture_payload_sha256(cases=[case])
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(second, visible_change)
 
     def test_watcher_command_pins_the_validated_config_bytes(self) -> None:
         plan = plan_with_approved_qwen_artifact()
@@ -508,10 +719,16 @@ class AgentChangeReplayTests(unittest.TestCase):
         finding = provider_finding(
             case["expected_findings"][0]["file"], "Concrete failure path",
         )
+        effective_config = {"candidate_id": "frozen-baseline"}
+        runtime_attestation = {
+            "runtime": {"name": "fixture", "version": "1.0"}
+        }
         found = live_eval.case_outcome(
             case,
             live_eval.ProviderOutcome(
                 "schema-valid", 1, "", "{}", {"findings": [finding]}, None,
+                effective_config=effective_config,
+                runtime_attestation=runtime_attestation,
             ),
             attempt_index=1,
             attempt_count=2,
@@ -520,11 +737,16 @@ class AgentChangeReplayTests(unittest.TestCase):
             case,
             live_eval.ProviderOutcome(
                 "schema-valid", 1, "", "{}", {"findings": []}, None,
+                effective_config=effective_config,
+                runtime_attestation=runtime_attestation,
             ),
             attempt_index=2,
             attempt_count=2,
         )
         self.assertNotEqual(found["sample_id"], missed["sample_id"])
+        for outcome in (found, missed):
+            self.assertEqual(outcome["effective_model_config"], effective_config)
+            self.assertEqual(outcome["runtime_attestation"], runtime_attestation)
         adjudication = {
             "run_id": "run-1", "fixture_revision": 3,
             "cases": {
@@ -1146,7 +1368,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             reasoning_effort=None,
             prompt=watch_files.DEFAULT_PROMPT,
             fixture_revision=3,
-            cases=[],
+            cases=[fixture_case],
             debounce_seconds=3.0,
             inter_file_delay_seconds=0.25,
             model_run_config=config,

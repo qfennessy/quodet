@@ -109,8 +109,42 @@ def challenge_plan_binding(
         "revision": challenge.load_index()["version"],
         "manifest_sha256": manifest_sha256(challenge_cases),
         "content_sha256": fixture_content_sha256(challenge_cases),
+        "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(
+            cases=challenge_cases
+        ),
         "case_ids": [case["id"] for case in challenge_cases],
     }
+
+
+def validate_plan_for_cases(
+    plan: dict[str, Any], cases: Sequence[dict[str, Any]], attempts: int,
+) -> None:
+    """Keep ordinary one-shot comparison and repeated challenge plans disjoint."""
+    expected_challenge_binding = challenge_plan_binding(cases)
+    if expected_challenge_binding is None:
+        if plan.get("evaluation_scope") != benchmark.ORDINARY_PLAN_SCOPE:
+            raise ValueError(
+                "challenge qualification plan cannot authorize ordinary fixtures"
+            )
+    else:
+        if any(case.get("evaluation_split") not in challenge.SPLITS for case in cases):
+            raise ValueError(
+                "challenge qualification plan cannot mix ordinary fixtures"
+            )
+        if (
+            plan.get("evaluation_scope") != benchmark.CHALLENGE_PLAN_SCOPE
+            or plan.get("challenge_fixture") != expected_challenge_binding
+        ):
+            raise ValueError(
+                "the benchmark plan is not bound to the selected challenge "
+                "fixture bytes, provider payload, and case IDs"
+            )
+    frozen_attempts = plan["review_contract"]["attempts_per_case"]
+    if attempts != frozen_attempts:
+        raise ValueError(
+            "--attempts must match the frozen benchmark review contract "
+            f"({frozen_attempts}) when --model-run-config is used"
+        )
 
 
 def runtime_provenance() -> dict[str, Any]:
@@ -184,7 +218,9 @@ def evaluation_configuration(
             "revision": fixture_revision,
             "manifest_sha256": manifest_sha256(cases),
             "fixture_tree_sha256": replay.fixture_tree_sha256(),
-            "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(),
+            "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(
+                cases=cases
+            ),
             "content_sha256": fixture_content_sha256(cases),
             "case_ids": [case["id"] for case in cases],
             "challenge_manifest_revision": (
@@ -571,7 +607,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def benchmark_cost_preflight(
     config: ModelRunConfig,
     cases: Sequence[dict[str, Any]],
+    *,
+    attempts: int = 1,
 ) -> float | None:
+    if attempts < 1:
+        raise ValueError("benchmark attempts must be at least one")
     maximum_costs: list[float] = []
     for case in cases:
         source_root = Path(
@@ -593,7 +633,7 @@ def benchmark_cost_preflight(
             maximum_costs.append(result.maximum_cost_usd)
     if not maximum_costs:
         return None
-    total = sum(maximum_costs)
+    total = sum(maximum_costs) * attempts
     assert config.max_cost_usd is not None
     if total > config.max_cost_usd:
         raise ValueError(
@@ -767,24 +807,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         benchmark.validate_model_run_config_against_plan(
             benchmark_plan, model_run_config,
         )
-        expected_challenge_binding = challenge_plan_binding(cases)
-        if expected_challenge_binding is not None and benchmark_plan.get(
-            "challenge_fixture"
-        ) != expected_challenge_binding:
-            raise ValueError(
-                "the benchmark plan is not bound to the selected challenge "
-                "fixture bytes and case IDs"
-            )
-        frozen_attempts = benchmark_plan["review_contract"]["attempts_per_case"]
-        if getattr(args, "attempts", 1) != frozen_attempts:
-            raise ValueError(
-                "--attempts must match the frozen benchmark review contract "
-                f"({frozen_attempts}) when --model-run-config is used"
-            )
+        validate_plan_for_cases(
+            benchmark_plan, cases, getattr(args, "attempts", 1)
+        )
         args.model_run_config_sha256 = model_run_config_sha256(model_run_config)
         args.benchmark_plan_sha256 = benchmark.plan_sha256(benchmark_plan)
         watch_files.validate_model_run_config_privacy(model_run_config)
-        maximum_authorized_cost = benchmark_cost_preflight(model_run_config, cases)
+        maximum_authorized_cost = benchmark_cost_preflight(
+            model_run_config, cases, attempts=getattr(args, "attempts", 1)
+        )
         runtime_attestation = attest_runtime(model_run_config)
         args.model = model_run_config.model
         args.review_timeout = model_run_config.timeout_seconds

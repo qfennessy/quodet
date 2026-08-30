@@ -528,8 +528,19 @@ uv run python -m evals.agent_changes.live_eval challenge-holdout --attempts 3 --
 
 The ordinary model-comparison plan does not authorize challenge fixture bytes.
 When `--model-run-config` is used, the supplied plan must also contain the exact
-challenge revision, combined manifest hash, content hash, and ordered case IDs;
-the runner fails closed if that dedicated binding is absent or stale.
+challenge revision, combined manifest hash, raw content hash, sanitized
+provider-payload hash, and ordered case IDs; the runner fails closed if that
+dedicated binding is absent or stale. Challenge replay IDs are short,
+deterministic directory identifiers whenever a descriptive case ID resembles a
+secret, so the credential-aware path redactor does not exclude valid fixture
+files. The descriptive case ID remains in the retained evaluation artifact.
+
+The ordinary plan declares `evaluation_scope: ordinary-benchmark` and freezes
+one attempt per case. Qualification uses a separate
+`evaluation_scope: challenge-qualification` plan bound to the selected challenge
+bytes and exactly three attempts. The runner rejects one- or two-attempt
+qualification plans, a CLI attempt count that differs from the frozen plan, and
+any attempt to use the repeated challenge contract for ordinary fixtures.
 
 Challenge scoring is stricter than filename matching. A true-positive
 adjudication must separately record the trigger, the complete failure path, and
