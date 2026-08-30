@@ -261,7 +261,10 @@ class AgentChangeReplayTests(unittest.TestCase):
             quantization="fp8",
             provider_model_revision="deepseek-v4-flash-test-revision",
         ), cases)
-        plan["execution_contract"]["reasoning_effort"] = "high"
+        plan["execution_contract"].update({
+            "temperature": None,
+            "reasoning_effort": "high",
+        })
         config = benchmark.prepare_run_config(
             plan,
             candidate_id="deepseek-v4-flash-hosted",
@@ -270,7 +273,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             runtime="test-runtime",
             runtime_version="1.0.0",
             quantization="fp8",
-            model_options={"temperature": 0, "reasoning_effort": "high"},
+            model_options={"reasoning_effort": "high"},
             timeout_seconds=60,
             max_output_tokens=4096,
             max_output_tokens_option="max_tokens",
@@ -291,7 +294,7 @@ class AgentChangeReplayTests(unittest.TestCase):
         )
         for reasoning_effort in ("low", "max", None):
             with self.subTest(reasoning_effort=reasoning_effort):
-                model_options = {"temperature": 0}
+                model_options = {}
                 if reasoning_effort is not None:
                     model_options["reasoning_effort"] = reasoning_effort
                 tampered = ModelRunConfig.from_dict({

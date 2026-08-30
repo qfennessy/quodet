@@ -78,16 +78,23 @@ def _matches_frozen_model_options(
     expected_reasoning_effort: Any = None,
 ) -> bool:
     temperature = model_options.get("temperature")
-    expected_keys = {"temperature"}
+    expected_keys: set[str] = set()
+    temperature_matches = expected_temperature is None
+    if expected_temperature is not None:
+        expected_keys.add("temperature")
+        temperature_matches = (
+            isinstance(expected_temperature, (int, float))
+            and not isinstance(expected_temperature, bool)
+            and isinstance(temperature, (int, float))
+            and not isinstance(temperature, bool)
+            and temperature == expected_temperature
+        )
     if expected_reasoning_effort is not None:
         expected_keys.add("reasoning_effort")
     return (
-        isinstance(expected_temperature, (int, float))
-        and not isinstance(expected_temperature, bool)
+        bool(expected_keys)
         and set(model_options) == expected_keys
-        and isinstance(temperature, (int, float))
-        and not isinstance(temperature, bool)
-        and temperature == expected_temperature
+        and temperature_matches
         and (
             expected_reasoning_effort is None
             or (
