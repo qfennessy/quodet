@@ -574,7 +574,7 @@ class WatchFilesTests(unittest.TestCase):
                 file_enum = schema["properties"]["findings"]["items"][
                     "properties"
                 ]["file"]["enum"]
-                self.assertEqual(file_enum, [f"{watch_files.REDACTED}.env"])
+                self.assertEqual(file_enum, ["source.env"])
                 self.assertFalse(
                     any(
                         secret_value in argument
