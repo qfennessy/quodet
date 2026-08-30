@@ -36,12 +36,25 @@ Responses are constrained to this JSON shape:
 ```
 
 When no confident negative findings exist, Luna returns `{"findings": []}`.
-Each `suggested_fix` is bounded to 2,000 characters and should name the relevant
-code element, describe the smallest behavior change tied to the demonstrated
-failure path, and include a narrow validation step. If supplied code is
-insufficient for a safe recommendation, it identifies the missing evidence
-instead of guessing. Recommendations are untrusted review data: independently
-verify both the diagnosis and fix, and do not apply them automatically.
+
+## Actionable recommended fixes
+
+[PR #3](https://github.com/qfennessy/quodet/pull/3) strengthened each finding's
+`suggested_fix` from an unconstrained string into a focused repair contract:
+
+- Recommendations are bounded to 2,000 characters and name the relevant code
+  element when the supplied evidence supports one.
+- They connect the smallest practical behavior change to the demonstrated
+  failure path and include a narrow regression test or validation step.
+- When the supplied files are insufficient for a safe repair, the reviewer
+  identifies the missing evidence instead of inventing architecture.
+- Recommendations remain untrusted review data. Coding agents and developers
+  must independently verify the diagnosis and fix; Quodet never auto-applies
+  the proposed change.
+
+PR #3 also added a frozen deterministic recommendation fixture and records the
+model, prompt SHA-256, fixture revision, and case IDs for separate live-model
+evaluations.
 
 It uses `gpt-5.6-luna` with `reasoning_effort=high` by default. The installed
 `llm` provider calls `high` its maximum supported reasoning level.
