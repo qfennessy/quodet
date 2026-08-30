@@ -542,9 +542,11 @@ def _reviewed_files_are_current(root: Path, reviewed_files: Sequence[ReviewedFil
     return True
 
 
-def _raw_hint_files_are_current(root: Path, value: object) -> bool:
+def _parse_raw_hint_files(
+    root: Path, value: object
+) -> tuple[ReviewedFile, ...] | None:
     if not isinstance(value, list) or not 0 < len(value) <= MAX_REVIEWED_FILES:
-        return False
+        return None
     reviewed: list[ReviewedFile] = []
     for item in value:
         if (
@@ -560,15 +562,23 @@ def _raw_hint_files_are_current(root: Path, value: object) -> bool:
             or not isinstance(item["size"], int)
             or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
         ):
-            return False
+            return None
         try:
             path = _normalize_finding_path(
                 item["path"], root.resolve(), {item["path"]}
             )
         except ReviewValidationError:
-            return False
+            return None
         reviewed.append(ReviewedFile(path, item["sha256"], item["size"]))
-    return _reviewed_files_are_current(root, reviewed)
+    return tuple(reviewed)
+
+
+def _raw_hint_has_current_file(root: Path, value: object) -> bool:
+    """Validate the complete hint shape but retain any current member."""
+    reviewed = _parse_raw_hint_files(root, value)
+    return reviewed is not None and any(
+        _reviewed_files_are_current(root, (item,)) for item in reviewed
+    )
 
 
 def publish_flush_hint(
@@ -998,7 +1008,7 @@ def matching_review_in_flight(
             and 0 < len(reviewed_files) <= MAX_REVIEWED_FILES
             and (
                 not validate_hint_files
-                or _raw_hint_files_are_current(root, reviewed_files)
+                or _raw_hint_has_current_file(root, reviewed_files)
             )
             and _session_is_owned(
                 directory,

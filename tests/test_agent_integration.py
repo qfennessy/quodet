@@ -18,6 +18,7 @@ import watch_files
 from feedback import (
     ReviewedFile,
     SpoolSink,
+    matching_review_in_flight,
     parse_review_output,
     publish_flush_hint,
     request_flush_hint,
@@ -862,6 +863,81 @@ class AgentIntegrationTests(unittest.TestCase):
             )
         self.assertIsNotNone(hint)
         self.assertEqual(list((self.spool / "flush-requests").glob("*.json")), [])
+
+    def test_stop_liveness_preserves_current_member_of_superseded_hint(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        sibling = self.root / "src" / "sibling.py"
+        sibling.write_text("sibling = 1\n", encoding="utf-8")
+        sibling_raw = sibling.read_bytes()
+        first_metadata = (
+            self._batch(route).reviewed_files[0],
+            ReviewedFile(
+                "src/sibling.py",
+                hashlib.sha256(sibling_raw).hexdigest(),
+                len(sibling_raw),
+            ),
+        )
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=first_metadata,
+            )
+        replacement = b"value = 2\n"
+        self.source.write_bytes(replacement)
+        replacement_metadata = ReviewedFile(
+            "src/app.py",
+            hashlib.sha256(replacement).hexdigest(),
+            len(replacement),
+        )
+        with mock.patch("feedback.time.time", return_value=100.1):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=(replacement_metadata,),
+            )
+        with mock.patch("feedback.time.time", return_value=100.11):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            self.assertTrue(
+                matching_review_in_flight(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                )
+            )
+            self.assertEqual(
+                len(list((self.spool / "flush-hints").glob("*.json"))), 2
+            )
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+
+        self.assertIsNotNone(hint)
+        self.assertEqual(
+            {item.path: item for item in hint.reviewed_files},  # type: ignore[union-attr]
+            {
+                "src/app.py": replacement_metadata,
+                "src/sibling.py": first_metadata[1],
+            },
+        )
 
     def test_unhinted_watch_event_keeps_normal_debounce(self) -> None:
         route, _ = self._route()
