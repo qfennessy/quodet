@@ -1202,9 +1202,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             measured_debounce_ms = max(
                 0.0, (batch_flushed_at - first_observed_at) * 1_000
             )
+            agent_session_id = (
+                triggered.flush_hint.agent_session_id
+                if triggered.flush_hint is not None
+                else None
+            )
             marker = (
                 spool_sink.begin_review(
-                    agent_session_id=triggered.flush_hint.agent_session_id,
+                    agent_session_id=agent_session_id,
                     review_timeout=args.review_timeout,
                     flush_hint=triggered.flush_hint,
                 )
@@ -1232,6 +1237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         first_observed_at=first_observed_at,
                         batch_flushed_at=batch_flushed_at,
                         review_coordinator=spool_sink,
+                        agent_session_id=agent_session_id,
                     )
             finally:
                 if triggered.flush_hint is not None:

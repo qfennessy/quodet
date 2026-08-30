@@ -432,6 +432,45 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertNotIn(current, observed_at)
         self.assertEqual(observed_at, {unrelated: 75.0})
 
+    def test_provider_review_refreshes_authenticated_in_flight_marker(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        observed_markers: list[dict[str, object]] = []
+
+        def capture_marker(*args: object, **kwargs: object) -> None:
+            marker_paths = list((self.spool / "in-flight").glob("*.json"))
+            self.assertEqual(len(marker_paths), 1)
+            observed_markers.append(json.loads(marker_paths[0].read_text()))
+
+        with mock.patch(
+            "watch_files._execute_review_command", side_effect=capture_marker
+        ):
+            watch_files.review_files(
+                [self.source],
+                root=self.root,
+                exclude_patterns=[],
+                max_bytes=1_000_000,
+                model="test-model",
+                prompt="review",
+                log=False,
+                review_timeout=1.0,
+                reasoning_effort=None,
+                review_coordinator=sink,
+                agent_session_id="live-agent-session",
+            )
+
+        self.assertEqual(
+            observed_markers[0]["agent_session_id"], "live-agent-session"
+        )
+        self.assertEqual(list((self.spool / "in-flight").glob("*.json")), [])
+
     def test_multi_file_hint_keeps_one_logical_edit_in_one_batch(self) -> None:
         route, _ = self._route()
         codex_feedback_hook.verify_session_lease(
