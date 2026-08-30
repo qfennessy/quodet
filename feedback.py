@@ -17,7 +17,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Protocol, Sequence, TextIO
+from typing import Mapping, Protocol, Sequence, TextIO
 
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_review
 from redaction import RedactionSummary, redaction_summary_from_document, redact_text
@@ -178,7 +178,12 @@ def _bounded_string(value: object, field: str, maximum: int) -> str:
     return value
 
 
-def _normalize_finding_path(value: object, root: Path, reviewed: set[str]) -> str:
+def _normalize_finding_path(
+    value: object,
+    root: Path,
+    reviewed: set[str],
+    provider_path_map: Mapping[str, str] | None = None,
+) -> str:
     raw = _bounded_string(value, "file", MAX_PATH_LENGTH)
     candidate = PurePosixPath(raw)
     if candidate.is_absolute() or ".." in candidate.parts or raw.startswith("~"):
@@ -188,13 +193,21 @@ def _normalize_finding_path(value: object, root: Path, reviewed: set[str]) -> st
         raise ReviewValidationError(
             "finding path must exactly match the supplied relative path"
         )
+    if provider_path_map is not None:
+        mapped = provider_path_map.get(raw)
+        if mapped is None:
+            raise ReviewValidationError(
+                "finding path was not one of the provider-visible paths"
+            )
+    else:
+        mapped = normalized
     try:
-        (root / normalized).resolve(strict=False).relative_to(root)
+        (root / mapped).resolve(strict=False).relative_to(root)
     except (OSError, ValueError) as error:
         raise ReviewValidationError("finding path escapes watched root") from error
-    if normalized not in reviewed:
+    if mapped not in reviewed:
         raise ReviewValidationError("finding path was not part of the reviewed snapshot")
-    return normalized
+    return mapped
 
 
 def parse_review_output(
@@ -202,6 +215,7 @@ def parse_review_output(
     *,
     root: Path,
     reviewed_files: Sequence[ReviewedFile],
+    provider_path_map: Mapping[str, str] | None = None,
     session_id: str | None = None,
     feedback_round: int = 1,
     debounce_ms: float = 0.0,
@@ -265,7 +279,9 @@ def parse_review_output(
             )
         findings.append(
             ReviewFinding(
-                file=_normalize_finding_path(raw["file"], root, reviewed),
+                file=_normalize_finding_path(
+                    raw["file"], root, reviewed, provider_path_map
+                ),
                 line=line,
                 severity=severity,
                 confidence=float(confidence),

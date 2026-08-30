@@ -280,6 +280,17 @@ class WatchFilesTests(unittest.TestCase):
             ],
         )
 
+    def test_response_schema_binds_only_exact_provider_visible_paths(self) -> None:
+        labels = ("src/app.py", "tests/test_app.py")
+        schema = json.loads(watch_files.response_schema_json(labels))
+        file_schema = schema["properties"]["findings"]["items"]["properties"][
+            "file"
+        ]
+
+        self.assertEqual(file_schema["enum"], list(labels))
+        self.assertNotIn("project/src/app.py", file_schema["enum"])
+        self.assertNotIn("tests/test_future.py", file_schema["enum"])
+
     def test_default_prompt_requests_only_confident_negative_json(self) -> None:
         prompt = watch_files.DEFAULT_PROMPT.lower()
         self.assertIn("only negative findings", prompt)
@@ -505,6 +516,38 @@ class WatchFilesTests(unittest.TestCase):
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz1234567890", secret_sanitized)
         self.assertGreater(secret_count, 0)
 
+    def test_provider_path_mapping_is_private_and_rejects_redaction_collisions(
+        self,
+    ) -> None:
+        first_secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        second_secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+
+        def snapshot(relative: str) -> watch_files.SourceSnapshot:
+            path = Path("/tmp") / relative
+            return watch_files.SourceSnapshot(path, Path(relative), "", "0" * 64, 0)
+
+        single = watch_files.provider_path_mapping(
+            [snapshot(f"src/{first_secret}.py")]
+        )
+        provider_label = next(iter(single))
+        schema_json = watch_files.response_schema_json(tuple(single))
+        self.assertNotIn(first_secret, provider_label)
+        self.assertNotIn(first_secret, schema_json)
+        self.assertEqual(single[provider_label], f"src/{first_secret}.py")
+
+        with self.assertRaisesRegex(
+            watch_files.ReviewValidationError,
+            "provider-visible path labels collide",
+        ) as raised:
+            watch_files.provider_path_mapping(
+                [
+                    snapshot(f"src/{first_secret}.py"),
+                    snapshot(f"src/{second_secret}.py"),
+                ]
+            )
+        self.assertNotIn(first_secret, str(raised.exception))
+        self.assertNotIn(second_secret, str(raised.exception))
+
     def test_review_sends_only_sanitized_temporary_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
@@ -527,6 +570,11 @@ class WatchFilesTests(unittest.TestCase):
                 uploaded = observed_path.read_text()
                 self.assertNotIn(secret, uploaded)
                 self.assertIn(watch_files.REDACTED, uploaded)
+                schema = json.loads(command[command.index("--schema") + 1])
+                file_enum = schema["properties"]["findings"]["items"][
+                    "properties"
+                ]["file"]["enum"]
+                self.assertEqual(file_enum, [f"{watch_files.REDACTED}.env"])
                 self.assertFalse(
                     any(
                         secret_value in argument

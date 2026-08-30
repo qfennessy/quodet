@@ -95,6 +95,7 @@ def evaluation_configuration(
             "revision": watch_files.REVIEW_SCHEMA_REVISION,
             "sha256": sha256_text(schema_text),
             "value": watch_files.REVIEW_SCHEMA,
+            "finding_file_binding": "per-batch-provider-visible-enum",
         },
         "fixture": {
             "revision": fixture_revision,
@@ -433,7 +434,12 @@ def benchmark_cost_preflight(
                 for filename in case["files"]
             ),
             prompt=watch_files.DEFAULT_PROMPT,
-            schema_json=watch_files.REVIEW_SCHEMA_JSON,
+            schema_json=watch_files.response_schema_json(
+                tuple(
+                    watch_files.redact_sensitive_path(Path(filename))[0]
+                    for filename in case["files"]
+                )
+            ),
             cwd=REPOSITORY_ROOT,
         )
         result = preflight_model_run(config, request)

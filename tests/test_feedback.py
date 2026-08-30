@@ -201,6 +201,42 @@ class FeedbackTests(unittest.TestCase):
             ):
                 self.parse(valid_output(finding_path))
 
+    def test_parse_maps_exact_sanitized_provider_path_without_leaking_it(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        original = f"src/{secret}.py"
+        source = self.root / original
+        source.write_text("value = 2\n", encoding="utf-8")
+        import hashlib
+
+        reviewed = (
+            ReviewedFile(
+                original,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                source.stat().st_size,
+            ),
+        )
+        provider_label = "src/[REDACTED].py"
+        raw = json.loads(valid_output(provider_label))
+        raw["findings"][0]["suggested_fix"] = (
+            "Change the assignment and add tests/test_future.py."
+        )
+
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            provider_path_map={provider_label: original},
+        )
+
+        self.assertEqual(batch.findings[0].file, original)
+        with self.assertRaisesRegex(ReviewValidationError, "provider-visible"):
+            parse_review_output(
+                valid_output(original),
+                root=self.root,
+                reviewed_files=reviewed,
+                provider_path_map={provider_label: original},
+            )
+
     def test_freshness_removes_finding_after_file_changes(self) -> None:
         batch = self.parse(valid_output())
         (self.root / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")

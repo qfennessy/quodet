@@ -396,6 +396,10 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(configuration["prompt"]["revision"], watch_files.PROMPT_REVISION)
         self.assertEqual(configuration["schema"]["value"], watch_files.REVIEW_SCHEMA)
         self.assertEqual(configuration["schema"]["revision"], watch_files.REVIEW_SCHEMA_REVISION)
+        self.assertEqual(
+            configuration["schema"]["finding_file_binding"],
+            "per-batch-provider-visible-enum",
+        )
         self.assertEqual(configuration["fixture"]["revision"], 3)
         self.assertEqual(configuration["fixture"]["case_ids"], [case["id"] for case in cases])
 

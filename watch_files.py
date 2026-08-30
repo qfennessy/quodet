@@ -181,6 +181,20 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 REVIEW_SCHEMA_JSON = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
+
+
+def response_schema_json(provider_paths: Sequence[str]) -> str:
+    """Bind finding.file to the exact sanitized labels visible to the provider."""
+    labels = tuple(provider_paths)
+    if not labels or len(labels) != len(set(labels)):
+        raise ReviewValidationError("provider-visible paths must be unique")
+    schema = json.loads(REVIEW_SCHEMA_JSON)
+    schema["properties"]["findings"]["items"]["properties"]["file"][
+        "enum"
+    ] = list(labels)
+    return json.dumps(schema, separators=(",", ":"))
+
+
 DEFAULT_IGNORED_PARTS = frozenset(
     {
         ".git",
@@ -537,6 +551,20 @@ def _safe_path_label(path: Path) -> str:
     return redact_path(path).text
 
 
+def provider_path_mapping(
+    snapshots: Sequence[SourceSnapshot],
+) -> dict[str, str]:
+    """Map unique provider-visible labels back to private reviewed paths."""
+    mapping: dict[str, str] = {}
+    for snapshot in snapshots:
+        label, _ = redact_sensitive_path(snapshot.relative_path)
+        original = snapshot.relative_path.as_posix()
+        if label in mapping and mapping[label] != original:
+            raise ReviewValidationError("provider-visible path labels collide")
+        mapping[label] = original
+    return mapping
+
+
 def collect_attachments(
     paths: Iterable[Path],
     *,
@@ -706,6 +734,7 @@ def build_llm_command(
     prompt: str,
     log: bool,
     reasoning_effort: str | None,
+    schema_json: str = REVIEW_SCHEMA_JSON,
 ) -> list[str]:
     command = [
         "llm",
@@ -714,7 +743,7 @@ def build_llm_command(
         model,
         "--no-stream",
         "--schema",
-        REVIEW_SCHEMA_JSON,
+        schema_json,
     ]
     if reasoning_effort is not None:
         command.extend(["--option", "reasoning_effort", reasoning_effort])
@@ -883,6 +912,9 @@ def review_files(
                 )
             return published_batch
 
+        provider_path_map = provider_path_mapping(sanitized_batch.snapshots)
+        schema_json = response_schema_json(tuple(provider_path_map))
+
         labels = [
             _safe_path_label(snapshot.relative_path)
             for snapshot in sanitized_batch.snapshots
@@ -908,6 +940,7 @@ def review_files(
                 prompt=sanitized_prompt.text,
                 log=log,
                 reasoning_effort=reasoning_effort,
+                schema_json=schema_json,
             )
             if model_run_config is None
             else None
@@ -940,6 +973,8 @@ def review_files(
                 sanitized_attachments=sanitized_batch.attachments,
                 sanitized_prompt=sanitized_prompt.text,
                 redactions=redactions,
+                schema_json=schema_json,
+                provider_path_map=provider_path_map,
                 log=log,
             )
         finally:
@@ -975,6 +1010,8 @@ def _execute_review_command(
     sanitized_attachments: Sequence[Attachment],
     sanitized_prompt: str,
     redactions: RedactionSummary,
+    schema_json: str,
+    provider_path_map: dict[str, str],
     log: bool,
 ) -> ReviewBatch | None:
     provider_started_at = time.time()
@@ -994,7 +1031,7 @@ def _execute_review_command(
                         for document in sanitized_attachments
                     ),
                     prompt=sanitized_prompt,
-                    schema_json=REVIEW_SCHEMA_JSON,
+                    schema_json=schema_json,
                     cwd=root,
                     log=log,
                 ),
@@ -1120,6 +1157,7 @@ def _execute_review_command(
             print(f"llm exited with status {result.returncode}", file=sys.stderr)
         return None
 
+    reviewed_paths = set(provider_path_map.values())
     reviewed_files = tuple(
         ReviewedFile(
             path=snapshot.relative_path.as_posix(),
@@ -1127,12 +1165,14 @@ def _execute_review_command(
             size=snapshot.size,
         )
         for snapshot in snapshots
+        if snapshot.relative_path.as_posix() in reviewed_paths
     )
     try:
         batch = parse_review_output(
             result.stdout,
             root=root,
             reviewed_files=reviewed_files,
+            provider_path_map=provider_path_map,
             session_id=session_id,
             feedback_round=feedback_round,
             debounce_ms=debounce_ms,
