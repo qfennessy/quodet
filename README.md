@@ -3,12 +3,12 @@
 Quodet was created at [Sundai Hack 138](https://sundai.club). Sundai Club is a
 community for building and launching AI prototypes every Sunday.
 
-Quodet's goal is to integrate directly with coding-agent workflows and provide
-extremely low-latency code-quality feedback while an agent is still working.
-The independent watcher batches related file changes, reviews the current code,
-and is designed to return defects with high model-reported confidence quickly
-enough for the coding agent to verify and address them in the same development
-loop. That raw score is a reviewer claim, not a calibrated probability.
+Quodet gives coding agents fast, independent code-quality feedback while the
+edit context is still fresh. That lets an agent verify and repair genuine
+defects before commit, pull request, or human review instead of discovering
+them later. Findings are untrusted model suggestions: Quodet never applies them
+automatically, and the agent or developer must independently verify each one
+before changing code.
 
 See [EXAMPLES.md](EXAMPLES.md) for complete buggy evaluation snippets and the
 focused fixes Quodet recommended during a live review.
@@ -499,15 +499,16 @@ without a model:
 uv run python -m evals.agent_changes.challenge verify all
 ```
 
-The candidates are deliberately not described as proven model misses. No live
-baseline calls have been made, so every entry records zero valid baseline misses
-and remains `candidate-not-qualified`. A candidate becomes a qualified challenge
-only after a second reader verifies it and the same frozen baseline misses its
-real trigger and failure path in three valid attempts. Provider errors, malformed
-responses, timeouts, and unavailable runtimes do not qualify it. Challenge
-metrics report valid and invalid attempt counts separately; invalid attempts do
-not enter defect-recall or clean-twin false-positive-rate denominators, and a
-rate remains unavailable until at least one valid attempt exists.
+The candidates are deliberately not described as proven model misses. No
+completed baseline qualification evidence is checked in: every entry records
+zero valid baseline misses and remains `candidate-not-qualified`. A candidate
+becomes a qualified challenge only after a second reader verifies it and the
+same frozen baseline misses its real trigger and failure path in three valid
+attempts. Provider errors, malformed responses, timeouts, and unavailable
+runtimes do not qualify it. Challenge metrics report valid and invalid attempt
+counts separately; invalid attempts do not enter defect-recall or clean-twin
+false-positive-rate denominators, and a rate remains unavailable until at least
+one valid attempt exists.
 
 Development and holdout candidates live under different directories and
 manifests. This is a process seal, not encryption: directly reading a holdout
