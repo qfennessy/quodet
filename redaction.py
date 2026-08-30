@@ -200,10 +200,14 @@ class RedactionSummaryBuilder:
         available = self._limit - len(self._notices)
         if available <= 0:
             return
+        # Display metadata is best-effort. If a caller supplies a path that is
+        # not independently safe to retain, omit the path instead of crashing
+        # the long-running watcher while preserving the value-free notice.
+        notice_file = file if file is None or _is_safe_notice_path(file) else None
         for detected in redacted.detections[:available]:
             self._notices.append(
                 RedactionNotice(
-                    file=file,
+                    file=notice_file,
                     line=detected.line if line_available else None,
                     category=detected.category,
                     masked_identifier=detected.masked_identifier,
@@ -438,13 +442,16 @@ def _is_safe_mask(value: str) -> bool:
 
 
 def _is_safe_notice_path(value: str) -> bool:
-    normalized = PurePosixPath(value).as_posix()
+    path = PurePosixPath(value)
+    normalized = path.as_posix()
     return not (
         not value
         or len(value) > MAX_REDACTION_PATH_LENGTH
         or value.startswith(("/", "~"))
         or "\\" in value
         or normalized != value
-        or ".." in PurePosixPath(value).parts
-        or redact_text(value).total
+        or ".." in path.parts
+        # Path sanitization is component-based so separators cannot join
+        # otherwise benign build-artifact names into one base64-like token.
+        or any(redact_text(part).total for part in path.parts)
     )

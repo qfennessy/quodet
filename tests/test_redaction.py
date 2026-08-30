@@ -89,6 +89,40 @@ class RedactionTests(unittest.TestCase):
         windows = redact_path(PureWindowsPath("src\\nested\\app.py"))
         self.assertEqual(windows.text, "src/nested/app.py")
 
+    def test_rust_artifact_path_can_be_reported_without_cross_separator_secret(
+        self,
+    ) -> None:
+        path = Path(
+            "uniqc/target/debug/deps/"
+            "uniqc-76126ca4a39e92cb.enpgo75k0i7vum73ua9a7igha.1jzr1ni.rcgu.o"
+        )
+        redacted = redact_path(path)
+        builder = RedactionSummaryBuilder()
+
+        # The complete path happens to match the generic base64 alphabet, but
+        # no individual path component is a detected secret.
+        builder.add(
+            RedactedText(
+                text="[REDACTED]",
+                total=1,
+                detections=redact_text(SYNTHETIC_TOKEN_A).detections,
+            ),
+            file=redacted.text,
+            disposition="excluded",
+        )
+
+        self.assertEqual(builder.build().notices[0].file, redacted.text)
+
+    def test_summary_omits_an_unsafe_path_instead_of_crashing(self) -> None:
+        builder = RedactionSummaryBuilder()
+        builder.add(
+            redact_text(SYNTHETIC_TOKEN_A),
+            file=SYNTHETIC_TOKEN_A,
+            disposition="excluded",
+        )
+
+        self.assertIsNone(builder.build().notices[0].file)
+
     def test_summary_is_bounded_and_records_sent_or_excluded(self) -> None:
         source = "\n".join(
             f"API_KEY={SYNTHETIC_TOKEN_A}{index:02d}" for index in range(30)

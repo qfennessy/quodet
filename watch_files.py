@@ -502,6 +502,17 @@ def _is_inside_python_virtual_environment(relative_path: Path, root: Path) -> bo
     return False
 
 
+def _is_inside_cargo_target(relative_path: Path, root: Path) -> bool:
+    """Return whether a path is beneath a Cargo package's build target."""
+    for index, part in enumerate(relative_path.parts):
+        if part != "target":
+            continue
+        package_root = root.joinpath(*relative_path.parts[:index])
+        if (package_root / "Cargo.toml").is_file():
+            return True
+    return False
+
+
 def is_excluded(
     relative_path: Path,
     patterns: Sequence[str],
@@ -516,6 +527,8 @@ def is_excluded(
     ):
         return True
     if root is not None and _is_inside_python_virtual_environment(relative_path, root):
+        return True
+    if root is not None and _is_inside_cargo_target(relative_path, root):
         return True
 
     return any(
