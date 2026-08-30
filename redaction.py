@@ -193,7 +193,10 @@ class RedactionSummaryBuilder:
     ) -> None:
         if disposition not in VALID_DISPOSITIONS:
             raise ValueError("invalid redaction disposition")
-        self._total += redacted.total
+        self._total = min(
+            MAX_REDACTIONS_PER_BATCH,
+            self._total + redacted.total,
+        )
         available = self._limit - len(self._notices)
         if available <= 0:
             return
@@ -218,7 +221,10 @@ class RedactionSummaryBuilder:
 
     def extend(self, summary: RedactionSummary) -> None:
         """Add an already-bounded summary without expanding omitted records."""
-        self._total += summary.total
+        self._total = min(
+            MAX_REDACTIONS_PER_BATCH,
+            self._total + summary.total,
+        )
         available = self._limit - len(self._notices)
         if available > 0:
             self._notices.extend(summary.notices[:available])
@@ -316,7 +322,10 @@ def redact_text(text: str) -> RedactedText:
             record(source, match, category=category, identifier=identifier)
             value = match.group("value")
             if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
-                replacement = f"{value[0]}{REDACTED}{value[0]}"
+                newline_padding = "\n" * value.count("\n")
+                replacement = (
+                    f"{value[0]}{REDACTED}{newline_padding}{value[0]}"
+                )
             else:
                 replacement = REDACTED
             return f"{match.group('prefix')}{replacement}"

@@ -731,6 +731,21 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertNotEqual(first[0].sha256, raw_digest)
         self.assertNotIn(first_secret[:10], json.dumps(first[0].__dict__))
 
+    def test_direct_edit_hook_excludes_sensitive_filename_from_hint(self) -> None:
+        filename_secret = "ghp_" + "a1B2" * 8
+        source = self.root / "src" / f"{filename_secret}.env"
+        source.write_text("name=safe\n", encoding="utf-8")
+
+        reviewed = codex_feedback_hook._hint_reviewed_files(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": os.fspath(source)},
+            },
+            root=self.root,
+        )
+
+        self.assertEqual(reviewed, ())
+
     def test_wrong_session_flush_hint_is_rejected(self) -> None:
         route, _ = self._route()
         self.assertTrue(

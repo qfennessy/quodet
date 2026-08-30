@@ -6,6 +6,8 @@ from pathlib import Path, PureWindowsPath
 
 from redaction import (
     MAX_REDACTION_NOTICES,
+    MAX_REDACTIONS_PER_BATCH,
+    RedactedText,
     RedactionSummaryBuilder,
     mask_identifier,
     redact_path,
@@ -60,6 +62,16 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("synthetic-material-only", redacted.text)
         self.assertEqual(redacted.text.count("\n"), source.count("\n"))
 
+    def test_multiline_quoted_assignment_preserves_following_line_numbers(self) -> None:
+        source = 'PASSWORD="first\nsecond"\nAPI_KEY=synthetic-value\n'
+
+        redacted = redact_text(source)
+
+        self.assertEqual(redacted.text.count("\n"), source.count("\n"))
+        self.assertEqual([item.line for item in redacted.detections], [1, 3])
+        self.assertNotIn("first", redacted.text)
+        self.assertNotIn("second", redacted.text)
+
     def test_mask_identifier_handles_short_and_unicode_key_names(self) -> None:
         self.assertEqual(mask_identifier("id"), "I…D")
         self.assertEqual(mask_identifier("clé_secrète"), "CLÉS…ÈTE")
@@ -96,6 +108,21 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(summary.total, 31)
         self.assertEqual(summary.omitted, 11)
         self.assertEqual(summary.notices[0].disposition, "sent")
+
+    def test_summary_count_saturates_instead_of_crashing_watcher(self) -> None:
+        builder = RedactionSummaryBuilder()
+        detected = RedactedText(
+            text="[REDACTED]",
+            total=MAX_REDACTIONS_PER_BATCH,
+            detections=(),
+        )
+
+        builder.add(detected, file="generated.env", disposition="sent")
+        builder.add(detected, file="generated.env", disposition="sent")
+        summary = builder.build()
+
+        self.assertEqual(summary.total, MAX_REDACTIONS_PER_BATCH)
+        self.assertEqual(summary.omitted, MAX_REDACTIONS_PER_BATCH)
 
     def test_retained_document_validator_rejects_unbounded_or_unsafe_metadata(self) -> None:
         safe = {
