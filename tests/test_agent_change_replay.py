@@ -861,6 +861,12 @@ class AgentChangeReplayTests(unittest.TestCase):
         ]["runtime_artifact_sha256"] = "b" * 64
         with self.assertRaisesRegex(ValueError, "local-model attestation differs"):
             benchmark.build_scorecard(plan, [tampered_case_attestation])
+        cli_version_drift = json.loads(json.dumps(run))
+        cli_version_drift["cases"][0]["runtime_attestation"][
+            "llm_cli_version"
+        ] = "different"
+        with self.assertRaisesRegex(ValueError, "CLI version differs"):
+            benchmark.build_scorecard(plan, [cli_version_drift])
         wrong_effective_config = json.loads(json.dumps(run))
         wrong_effective_config["cases"][0]["effective_model_config"][
             "runtime_version"

@@ -441,7 +441,8 @@ def _validate_runtime_attestation(
     attestation: object,
     *,
     label: str,
-) -> None:
+    expected_cli_version: str | None = None,
+) -> str:
     """Bind a recorded runtime observation to the exact effective config."""
     if not isinstance(attestation, Mapping):
         raise ValueError(f"{label} is missing live runtime attestation")
@@ -454,6 +455,13 @@ def _validate_runtime_attestation(
     llm_cli_version = attestation.get("llm_cli_version")
     if not isinstance(llm_cli_version, str) or not llm_cli_version.strip():
         raise ValueError(f"{label} is missing its exact llm CLI version")
+    if (
+        expected_cli_version is not None
+        and llm_cli_version != expected_cli_version
+    ):
+        raise ValueError(
+            f"{label} llm CLI version differs from the startup attestation"
+        )
     registry_entry = attestation.get("model_registry_entry")
     if not isinstance(registry_entry, str) or (
         model_config.get("model") not in watch_files._listed_model_entries(
@@ -474,6 +482,7 @@ def _validate_runtime_attestation(
             raise ValueError(
                 f"{label} local-model attestation differs from exact config"
             )
+    return llm_cli_version
 
 
 def validate_run_against_plan(
@@ -548,9 +557,10 @@ def validate_run_against_plan(
             raise ValueError(
                 "run hosted identity differs from the frozen candidate binding"
             )
-    _validate_runtime_attestation(
+    startup_attestation = benchmark.get("runtime_attestation")
+    startup_cli_version = _validate_runtime_attestation(
         model_config,
-        benchmark.get("runtime_attestation"),
+        startup_attestation,
         label="run",
     )
     fixture = configuration.get("fixture", {})
@@ -618,6 +628,7 @@ def validate_run_against_plan(
                 model_config,
                 outcome.get("runtime_attestation"),
                 label=f"scored run case {case_id}",
+                expected_cli_version=startup_cli_version,
             )
         elif model_attempted is False:
             if outcome.get("model_attempt_count") is not None:
