@@ -475,7 +475,8 @@ def collect_attachments(
     max_bytes: int,
 ) -> list[Attachment]:
     attachments: list[Attachment] = []
-    for path in sorted(set(paths)):
+    ordered_paths = sorted(set(paths))
+    for index, path in enumerate(ordered_paths):
         relative_path = relative_to_root(path, root)
         if relative_path is None or is_excluded(
             relative_path,
@@ -509,11 +510,11 @@ def collect_attachments(
         attachments.append(Attachment(
             path=resolved_path, media_type="text/plain"))
         if len(attachments) == MAX_REVIEWED_FILES:
-            print(
-                f"Review batch capped at {MAX_REVIEWED_FILES} files; "
-                "remaining files in this event batch were skipped.",
-                file=sys.stderr,
-            )
+            if index + 1 < len(ordered_paths):
+                print(
+                    f"Direct review batch capped at {MAX_REVIEWED_FILES} files.",
+                    file=sys.stderr,
+                )
             break
     return attachments
 
@@ -880,6 +881,13 @@ def next_batch(changes: queue.Queue[Path], debounce: float) -> set[Path]:
             return batch
 
 
+def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
+    """Split a drained event set without dropping paths beyond the review cap."""
+    ordered = sorted(set(paths))
+    for index in range(0, len(ordered), MAX_REVIEWED_FILES):
+        yield tuple(ordered[index : index + MAX_REVIEWED_FILES])
+
+
 def validate_runtime(path: Path, model: str) -> Path:
     root = path.expanduser().resolve()
     if not root.is_dir():
@@ -941,22 +949,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Model: {args.model}; debounce: {args.debounce:g}s")
     try:
         while True:
-            review_files(
-                next_batch(changes, args.debounce),
-                root=root,
-                exclude_patterns=args.exclude,
-                max_bytes=args.max_bytes,
-                model=args.model,
-                prompt=args.prompt,
-                log=args.log,
-                review_timeout=args.review_timeout,
-                reasoning_effort=resolve_reasoning_effort(
-                    args.model, args.reasoning_effort
-                ),
-                evaluation_events=args.evaluation_events,
-                sink=sink,
-                session_id=args.session_id,
-            )
+            event_batch = next_batch(changes, args.debounce)
+            for review_batch in bounded_review_batches(event_batch):
+                review_files(
+                    review_batch,
+                    root=root,
+                    exclude_patterns=args.exclude,
+                    max_bytes=args.max_bytes,
+                    model=args.model,
+                    prompt=args.prompt,
+                    log=args.log,
+                    review_timeout=args.review_timeout,
+                    reasoning_effort=resolve_reasoning_effort(
+                        args.model, args.reasoning_effort
+                    ),
+                    evaluation_events=args.evaluation_events,
+                    sink=sink,
+                    session_id=args.session_id,
+                )
     except KeyboardInterrupt:
         print("\nStopping watcher.")
     finally:

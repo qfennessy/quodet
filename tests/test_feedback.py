@@ -8,16 +8,20 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 import codex_feedback_hook
 from feedback import (
+    MAX_PROVIDER_OUTPUT_BYTES,
+    MAX_SPOOL_PAYLOAD_BYTES,
     MAX_TITLE_LENGTH,
     ConsoleSink,
     ReviewValidationError,
     ReviewedFile,
     SpoolSink,
+    UNTRUSTED_NOTICE,
     fresh_findings,
     fresh_spooled_payload,
     parse_review_output,
@@ -154,6 +158,44 @@ class FeedbackTests(unittest.TestCase):
                 root=self.root,
                 session_id="agent-c",
             )
+
+    def test_spool_envelope_can_safely_exceed_provider_response_limit(self) -> None:
+        raw = json.loads(valid_output())
+        raw["findings"] = [
+            {
+                **raw["findings"][0],
+                "line": index + 1,
+                "title": f"Finding {index}",
+                "explanation": "x" * 7_000,
+            }
+            for index in range(30)
+        ]
+        provider_output = json.dumps(raw)
+        self.assertLess(len(provider_output.encode()), MAX_PROVIDER_OUTPUT_BYTES)
+        batch = self.parse(provider_output)
+        long_paths = tuple(
+            ReviewedFile(
+                path=f"extra/{index}/" + "/".join(["x" * 80] * 10),
+                sha256="0" * 64,
+                size=0,
+            )
+            for index in range(99)
+        )
+        batch = replace(batch, reviewed_files=batch.reviewed_files + long_paths)
+        payload = batch.to_dict()
+        payload["notice"] = UNTRUSTED_NOTICE
+        encoded = json.dumps(payload, separators=(",", ":")).encode()
+        self.assertGreater(len(encoded), MAX_PROVIDER_OUTPUT_BYTES)
+        self.assertLess(len(encoded), MAX_SPOOL_PAYLOAD_BYTES)
+
+        spool = self.base / "large-runtime" / "feedback"
+        self.assertTrue(
+            SpoolSink(spool, root=self.root, session_id="agent-a").publish(batch)
+        )
+        claim = codex_feedback_hook.claim_feedback(
+            spool, root=self.root, session_id="agent-a"
+        )
+        self.assertIsNotNone(claim)
 
     def test_duplicate_review_is_published_once_and_edit_rounds_are_bounded(self) -> None:
         spool = self.base / "runtime" / "feedback"

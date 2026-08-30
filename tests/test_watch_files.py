@@ -16,6 +16,15 @@ import watch_files
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_review_batches_retain_every_path_beyond_the_provider_cap(self) -> None:
+        paths = [Path(f"/tmp/source-{index}.py") for index in range(205)]
+        batches = list(watch_files.bounded_review_batches(paths))
+
+        self.assertEqual([len(batch) for batch in batches], [100, 100, 5])
+        self.assertEqual(
+            [path for batch in batches for path in batch], sorted(paths)
+        )
+
     def test_default_debounce_groups_related_agent_changes(self) -> None:
         args = watch_files.parse_args(["."])
         self.assertEqual(args.debounce, 3.0)

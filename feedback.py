@@ -6,8 +6,8 @@ into bounded values before they can be displayed or delivered to an agent.
 
 from __future__ import annotations
 
-import hashlib
 import errno
+import hashlib
 import json
 import os
 import stat
@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - Windows lacks flock.
 MAX_FINDINGS = 50
 MAX_REVIEWED_FILES = 100
 MAX_PROVIDER_OUTPUT_BYTES = 256_000
+MAX_SPOOL_PAYLOAD_BYTES = 1_048_576
 MAX_REVIEWED_FILE_BYTES = 100_000_000
 MAX_PATH_LENGTH = 1_024
 MAX_TITLE_LENGTH = 300
@@ -432,6 +433,9 @@ class SpoolSink:
             return False
         payload = batch.to_dict()
         payload["notice"] = UNTRUSTED_NOTICE
+        encoded_payload = json.dumps(payload, separators=(",", ":")).encode()
+        if len(encoded_payload) > MAX_SPOOL_PAYLOAD_BYTES:
+            raise ReviewValidationError("spooled batch exceeds envelope size limit")
         fingerprint = self._fingerprint(batch)
         filename = f"{fingerprint}.json"
         states = ("pending", "claimed", "acknowledged")

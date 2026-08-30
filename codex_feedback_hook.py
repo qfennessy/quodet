@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from feedback import (
-    MAX_PROVIDER_OUTPUT_BYTES,
+    MAX_SPOOL_PAYLOAD_BYTES,
     UNTRUSTED_NOTICE,
     ReviewValidationError,
     fresh_spooled_payload,
@@ -41,7 +41,7 @@ def _private_directory(directory: Path, name: str) -> Path:
 
 def _load_payload(path: Path) -> dict[str, object] | None:
     try:
-        if path.stat().st_size > MAX_PROVIDER_OUTPUT_BYTES:
+        if path.stat().st_size > MAX_SPOOL_PAYLOAD_BYTES:
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
