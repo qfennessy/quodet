@@ -239,6 +239,23 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                     "unsupported-test-mutation",
                 )
 
+    def test_explicit_rspec_context_rejects_unknown_spec_symbol(self) -> None:
+        for recommendation in (
+            "Extend missing_spec in the RSpec suite with a boundary assertion.",
+            "Edit missing_spec in the spec suite to assert the boundary.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["request.py"],
+                )
+
+                self.assertEqual(result["status"], "failure")
+                self.assertEqual(
+                    result["violations"][0]["code"],
+                    "unsupported-test-mutation",
+                )
+
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
             "Preserve the existing cache regression test.",

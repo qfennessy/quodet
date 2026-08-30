@@ -40,6 +40,10 @@ _SPEC_SYMBOL = re.compile(
     r"(?<![A-Za-z0-9_])[A-Za-z0-9_]+_spec(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_SPEC_TEST_CONTEXT = re.compile(
+    r"\brspec\b|\bspec\s+(?:suite|tests?|cases?)\b",
+    re.IGNORECASE,
+)
 _MUTATION_VERB = re.compile(
     r"\b(?:preserve|retain|extend|modify|update|keep|change|edit)\b",
     re.IGNORECASE,
@@ -113,7 +117,7 @@ def _mutates_unsupplied_test(
         _SPEC_SYMBOL.fullmatch(symbol) is not None
         for symbol in visible_clause_symbols
     )
-    if test_matches or visible_spec_symbol:
+    if test_matches or visible_spec_symbol or _SPEC_TEST_CONTEXT.search(clause):
         test_matches.extend(_SPEC_SYMBOL.finditer(clause))
         test_matches.sort(key=lambda match: match.start())
     for test_match in test_matches:
