@@ -206,6 +206,11 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         for recommendation in (
             "Update API_SPEC to require tenant_id.",
             "Change request_spec to include tenant_id.",
+            "Update API_SPEC to require tenant_id without changing tests.",
+            (
+                "Update API_SPEC to require tenant_id without changing "
+                "missing_spec in the RSpec suite."
+            ),
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
@@ -245,6 +250,7 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
             "Edit missing_spec in the spec suite to assert the boundary.",
             "Extend missing_spec in the spec folder with a boundary assertion.",
             "Edit missing_spec in the specs directory to assert the boundary.",
+            "Edit missing_spec in specs/ to assert the boundary.",
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
@@ -257,6 +263,38 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                     result["violations"][0]["code"],
                     "unsupported-test-mutation",
                 )
+
+    def test_spec_symbol_context_matrix(self) -> None:
+        cases = (
+            ("Update API_SPEC to require tenant_id.", (), "grounded"),
+            (
+                "Update API_SPEC without changing tests.",
+                (),
+                "grounded",
+            ),
+            ("Extend missing_spec test case.", (), "failure"),
+            ("Extend missing_spec in the RSpec suite.", (), "failure"),
+            ("Extend missing_spec in specs/.", (), "failure"),
+            (
+                "Extend known_spec and missing_spec with assertions.",
+                ("known_spec",),
+                "failure",
+            ),
+            (
+                "Update API_SPEC while you add a new missing_spec "
+                "in the RSpec suite.",
+                (),
+                "grounded",
+            ),
+        )
+        for recommendation, visible_symbols, expected in cases:
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["request.py"],
+                    supplied_test_symbols=visible_symbols,
+                )
+                self.assertEqual(result["status"], expected)
 
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
