@@ -948,6 +948,18 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(metrics["challenge_invalid_attempts"], 2)
         self.assertEqual(metrics["challenge_defect_recall"], 1.0)
         self.assertEqual(metrics["challenge_clean_twin_false_positive_rate"], 1.0)
+        self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (1, 1, 0))
+        split = metrics["by_split"]["challenge-development"]
+        self.assertEqual(split, {"tp": 1, "fp": 1, "fn": 0})
+        split_metrics = metrics["split_metrics"]["challenge-development"]
+        self.assertEqual(split_metrics["attempted_cases"], 4)
+        self.assertEqual(split_metrics["schema_valid_rate"], 0.5)
+        self.assertEqual(split_metrics["finding_precision"], 0.5)
+        self.assertEqual(split_metrics["finding_recall"], 1.0)
+        for family in buggy["failure_families"]:
+            self.assertEqual(
+                metrics["by_family"][family], {"tp": 1, "fp": 1, "fn": 0}
+            )
 
     def test_challenge_rates_are_unavailable_without_valid_attempts(self) -> None:
         case = challenge.model_cases("challenge-development")[0]
@@ -966,6 +978,18 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(metrics["challenge_invalid_attempts"], 1)
         self.assertIsNone(metrics["challenge_defect_recall"])
         self.assertIsNone(metrics["challenge_clean_twin_false_positive_rate"])
+        self.assertEqual((metrics["tp"], metrics["fp"], metrics["fn"]), (0, 0, 0))
+        split = metrics["by_split"]["challenge-development"]
+        self.assertEqual(split, {"tp": 0, "fp": 0, "fn": 0})
+        split_metrics = metrics["split_metrics"]["challenge-development"]
+        self.assertEqual(split_metrics["attempted_cases"], 1)
+        self.assertEqual(split_metrics["schema_valid_rate"], 0.0)
+        self.assertIsNone(split_metrics["finding_precision"])
+        self.assertIsNone(split_metrics["finding_recall"])
+        for family in case["failure_families"]:
+            self.assertEqual(
+                metrics["by_family"][family], {"tp": 0, "fp": 0, "fn": 0}
+            )
 
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
