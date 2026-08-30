@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
+import io
 import json
 import queue
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import watch_files
 from evals.agent_changes import live_eval, replay, scoring
@@ -138,6 +141,72 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(outcome.raw_response, raw_response)
         self.assertEqual(outcome.parsed_response, response)
         self.assertGreaterEqual(outcome.latency_ms, 0)
+
+    def test_live_schema_validation_matches_recorded_schema_and_strict_json(self) -> None:
+        finding = provider_finding("", "")
+        finding["title"] = ""
+        finding["extra_provider_field"] = "allowed by the recorded schema"
+        self.assertIsNone(live_eval.validate_response({"findings": [finding]}))
+
+        output: queue.Queue[str] = queue.Queue()
+        raw_response = json.dumps({"findings": [provider_finding("a.py", "bug")]})
+        raw_response = raw_response.replace("0.99", "NaN")
+        output.put(json.dumps({"quodet_evaluation_event": {
+            "status": "success", "returncode": 0,
+            "raw_response": raw_response, "stderr": "",
+        }}) + "\n")
+        outcome = live_eval.wait_for_outcome(output, timeout=1)
+        self.assertEqual(outcome.status, "schema-error")
+        self.assertIn("invalid JSON constant", outcome.error or "")
+
+    def test_live_eval_persists_completed_cases_when_replay_fails(self) -> None:
+        manifest = replay.load_manifest()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = argparse.Namespace(
+                case="all",
+                destination=root / "replay",
+                results_directory=root / "results",
+                model="test-model",
+                reasoning_effort="auto",
+                debounce=0.01,
+                review_timeout=0.01,
+                inter_file_delay=0,
+                settle=0.01,
+                log=False,
+            )
+            process = mock.Mock(stdout=io.StringIO(), poll=mock.Mock(return_value=0))
+            provider = live_eval.ProviderOutcome(
+                status="schema-valid",
+                latency_ms=1,
+                transcript="",
+                raw_response='{\"findings\": []}',
+                parsed_response={"findings": []},
+                error=None,
+            )
+            with (
+                mock.patch("evals.agent_changes.live_eval.parse_args", return_value=args),
+                mock.patch("evals.agent_changes.live_eval.subprocess.Popen", return_value=process),
+                mock.patch("evals.agent_changes.live_eval.threading.Thread"),
+                mock.patch("evals.agent_changes.live_eval.wait_for_startup"),
+                mock.patch("evals.agent_changes.live_eval.time.sleep"),
+                mock.patch(
+                    "evals.agent_changes.live_eval.replay.replay_case",
+                    side_effect=[None, RuntimeError("fixture failed")],
+                ),
+                mock.patch(
+                    "evals.agent_changes.live_eval.wait_for_outcome",
+                    return_value=provider,
+                ),
+                self.assertRaisesRegex(RuntimeError, "fixture failed"),
+            ):
+                live_eval.main([])
+
+            artifacts = list((root / "results").glob("*.raw.json"))
+            self.assertEqual(len(artifacts), 1)
+            artifact = json.loads(artifacts[0].read_text())
+            self.assertEqual(len(artifact["cases"]), 1)
+            self.assertEqual(artifact["cases"][0]["case_id"], manifest["cases"][0]["id"])
 
     def test_filename_match_is_diagnostic_not_true_positive(self) -> None:
         case = replay.case_by_id(replay.load_manifest(), "12_semantically_invalid_external_value")

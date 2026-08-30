@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import queue
 import signal
 import subprocess
@@ -94,41 +95,60 @@ def wait_for_startup(output: queue.Queue[str], timeout: float = 15.0) -> None:
 
 
 def validate_response(value: Any) -> str | None:
+    schema = watch_files.REVIEW_SCHEMA
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
         return "response must contain a findings array"
-    required = set(
-        watch_files.REVIEW_SCHEMA["properties"]["findings"]["items"]["required"]
-    )
+    item_schema = schema["properties"]["findings"]["items"]
+    properties = item_schema["properties"]
+    required = set(item_schema["required"])
     for index, finding in enumerate(value["findings"]):
         if not isinstance(finding, dict):
             return f"finding {index} is not an object"
         missing = required - finding.keys()
         if missing:
             return f"finding {index} is missing {sorted(missing)}"
-        if not isinstance(finding["file"], str) or not finding["file"]:
+        if not isinstance(finding["file"], str):
             return f"finding {index} has an invalid file"
         if "line" in finding and (
             isinstance(finding["line"], bool)
             or not isinstance(finding["line"], int)
-            or finding["line"] < 1
+            or finding["line"] < properties["line"]["minimum"]
         ):
             return f"finding {index} has an invalid line"
-        if finding["severity"] not in {"critical", "high", "medium", "low"}:
+        if finding["severity"] not in properties["severity"]["enum"]:
             return f"finding {index} has an invalid severity"
         confidence = finding["confidence"]
         if (
             isinstance(confidence, bool)
             or not isinstance(confidence, (int, float))
-            or confidence < 0.95
-            or confidence > 1
+            or not math.isfinite(confidence)
+            or confidence < properties["confidence"]["minimum"]
+            or confidence > properties["confidence"]["maximum"]
         ):
             return f"finding {index} has invalid confidence"
-        for field in ("title", "explanation", "suggested_fix"):
-            if not isinstance(finding[field], str) or not finding[field]:
+        for field in ("title", "explanation"):
+            if not isinstance(finding[field], str):
                 return f"finding {index} has an invalid {field}"
-        if len(finding["suggested_fix"]) > 2000:
-            return f"finding {index} has an overlong suggested_fix"
+        suggested_fix = finding["suggested_fix"]
+        fix_schema = properties["suggested_fix"]
+        if (
+            not isinstance(suggested_fix, str)
+            or len(suggested_fix) < fix_schema["minLength"]
+            or len(suggested_fix) > fix_schema["maxLength"]
+        ):
+            return f"finding {index} has an invalid suggested_fix"
     return None
+
+
+def parse_provider_response(raw_response: object) -> Any:
+    """Parse strict JSON, rejecting JavaScript constants accepted by json.loads."""
+    if not isinstance(raw_response, str):
+        raise TypeError("provider response is not text")
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    return json.loads(raw_response, parse_constant=reject_constant)
 
 
 def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOutcome:
@@ -172,8 +192,8 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                     str(event.get("stderr") or "provider invocation failed"),
                 )
             try:
-                parsed = json.loads(raw_response)
-            except (TypeError, json.JSONDecodeError) as error:
+                parsed = parse_provider_response(raw_response)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
                 return ProviderOutcome(
                     "schema-error", round((time.monotonic() - started) * 1000),
                     "".join(transcript),
@@ -208,9 +228,14 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
 
         raw_response = "".join(raw_lines)
         try:
-            parsed = json.loads(raw_response)
+            parsed = parse_provider_response(raw_response)
         except json.JSONDecodeError:
             continue
+        except (TypeError, ValueError) as error:
+            return ProviderOutcome(
+                "schema-error", round((time.monotonic() - started) * 1000),
+                "".join(transcript), raw_response, None, str(error),
+            )
         schema_error = validate_response(parsed)
         return ProviderOutcome(
             "schema-error" if schema_error else "schema-valid",
@@ -346,16 +371,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Raw evaluation artifact: {artifact}")
         return 0
 
-    args.destination.mkdir(parents=True, exist_ok=True)
-    process = subprocess.Popen(
-        watcher_command(args), cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
-    assert process.stdout is not None
-    output: queue.Queue[str] = queue.Queue()
-    threading.Thread(target=_read_lines, args=(process.stdout, output), daemon=True).start()
     outcomes: list[dict[str, Any]] = []
+    process: subprocess.Popen[str] | None = None
+    interrupted = False
+    artifact: Path | None = None
     try:
+        args.destination.mkdir(parents=True, exist_ok=True)
+        process = subprocess.Popen(
+            watcher_command(args), cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        assert process.stdout is not None
+        output: queue.Queue[str] = queue.Queue()
+        threading.Thread(
+            target=_read_lines, args=(process.stdout, output), daemon=True
+        ).start()
         wait_for_startup(output)
         time.sleep(args.settle)
         for case in cases:
@@ -374,19 +404,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"filename_match={outcome['diagnostics']['filename_match']}; "
                 "semantic adjudication=pending", flush=True,
             )
+    except BaseException:
+        interrupted = True
+        raise
     finally:
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        artifact = write_raw_run(
+            results_directory=args.results_directory, configuration=configuration,
+            cases=outcomes, started_at=started_at,
+        )
+        if interrupted:
+            print(f"\nPartial raw evaluation artifact: {artifact}", file=sys.stderr)
 
-    artifact = write_raw_run(
-        results_directory=args.results_directory, configuration=configuration,
-        cases=outcomes, started_at=started_at,
-    )
+    assert artifact is not None
     print(f"\nRaw evaluation artifact: {artifact}")
     print("Semantic adjudication is required before TP/FP/FN are reported.")
     return 0 if all(outcome["status"] == "schema-valid" for outcome in outcomes) else 1
