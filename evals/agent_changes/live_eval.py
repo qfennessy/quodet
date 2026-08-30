@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import queue
 import re
 import signal
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 import watch_files
-from evals.agent_changes import artifacts, benchmark, replay, scoring
+from evals.agent_changes import artifacts, benchmark, challenge, replay, scoring
 from evals.recommended_fixes import scoring as recommendation_scoring
 from model_runner import (
     ModelDocument,
@@ -66,14 +67,139 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def manifest_sha256() -> str:
-    return hashlib.sha256(replay.MANIFEST_PATH.read_bytes()).hexdigest()
+def manifest_sha256(cases: Sequence[dict[str, Any]] = ()) -> str:
+    digest = hashlib.sha256(replay.MANIFEST_PATH.read_bytes())
+    challenge_splits = {
+        case["evaluation_split"] for case in cases
+        if case.get("evaluation_split") in challenge.SPLITS
+    }
+    if challenge_splits:
+        digest.update(challenge.INDEX_PATH.read_bytes())
+        for split in sorted(challenge_splits):
+            digest.update((challenge.split_directory(split) / "manifest.json").read_bytes())
+    return digest.hexdigest()
+
+
+def fixture_content_sha256(cases: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for case in cases:
+        source_root = Path(
+            case.get("_source_root", replay.CASES_ROOT / case["id"])
+        )
+        for filename in case["files"]:
+            data = (source_root / filename).read_bytes()
+            label = f"{case['id']}/{filename}".encode()
+            digest.update(len(label).to_bytes(8, "big"))
+            digest.update(label)
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+    return digest.hexdigest()
+
+
+def challenge_plan_binding(
+    cases: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    challenge_cases = [
+        case for case in cases
+        if case.get("evaluation_split") in challenge.SPLITS
+    ]
+    if not challenge_cases:
+        return None
+    return {
+        "revision": challenge.load_index()["version"],
+        "manifest_sha256": manifest_sha256(challenge_cases),
+        "content_sha256": fixture_content_sha256(challenge_cases),
+        "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(
+            cases=challenge_cases
+        ),
+        "case_ids": [case["id"] for case in challenge_cases],
+    }
+
+
+def validate_plan_for_cases(
+    plan: dict[str, Any], cases: Sequence[dict[str, Any]], attempts: int,
+    *, debounce_seconds: float, inter_file_delay_seconds: float,
+) -> None:
+    """Keep ordinary one-shot comparison and repeated challenge plans disjoint."""
+    expected_challenge_binding = challenge_plan_binding(cases)
+    if expected_challenge_binding is None:
+        if plan.get("evaluation_scope") != benchmark.ORDINARY_PLAN_SCOPE:
+            raise ValueError(
+                "challenge qualification plan cannot authorize ordinary fixtures"
+            )
+    else:
+        if any(case.get("evaluation_split") not in challenge.SPLITS for case in cases):
+            raise ValueError(
+                "challenge qualification plan cannot mix ordinary fixtures"
+            )
+        if (
+            plan.get("evaluation_scope") != benchmark.CHALLENGE_PLAN_SCOPE
+            or plan.get("challenge_fixture") != expected_challenge_binding
+        ):
+            raise ValueError(
+                "the benchmark plan is not bound to the selected challenge "
+                "fixture bytes, provider payload, and case IDs"
+            )
+        if any(len(case["files"]) > watch_files.MAX_REVIEWED_FILES for case in cases):
+            raise ValueError(
+                "challenge qualification case exceeds one provider review batch"
+            )
+        if (
+            any(len(case["files"]) > 1 for case in cases)
+            and inter_file_delay_seconds >= debounce_seconds
+        ):
+            raise ValueError(
+                "challenge qualification --inter-file-delay must be shorter "
+                "than --debounce so every case reaches one provider batch"
+            )
+    frozen_attempts = plan["review_contract"]["attempts_per_case"]
+    if attempts != frozen_attempts:
+        raise ValueError(
+            "--attempts must match the frozen benchmark review contract "
+            f"({frozen_attempts}) when --model-run-config is used"
+        )
+
+
+def runtime_provenance() -> dict[str, Any]:
+    uname = os.uname() if hasattr(os, "uname") else None
+    value: dict[str, Any] = {
+        "provider_runtime": "llm CLI",
+        "python": sys.version,
+        "platform": {
+            "sys_platform": sys.platform,
+            "system": uname.sysname if uname else os.name,
+            "release": uname.release if uname else None,
+            "machine": uname.machine if uname else None,
+        },
+    }
+    for label, command in (
+        ("quodet_commit", ["git", "rev-parse", "HEAD"]),
+        ("llm_version", ["llm", "--version"]),
+        ("llm_plugins", ["llm", "plugins"]),
+    ):
+        try:
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=5, check=False, cwd=REPOSITORY_ROOT,
+            )
+        except (OSError, TypeError, subprocess.TimeoutExpired) as error:
+            value[label] = {"status": "unavailable", "error": str(error)}
+        else:
+            value[label] = {
+                "status": "ok" if result.returncode == 0 else "error",
+                "returncode": result.returncode,
+                "output": result.stdout.strip(),
+            }
+    return value
 
 
 def evaluation_configuration(
     *, model: str, reasoning_effort: str | None, prompt: str,
     fixture_revision: int, cases: Sequence[dict[str, Any]],
     debounce_seconds: float, inter_file_delay_seconds: float,
+    attempts: int = 1,
+    runtime: dict[str, Any] | None = None,
+    runner_options: dict[str, Any] | None = None,
     model_run_config: ModelRunConfig | None = None,
     benchmark_plan: dict[str, Any] | None = None,
     maximum_authorized_cost_usd: float | None = None,
@@ -87,6 +213,9 @@ def evaluation_configuration(
             "debounce_seconds": debounce_seconds,
             "inter_file_delay_seconds": inter_file_delay_seconds,
         },
+        "attempts_per_case": attempts,
+        "runtime": runtime or {"provider_runtime": "llm CLI"},
+        "runner_options": runner_options or {},
         "prompt": {
             "revision": watch_files.PROMPT_REVISION,
             "sha256": sha256_text(prompt),
@@ -100,10 +229,18 @@ def evaluation_configuration(
         },
         "fixture": {
             "revision": fixture_revision,
-            "manifest_sha256": manifest_sha256(),
+            "manifest_sha256": manifest_sha256(cases),
             "fixture_tree_sha256": replay.fixture_tree_sha256(),
-            "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(),
+            "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(
+                cases=cases
+            ),
+            "content_sha256": fixture_content_sha256(cases),
             "case_ids": [case["id"] for case in cases],
+            "challenge_manifest_revision": (
+                challenge.load_index()["version"]
+                if any(case.get("evaluation_split") in challenge.SPLITS for case in cases)
+                else None
+            ),
         },
     }
     if model_run_config is not None:
@@ -170,15 +307,19 @@ def wait_for_startup(output: queue.Queue[str], timeout: float = 15.0) -> None:
 
 def case_provider_paths(case: dict[str, Any]) -> tuple[str, ...]:
     """Return the exact sanitized paths exposed by the replay watcher."""
+    replay_directory = replay.replay_relative_directory(case)
     return tuple(
-        watch_files.redact_sensitive_path(Path(case["id"]) / filename)[0]
+        watch_files.redact_sensitive_path(replay_directory / filename)[0]
         for filename in case["files"]
     )
 
 
 def case_test_symbols(case: dict[str, Any]) -> tuple[str, ...]:
+    source_root = Path(
+        case.get("_source_root", replay.CASES_ROOT / case["id"])
+    )
     sources = tuple(
-        (replay.CASES_ROOT / case["id"] / filename).read_text(encoding="utf-8")
+        (source_root / filename).read_text(encoding="utf-8")
         for filename, provider_path in zip(
             case["files"], case_provider_paths(case), strict=True
         )
@@ -351,7 +492,10 @@ def wait_for_outcome(
         )
 
 
-def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, Any]:
+def case_outcome(
+    case: dict[str, Any], provider: ProviderOutcome, *,
+    attempt_index: int = 1, attempt_count: int = 1,
+) -> dict[str, Any]:
     case_schema_error = (
         validate_response(
             provider.parsed_response,
@@ -378,8 +522,13 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         supplied_files=case_provider_paths(case),
         supplied_test_symbols=case_test_symbols(case),
     )
-    return {
+    outcome = {
         "case_id": case["id"],
+        "sample_id": (
+            f"{case['id']}#attempt-{attempt_index}" if attempt_count > 1 else case["id"]
+        ),
+        "attempt_index": attempt_index,
+        "attempt_count": attempt_count,
         "evaluation_split": case["evaluation_split"],
         "failure_families": case["failure_families"],
         "scope": case["scope"],
@@ -410,6 +559,13 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
             "recommendation_grounding": recommendation_grounding,
         },
     }
+    if "challenge_pair_id" in case:
+        outcome.update({
+            "challenge_pair_id": case["challenge_pair_id"],
+            "challenge_variant": case["challenge_variant"],
+            "qualification": case["qualification"],
+        })
+    return outcome
 
 
 def watcher_command(args: argparse.Namespace) -> list[str]:
@@ -448,6 +604,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--review-timeout", type=float, default=60.0)
     parser.add_argument("--inter-file-delay", type=float, default=0.25)
     parser.add_argument("--settle", type=float, default=1.5)
+    parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--log", action="store_true")
     parser.add_argument("--model-run-config", type=Path)
     parser.add_argument(
@@ -455,22 +612,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     for name in ("debounce", "review_timeout", "settle"):
-        if getattr(args, name) <= 0:
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be greater than zero")
-    if args.inter_file_delay < 0:
-        parser.error("--inter-file-delay cannot be negative")
+    if not math.isfinite(args.inter_file_delay) or args.inter_file_delay < 0:
+        parser.error("--inter-file-delay must be finite and non-negative")
+    if args.attempts < 1:
+        parser.error("--attempts must be at least one")
     return args
 
 
 def benchmark_cost_preflight(
     config: ModelRunConfig,
     cases: Sequence[dict[str, Any]],
+    *,
+    attempts: int = 1,
 ) -> float | None:
+    if attempts < 1:
+        raise ValueError("benchmark attempts must be at least one")
     maximum_costs: list[float] = []
     for case in cases:
+        source_root = Path(
+            case.get("_source_root", replay.CASES_ROOT / case["id"])
+        )
         request = ModelRunRequest(
             documents=tuple(
-                ModelDocument(replay.CASES_ROOT / case["id"] / filename)
+                ModelDocument(source_root / filename)
                 for filename in case["files"]
             ),
             prompt=watch_files.DEFAULT_PROMPT,
@@ -484,7 +650,7 @@ def benchmark_cost_preflight(
             maximum_costs.append(result.maximum_cost_usd)
     if not maximum_costs:
         return None
-    total = sum(maximum_costs)
+    total = sum(maximum_costs) * attempts
     assert config.max_cost_usd is not None
     if total > config.max_cost_usd:
         raise ValueError(
@@ -601,6 +767,13 @@ def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
 
 
 def select_cases(manifest: dict[str, Any], selector: str) -> list[dict[str, Any]]:
+    if selector in challenge.SPLITS:
+        return challenge.model_cases(selector)
+    if "__" in selector:
+        try:
+            return [challenge.case_by_id(selector)]
+        except ValueError:
+            pass
     if selector == "all":
         return list(manifest["cases"])
     by_split = [case for case in manifest["cases"] if case["evaluation_split"] == selector]
@@ -651,10 +824,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         benchmark.validate_model_run_config_against_plan(
             benchmark_plan, model_run_config,
         )
+        validate_plan_for_cases(
+            benchmark_plan,
+            cases,
+            getattr(args, "attempts", 1),
+            debounce_seconds=args.debounce,
+            inter_file_delay_seconds=args.inter_file_delay,
+        )
         args.model_run_config_sha256 = model_run_config_sha256(model_run_config)
         args.benchmark_plan_sha256 = benchmark.plan_sha256(benchmark_plan)
         watch_files.validate_model_run_config_privacy(model_run_config)
-        maximum_authorized_cost = benchmark_cost_preflight(model_run_config, cases)
+        maximum_authorized_cost = benchmark_cost_preflight(
+            model_run_config, cases, attempts=getattr(args, "attempts", 1)
+        )
         runtime_attestation = attest_runtime(model_run_config)
         args.model = model_run_config.model
         args.review_timeout = model_run_config.timeout_seconds
@@ -669,6 +851,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         cases=cases,
         debounce_seconds=args.debounce,
         inter_file_delay_seconds=args.inter_file_delay,
+        attempts=getattr(args, "attempts", 1),
+        runtime=runtime_provenance(),
+        runner_options={
+            "debounce_seconds": args.debounce,
+            "review_timeout_seconds": args.review_timeout,
+            "inter_file_delay_seconds": args.inter_file_delay,
+            "settle_seconds": args.settle,
+        },
         model_run_config=model_run_config,
         benchmark_plan=benchmark_plan,
         maximum_authorized_cost_usd=maximum_authorized_cost,
@@ -704,45 +894,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         ).start()
         wait_for_startup(output)
         time.sleep(args.settle)
+        attempt_count = getattr(args, "attempts", 1)
         for case in cases:
-            print(f"\nReplaying {case['id']} ({case['difficulty']})", flush=True)
-            outcome_index = len(outcomes)
-            outcomes.append(case_outcome(
-                case,
-                ProviderOutcome(
-                    status="interrupted", latency_ms=0, transcript="",
-                    raw_response=None, parsed_response=None,
-                    error="attempt started but did not produce a complete outcome",
-                ),
-            ))
-            try:
-                replay.replay_case(
-                    case, destination=args.destination,
-                    inter_file_delay=args.inter_file_delay,
+            for attempt_index in range(1, attempt_count + 1):
+                print(
+                    f"\nReplaying {case['id']} ({case['difficulty']}); "
+                    f"attempt {attempt_index}/{attempt_count}", flush=True,
                 )
-                provider = wait_for_outcome(
-                    output,
-                    timeout=args.debounce + args.review_timeout + 15,
-                    allowed_files=case_provider_paths(case),
-                )
-            except BaseException as error:
-                if not isinstance(error, KeyboardInterrupt):
-                    outcomes[outcome_index] = case_outcome(
-                        case,
-                        ProviderOutcome(
-                            status="harness-error", latency_ms=0, transcript="",
-                            raw_response=None, parsed_response=None,
-                            error=f"{type(error).__name__}: {error}",
-                        ),
+                outcome_index = len(outcomes)
+                outcomes.append(case_outcome(
+                    case,
+                    ProviderOutcome(
+                        status="interrupted", latency_ms=0, transcript="",
+                        raw_response=None, parsed_response=None,
+                        error="attempt started but did not produce a complete outcome",
+                    ),
+                    attempt_index=attempt_index,
+                    attempt_count=attempt_count,
+                ))
+                try:
+                    replay.replay_case(
+                        case, destination=args.destination,
+                        inter_file_delay=args.inter_file_delay,
                     )
-                raise
-            outcome = case_outcome(case, provider)
-            outcomes[outcome_index] = outcome
-            print(
-                f"RAW {case['id']}: status={outcome['status']}; "
-                f"filename_match={outcome['diagnostics']['filename_match']}; "
-                "semantic adjudication=pending", flush=True,
-            )
+                    provider = wait_for_outcome(
+                        output,
+                        timeout=args.debounce + args.review_timeout + 15,
+                        allowed_files=case_provider_paths(case),
+                    )
+                except BaseException as error:
+                    if not isinstance(error, KeyboardInterrupt):
+                        outcomes[outcome_index] = case_outcome(
+                            case,
+                            ProviderOutcome(
+                                status="harness-error", latency_ms=0, transcript="",
+                                raw_response=None, parsed_response=None,
+                                error=f"{type(error).__name__}: {error}",
+                            ),
+                            attempt_index=attempt_index,
+                            attempt_count=attempt_count,
+                        )
+                    raise
+                outcome = case_outcome(
+                    case, provider, attempt_index=attempt_index,
+                    attempt_count=attempt_count,
+                )
+                outcomes[outcome_index] = outcome
+                print(
+                    f"RAW {outcome['sample_id']}: status={provider.status}; "
+                    f"filename_match={outcome['diagnostics']['filename_match']}; "
+                    "semantic adjudication=pending", flush=True,
+                )
     except BaseException:
         interrupted = True
         raise

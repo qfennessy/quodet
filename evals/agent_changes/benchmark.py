@@ -19,6 +19,9 @@ from model_runner import ModelRunConfig, Pricing
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PLAN = ROOT / "model_benchmark_plan.json"
 DEFAULT_SCORECARD = ROOT / "model_benchmark_scorecard.json"
+ORDINARY_PLAN_SCOPE = "ordinary-benchmark"
+CHALLENGE_PLAN_SCOPE = "challenge-qualification"
+CHALLENGE_QUALIFICATION_ATTEMPTS = 3
 
 
 def _sha256(path: Path) -> str:
@@ -34,19 +37,36 @@ def plan_sha256(plan: Mapping[str, Any]) -> str:
 
 def provider_fixture_payload_sha256(
     manifest: Mapping[str, Any] | None = None,
+    *,
+    cases: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Hash the exact deterministic document text staged for the provider."""
+    if manifest is not None and cases is not None:
+        raise ValueError("pass either manifest or cases, not both")
+    selected_cases = cases if cases is not None else (
+        manifest or replay.load_manifest()
+    )["cases"]
     digest = hashlib.sha256()
-    for case in (manifest or replay.load_manifest())["cases"]:
-        for filename in case["files"]:
-            relative_path = Path(case["id"]) / filename
-            contents = (replay.CASES_ROOT / relative_path).read_text(encoding="utf-8")
+    for case in selected_cases:
+        source_root = Path(
+            case.get("_source_root", replay.CASES_ROOT / case["id"])
+        )
+        # collect_attachments sorts a debounced batch by path before staging it.
+        for filename in sorted(case["files"]):
+            relative_path = replay.replay_relative_directory(case) / filename
+            contents = (source_root / filename).read_text(encoding="utf-8")
             sanitized, _ = watch_files.redact_sensitive_values(contents)
-            sanitized_path, _ = watch_files.redact_sensitive_path(relative_path)
+            sanitized_path, path_redactions = watch_files.redact_sensitive_path(
+                relative_path
+            )
+            # sanitize_attachments excludes a file whose path itself is sensitive.
+            # Such a file contributes no provider document bytes.
+            if path_redactions:
+                continue
             provider_contents = (
                 f"Original relative path: {sanitized_path}\n\n{sanitized}"
             ).encode()
-            digest.update(relative_path.as_posix().encode())
+            digest.update(sanitized_path.encode())
             digest.update(b"\0")
             digest.update(len(provider_contents).to_bytes(8, "big"))
             digest.update(provider_contents)
@@ -87,6 +107,52 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
         plan.get("candidate_order", [])
     ):
         raise ValueError("candidate_order must name every candidate exactly once")
+    scope = plan.get("evaluation_scope")
+    challenge_fixture = plan.get("challenge_fixture")
+    attempts = contract.get("attempts_per_case")
+    if scope == ORDINARY_PLAN_SCOPE:
+        if challenge_fixture is not None:
+            raise ValueError("ordinary benchmark plan cannot bind challenge fixtures")
+        if attempts != 1:
+            raise ValueError("ordinary benchmark must freeze exactly one attempt")
+    elif scope == CHALLENGE_PLAN_SCOPE:
+        if attempts != CHALLENGE_QUALIFICATION_ATTEMPTS:
+            raise ValueError(
+                "challenge qualification plan must freeze exactly three attempts"
+            )
+        if not isinstance(challenge_fixture, Mapping) or set(challenge_fixture) != {
+            "revision", "manifest_sha256", "content_sha256",
+            "provider_payload_sha256", "case_ids",
+        }:
+            raise ValueError(
+                "challenge qualification plan requires an exact challenge_fixture binding"
+            )
+        case_ids = challenge_fixture.get("case_ids")
+        if (
+            not isinstance(challenge_fixture.get("revision"), int)
+            or isinstance(challenge_fixture.get("revision"), bool)
+            or challenge_fixture["revision"] < 1
+            or not isinstance(case_ids, list)
+            or not case_ids
+            or any(not isinstance(case_id, str) or not case_id for case_id in case_ids)
+            or len(case_ids) != len(set(case_ids))
+        ):
+            raise ValueError("challenge fixture revision or ordered case IDs are invalid")
+        for key in (
+            "manifest_sha256", "content_sha256", "provider_payload_sha256",
+        ):
+            digest = challenge_fixture.get(key)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(f"challenge fixture {key} is not a lowercase SHA-256")
+    else:
+        raise ValueError(
+            "benchmark plan evaluation_scope must be ordinary-benchmark or "
+            "challenge-qualification"
+        )
     if fixture.get("revision") != replay.load_manifest().get("version"):
         raise ValueError("benchmark fixture revision does not match the corpus")
     if fixture.get("manifest_sha256") != _sha256(replay.MANIFEST_PATH):
@@ -106,8 +172,8 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
     for key, expected in expected_contract.items():
         if contract.get(key) != expected:
             raise ValueError(f"benchmark review contract {key} has drifted")
-    if contract.get("attempts_per_case") != 1 or contract.get("repair_or_fallback"):
-        raise ValueError("benchmark must freeze one attempt with no repair or fallback")
+    if contract.get("repair_or_fallback"):
+        raise ValueError("benchmark must freeze no repair or fallback")
     privacy = plan.get("privacy", {})
     if not privacy.get("hosted_requires_external_upload_consent") or not privacy.get(
         "local_requires_immutable_runtime_artifact_attestation"
@@ -492,6 +558,10 @@ def validate_run_against_plan(
     benchmark = configuration.get("benchmark", {})
     if benchmark.get("plan_sha256") != plan_sha256(plan):
         raise ValueError("run benchmark plan hash differs from the scoring plan")
+    if configuration.get("attempts_per_case") != plan["review_contract"][
+        "attempts_per_case"
+    ]:
+        raise ValueError("run attempt count differs from the frozen plan")
     candidate_id = benchmark.get("candidate_id")
     if candidate_id not in plan["candidates"]:
         raise ValueError("run does not name a candidate from this benchmark")
@@ -570,8 +640,20 @@ def validate_run_against_plan(
         raise ValueError("run fixture hash does not match the frozen plan")
     if fixture.get("fixture_tree_sha256") != plan["fixture"]["fixture_tree_sha256"]:
         raise ValueError("run fixture file hash does not match the frozen plan")
-    if fixture.get("provider_payload_sha256") != plan["fixture"]["provider_payload_sha256"]:
-        raise ValueError("run provider payload hash does not match the frozen plan")
+    case_ids = fixture.get("case_ids")
+    manifest_cases = {case["id"]: case for case in replay.load_manifest()["cases"]}
+    if (
+        not isinstance(case_ids, list)
+        or any(not isinstance(case_id, str) for case_id in case_ids)
+        or len(case_ids) != len(set(case_ids))
+        or any(case_id not in manifest_cases for case_id in case_ids)
+    ):
+        raise ValueError("run fixture case IDs are invalid or outside the frozen corpus")
+    selected_cases = [manifest_cases[case_id] for case_id in case_ids]
+    if fixture.get("provider_payload_sha256") != provider_fixture_payload_sha256(
+        cases=selected_cases
+    ):
+        raise ValueError("run provider payload hash does not match selected fixture bytes")
     for name in ("prompt", "schema"):
         expected = plan["review_contract"][f"{name}_sha256"]
         if configuration.get(name, {}).get("sha256") != expected:
@@ -585,15 +667,20 @@ def validate_run_against_plan(
     if run.get("metrics") != recomputed_metrics:
         raise ValueError("scored run metrics do not match retained adjudication")
 
-    manifest_cases = {case["id"]: case for case in replay.load_manifest()["cases"]}
     valid_statuses = {
         "schema-valid", "schema-error", "timeout", "provider-error",
         "output-limit", "budget-blocked", "harness-error", "interrupted",
     }
+    seen_case_ids: set[str] = set()
     for outcome in run.get("cases", []):
         case_id = outcome.get("case_id")
         if case_id not in manifest_cases:
             raise ValueError(f"scored run contains unknown case {case_id!r}")
+        if case_id not in case_ids:
+            raise ValueError(f"scored run case {case_id!r} was not in its fixture binding")
+        if case_id in seen_case_ids:
+            raise ValueError("ordinary benchmark contains a repeated case attempt")
+        seen_case_ids.add(case_id)
         fixture_case = manifest_cases[case_id]
         for key, expected in (
             ("evaluation_split", fixture_case["evaluation_split"]),
@@ -818,6 +905,9 @@ def _eligible(summary: Mapping[str, Any], rule: Mapping[str, Any]) -> bool:
 def build_scorecard(
     plan: Mapping[str, Any], runs: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
+    validate_plan(plan)
+    if plan["evaluation_scope"] != ORDINARY_PLAN_SCOPE:
+        raise ValueError("challenge qualification plans cannot build ordinary scorecards")
     summaries = {
         candidate_id: {"status": "not-run"}
         for candidate_id in plan["candidate_order"]

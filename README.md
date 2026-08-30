@@ -480,6 +480,81 @@ secrets before sharing. The scorecard never auto-switches the production
 default: apply the pre-registered lexicographic rule explicitly, or record that
 no candidate established eligibility.
 
+### Challenge candidates
+
+`evals/agent_changes/challenge` contains eight original, repository-neutral
+defect candidates across seven failure families. Each defect has a separately
+replayed minimal clean twin and an executable oracle: the buggy oracle must fail
+and the clean oracle must pass. Six pairs require cross-file reasoning, one is
+multi-step, and one is a narrow semantic-boundary defect. Verify all pairs
+without a model:
+
+```sh
+uv run python -m evals.agent_changes.challenge verify all
+```
+
+The candidates are deliberately not described as proven model misses. No live
+baseline calls have been made, so every entry records zero valid baseline misses
+and remains `candidate-not-qualified`. A candidate becomes a qualified challenge
+only after a second reader verifies it and the same frozen baseline misses its
+real trigger and failure path in three valid attempts. Provider errors, malformed
+responses, timeouts, and unavailable runtimes do not qualify it. Challenge
+metrics report valid and invalid attempt counts separately; invalid attempts do
+not enter defect-recall or clean-twin false-positive-rate denominators, and a
+rate remains unavailable until at least one valid attempt exists.
+
+Development and holdout candidates live under different directories and
+manifests. This is a process seal, not encryption: directly reading a holdout
+answer or comparing its twins invalidates that pair as holdout evidence. Prompt
+work may use only `challenge-development`. Holdout twins are
+replayed one at a time, never together in one review batch. If an answer is
+opened for tuning, use the transition command; it moves the complete pair and
+its metadata out of the sealed split before exposing it for development:
+
+```sh
+uv run python -m evals.agent_changes.challenge open-answer PAIR_ID
+```
+
+After opening a holdout pair, replace it with a newly verified and qualified
+pair before treating the holdout size as restored.
+
+After freezing model, prompt, schema, timeout, and fixture revisions, the live
+runner can replay either split and retain raw responses, latency, and runtime
+provenance exactly as it does for the ordinary corpus. Artifacts include the
+Quodet commit, fixture-content and manifest hashes, Python/platform details,
+`llm` and plugin versions, runner timeouts, and every repeated attempt:
+
+```sh
+uv run python -m evals.agent_changes.live_eval challenge-development --log
+uv run python -m evals.agent_changes.live_eval challenge-holdout --attempts 3 --log
+```
+
+The ordinary model-comparison plan does not authorize challenge fixture bytes.
+When `--model-run-config` is used, the supplied plan must also contain the exact
+challenge revision, combined manifest hash, raw content hash, sanitized
+provider-payload hash, and ordered case IDs; the runner fails closed if that
+dedicated binding is absent or stale. Challenge replay IDs are short,
+deterministic directory identifiers whenever a descriptive case ID resembles a
+secret, so the credential-aware path redactor does not exclude valid fixture
+files. The descriptive case ID remains in the retained evaluation artifact.
+
+The ordinary plan declares `evaluation_scope: ordinary-benchmark` and freezes
+one attempt per case. Qualification uses a separate
+`evaluation_scope: challenge-qualification` plan bound to the selected challenge
+bytes and exactly three attempts. The runner rejects one- or two-attempt
+qualification plans, a CLI attempt count that differs from the frozen plan, and
+any attempt to use the repeated challenge contract for ordinary fixtures.
+For multi-file qualification cases, `--inter-file-delay` must be strictly less
+than `--debounce`, and a case must fit in one provider review batch. The runner
+rejects unsafe batching before cost preflight, runtime attestation, or provider
+work so an artifact cannot claim the all-files payload hash for a partial batch.
+
+Challenge scoring is stricter than filename matching. A true-positive
+adjudication must separately record the trigger, the complete failure path, and
+the observable impact. Reports pair buggy recall with clean-twin false-positive
+rate and keep both challenge splits separate from calibration, ordinary holdout,
+temporal, confirmation, and clean-control metrics.
+
 The watcher sees changes made by every process, not only a coding agent. Add
 generated output paths with `--exclude` to prevent noisy reviews or feedback
 loops. Files are read by `llm` when a review starts, so the review reflects the

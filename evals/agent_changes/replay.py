@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from redaction import redact_path
+
 
 EVAL_ROOT = Path(__file__).resolve().parent
 MANIFEST_PATH = EVAL_ROOT / "manifest.json"
@@ -43,14 +45,24 @@ def case_by_id(manifest: dict[str, Any], case_id: str) -> dict[str, Any]:
     raise ValueError(f"Unknown case {case_id!r}. Available cases: {available}")
 
 
+def replay_relative_directory(case: dict[str, Any]) -> Path:
+    """Return a stable provider-visible directory that cannot look like a secret."""
+    case_id = str(case["id"])
+    relative = Path(case_id)
+    if not redact_path(relative).total:
+        return relative
+    token = hashlib.sha256(case_id.encode()).hexdigest()[:12]
+    return Path(f"qd_case_{token}")
+
+
 def replay_case(
     case: dict[str, Any],
     *,
     destination: Path,
     inter_file_delay: float,
 ) -> list[Path]:
-    source_root = CASES_ROOT / case["id"]
-    target_root = destination.resolve() / case["id"]
+    source_root = Path(case.get("_source_root", CASES_ROOT / case["id"]))
+    target_root = destination.resolve() / replay_relative_directory(case)
     target_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for index, filename in enumerate(case["files"]):
@@ -104,11 +116,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     manifest = load_manifest()
-    cases = (
-        manifest["cases"]
-        if args.case == "all"
-        else [case_by_id(manifest, args.case)]
-    )
+    if args.case.startswith("challenge-"):
+        from evals.agent_changes import challenge
+
+        cases = challenge.model_cases(args.case)
+    elif "__" in args.case:
+        from evals.agent_changes import challenge
+
+        cases = [challenge.case_by_id(args.case)]
+    else:
+        cases = (
+            manifest["cases"]
+            if args.case == "all"
+            else [case_by_id(manifest, args.case)]
+        )
 
     for index, case in enumerate(cases):
         written = replay_case(

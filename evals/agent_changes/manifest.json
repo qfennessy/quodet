@@ -12,8 +12,11 @@
     "holdout": "Quodet v1 fixtures frozen before corpus-derived expansion; evaluate without prompt iteration.",
     "temporal": "Reserved boundary; no answer-bearing synthetic fixture was derived from sealed temporal entries.",
     "clean-control": "Matched bug-free fixtures; never use their source corpus answers for prompt design.",
-    "confirmation": "Reserved sealed boundary; no confirmation answer is present in this repository."
+    "confirmation": "Reserved sealed boundary; no confirmation answer is present in this repository.",
+    "challenge-development": "Original challenge candidates available for harness and prompt development.",
+    "challenge-holdout": "Process-sealed original candidates; opening an answer moves its pair to challenge-development."
   },
+  "challenge_manifest": "challenge/manifest.json",
   "cases": [
     {
       "id": "01_obvious_runtime", "difficulty": "obvious", "files": ["calculator.py"],

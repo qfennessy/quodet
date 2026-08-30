@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Original repository-neutral challenge candidates with paired deterministic oracles",
+  "splits": {
+    "challenge-development": {
+      "path": "development/manifest.json",
+      "answer_access": "open",
+      "tuning_allowed": true
+    },
+    "challenge-holdout": {
+      "path": "holdout/manifest.json",
+      "answer_access": "sealed-by-process",
+      "tuning_allowed": false,
+      "opening_rule": "Use challenge.py open-answer; the pair is moved to development before answer access and must be replaced before the holdout size is restored."
+    }
+  },
+  "qualification_policy": {
+    "required_valid_baseline_misses": 3,
+    "provider_failures_do_not_qualify": true,
+    "current_status": "candidate-only; no baseline qualification runs have been performed"
+  }
+}

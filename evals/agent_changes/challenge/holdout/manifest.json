@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "split": "challenge-holdout",
+  "sealed": true,
+  "pairs": [
+    {
+      "id": "sealed_partial_index_rollback",
+      "failure_families": ["persistence/atomicity", "retry/concurrency"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "sibling task lifecycle after rollback",
+      "buggy": {"files": ["record_store.py", "index_service.py", "oracle_test.py"]},
+      "clean": {"files": ["record_store.py", "index_service.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "index-write-survives-record-rollback", "file": "index_service.py", "summary": "rollback returns without cancelling and awaiting a sibling index write", "trigger": "record persistence fails while indexing is paused", "failure_path": "the record is removed, then the still-running task resumes and publishes its index entry", "impact": "search exposes a dangling record"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "sealed", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "sealed_legacy_export_marker",
+      "failure_families": ["persistence/atomicity", "state/lifecycle"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "new and legacy state representations across migration",
+      "buggy": {"files": ["export_record.py", "export_service.py", "oracle_test.py"]},
+      "clean": {"files": ["export_record.py", "export_service.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "legacy-export-treated-as-never-exported", "file": "export_service.py", "summary": "missing exported_at is treated as proof no export occurred", "trigger": "load a legacy record whose durable export_job_state says completed but which predates exported_at", "failure_path": "should_export checks only the absent new field and ignores the explicit completed marker", "impact": "the same export is submitted twice"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "sealed", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "sealed_claimed_owner",
+      "failure_families": ["privacy/authorization"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "untrusted request provenance versus repository ownership",
+      "buggy": {"files": ["documents.py", "download_service.py", "oracle_test.py"]},
+      "clean": {"files": ["documents.py", "download_service.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "client-owner-claim-authorizes-download", "file": "download_service.py", "summary": "authorization trusts a caller-supplied owner instead of stored ownership", "trigger": "an attacker claims their own ID for another user's document", "failure_path": "the service compares actor_id to claimed_owner and never asks Documents for the authoritative owner", "impact": "an unauthorized user can download the document"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "sealed", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "sealed_policy_dependency",
+      "failure_families": ["CI/tooling"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "path filter versus the complete job dependency graph",
+      "buggy": {"files": ["change_filter.py", "policy_job.py", "oracle_test.py"]},
+      "clean": {"files": ["change_filter.py", "policy_job.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "policy-runner-change-skips-policy-job", "file": "change_filter.py", "summary": "the path filter omits the script executed by the policy job", "trigger": "change only scripts/run_policy.py", "failure_path": "policy_job names the script as an input but should_run checks only policies/", "impact": "a broken policy runner can merge without its validation job"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "sealed", "status": "candidate-not-qualified"}
+    }
+  ]
+}

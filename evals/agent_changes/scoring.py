@@ -18,6 +18,8 @@ EVALUATION_SPLITS = (
     "temporal",
     "clean-control",
     "confirmation",
+    "challenge-development",
+    "challenge-holdout",
 )
 VERDICTS = frozenset({"true-positive", "false-positive"})
 FIX_QUALITY = {
@@ -59,7 +61,7 @@ def validate_adjudications(
     for outcome in run["cases"]:
         if outcome["status"] != "schema-valid":
             continue
-        case_id = outcome["case_id"]
+        case_id = outcome.get("sample_id", outcome["case_id"])
         findings = outcome["parsed_response"]["findings"]
         entries = cases.get(case_id, {}).get("findings", [])
         indexes = [entry.get("finding_index") for entry in entries]
@@ -90,6 +92,17 @@ def validate_adjudications(
                     raise ValueError(
                         f"{case_id} true positive requires a valid fix_quality"
                     )
+                if outcome.get("challenge_pair_id"):
+                    evidence = entry.get("evidence")
+                    if not isinstance(evidence, dict) or any(
+                        not isinstance(evidence.get(field), str)
+                        or not evidence[field].strip()
+                        for field in ("trigger", "failure_path", "impact")
+                    ):
+                        raise ValueError(
+                            f"{case_id} challenge true positive requires trigger, "
+                            "failure_path, and impact evidence"
+                        )
             elif expected_id is not None:
                 raise ValueError(
                     f"{case_id} false positive cannot name an expected finding"
@@ -190,7 +203,9 @@ def score_run(
 
     adjudicated_cases = adjudications["cases"]
     for outcome in run["cases"]:
-        counts = _case_counts(outcome, adjudicated_cases.get(outcome["case_id"]))
+        counts = _case_counts(
+            outcome, adjudicated_cases.get(outcome.get("sample_id", outcome["case_id"]))
+        )
         _add_counts(totals, counts)
         _add_counts(by_split[outcome["evaluation_split"]], counts)
         if outcome["evaluation_split"] == "clean-control":
@@ -203,7 +218,8 @@ def score_run(
                 control_cases[family] += 1
                 if counts["fp"]:
                     control_cases_with_fp[family] += 1
-        for entry in adjudicated_cases.get(outcome["case_id"], {}).get("findings", []):
+        sample_id = outcome.get("sample_id", outcome["case_id"])
+        for entry in adjudicated_cases.get(sample_id, {}).get("findings", []):
             if entry.get("verdict") == "true-positive":
                 fix_quality_scores.append(FIX_QUALITY[entry["fix_quality"]])
 
@@ -236,7 +252,9 @@ def score_run(
         split_fix_scores = [
             FIX_QUALITY[entry["fix_quality"]]
             for outcome in split_outcomes
-            for entry in adjudicated_cases.get(outcome["case_id"], {}).get(
+            for entry in adjudicated_cases.get(
+                outcome.get("sample_id", outcome["case_id"]), {}
+            ).get(
                 "findings", []
             )
             if entry.get("verdict") == "true-positive"
@@ -262,6 +280,57 @@ def score_run(
             ),
         }
     base["split_metrics"] = split_metrics
+    challenge_pairs: dict[str, dict[str, Any]] = {}
+    for outcome in run["cases"]:
+        pair_id = outcome.get("challenge_pair_id")
+        if not pair_id:
+            continue
+        variant = outcome["challenge_variant"]
+        aggregate = challenge_pairs.setdefault(pair_id, {}).setdefault(
+            variant,
+            {
+                "tp": 0, "fp": 0, "fn": 0,
+                "attempts": 0, "samples": 0, "valid_samples": 0,
+                "invalid_samples": 0, "samples_with_fp": 0,
+            },
+        )
+        aggregate["attempts"] += 1
+        if outcome["status"] != "schema-valid":
+            aggregate["invalid_samples"] += 1
+            continue
+        counts = _case_counts(
+            outcome, adjudicated_cases.get(outcome.get("sample_id", outcome["case_id"]))
+        )
+        _add_counts(aggregate, counts)
+        aggregate["samples"] += 1
+        aggregate["valid_samples"] += 1
+        aggregate["samples_with_fp"] += counts["fp"] > 0
+    if challenge_pairs:
+        defects = [pair["buggy"] for pair in challenge_pairs.values() if "buggy" in pair]
+        clean = [pair["clean"] for pair in challenge_pairs.values() if "clean" in pair]
+        defect_denominator = sum(item["tp"] + item["fn"] for item in defects)
+        clean_denominator = sum(item["valid_samples"] for item in clean)
+        base["challenge_pairs"] = challenge_pairs
+        base["challenge_valid_attempts"] = sum(
+            item["valid_samples"]
+            for pair in challenge_pairs.values()
+            for item in pair.values()
+        )
+        base["challenge_invalid_attempts"] = sum(
+            item["invalid_samples"]
+            for pair in challenge_pairs.values()
+            for item in pair.values()
+        )
+        base["challenge_defect_recall"] = (
+            sum(item["tp"] for item in defects)
+            / defect_denominator
+            if defect_denominator else None
+        )
+        base["challenge_clean_twin_false_positive_rate"] = (
+            sum(item["samples_with_fp"] for item in clean)
+            / clean_denominator
+            if clean_denominator else None
+        )
     return base
 
 
@@ -275,7 +344,7 @@ def adjudication_template(run: dict[str, Any]) -> dict[str, Any]:
             "filename. Mark each provider finding true-positive or false-positive."
         ),
         "cases": {
-            outcome["case_id"]: {
+            outcome.get("sample_id", outcome["case_id"]): {
                 "expected_findings": outcome.get("expected_findings", []),
                 "findings": [
                     {
@@ -284,6 +353,9 @@ def adjudication_template(run: dict[str, Any]) -> dict[str, Any]:
                         "expected_finding_id": None,
                         "fix_quality": "REPLACE_ME",
                         "rationale": "",
+                        **({"evidence": {
+                            "trigger": "", "failure_path": "", "impact": "",
+                        }} if outcome.get("challenge_pair_id") else {}),
                     }
                     for index, _ in enumerate(
                         (outcome.get("parsed_response") or {}).get("findings", [])
