@@ -334,6 +334,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--benchmark-plan",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--benchmark-plan-sha256",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--spool-dir",
         type=Path,
         help=(
@@ -1305,9 +1314,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return agent_main(raw_argv)
     args = parse_args(raw_argv)
-    if args.model_run_config_sha256 is not None and args.model_run_config is None:
+    benchmark_arguments = (
+        args.model_run_config,
+        args.model_run_config_sha256,
+        args.benchmark_plan,
+        args.benchmark_plan_sha256,
+    )
+    if any(value is not None for value in benchmark_arguments) and not all(
+        value is not None for value in benchmark_arguments
+    ):
         raise SystemExit(
-            "--model-run-config-sha256 requires --model-run-config"
+            "benchmark execution requires --model-run-config, "
+            "--model-run-config-sha256, --benchmark-plan, and "
+            "--benchmark-plan-sha256 together"
         )
     model_run_config = (
         load_model_run_config(args.model_run_config)
@@ -1315,9 +1334,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         else None
     )
     if model_run_config is not None:
+        from evals.agent_changes import benchmark
+
+        try:
+            benchmark_plan = benchmark.load_plan(args.benchmark_plan)
+            if benchmark.plan_sha256(benchmark_plan) != args.benchmark_plan_sha256:
+                raise ValueError(
+                    "benchmark plan changed after parent approval"
+                )
+            benchmark.validate_model_run_config_against_plan(
+                benchmark_plan, model_run_config,
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
         if (
-            args.model_run_config_sha256 is not None
-            and model_run_config_sha256(model_run_config)
+            model_run_config_sha256(model_run_config)
             != args.model_run_config_sha256
         ):
             raise SystemExit(

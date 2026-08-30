@@ -293,6 +293,8 @@ class AgentChangeReplayTests(unittest.TestCase):
             log=False,
             model_run_config=Path("approved.json"),
             model_run_config_sha256=model_run_config_sha256(config),
+            benchmark_plan=Path("approved-plan.json"),
+            benchmark_plan_sha256=benchmark.plan_sha256(plan),
         )
 
         command = live_eval.watcher_command(args)
@@ -300,6 +302,10 @@ class AgentChangeReplayTests(unittest.TestCase):
         digest_index = command.index("--model-run-config-sha256")
         self.assertEqual(
             command[digest_index + 1], model_run_config_sha256(config),
+        )
+        plan_digest_index = command.index("--benchmark-plan-sha256")
+        self.assertEqual(
+            command[plan_digest_index + 1], benchmark.plan_sha256(plan),
         )
 
     def test_private_artifact_write_does_not_repermission_existing_parent(self) -> None:

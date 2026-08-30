@@ -358,6 +358,8 @@ def watcher_command(args: argparse.Namespace) -> list[str]:
         command.extend(["--model-run-config", str(args.model_run_config)])
         command.extend([
             "--model-run-config-sha256", args.model_run_config_sha256,
+            "--benchmark-plan", str(args.benchmark_plan),
+            "--benchmark-plan-sha256", args.benchmark_plan_sha256,
         ])
     return command
 
@@ -565,13 +567,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_attestation = None
     if model_run_config is not None:
         args.model_run_config = run_config_path.expanduser().resolve()
-        benchmark_plan = benchmark.load_plan(
-            getattr(args, "benchmark_plan", benchmark.DEFAULT_PLAN)
-        )
+        args.benchmark_plan = getattr(
+            args, "benchmark_plan", benchmark.DEFAULT_PLAN,
+        ).expanduser().resolve()
+        benchmark_plan = benchmark.load_plan(args.benchmark_plan)
         benchmark.validate_model_run_config_against_plan(
             benchmark_plan, model_run_config,
         )
         args.model_run_config_sha256 = model_run_config_sha256(model_run_config)
+        args.benchmark_plan_sha256 = benchmark.plan_sha256(benchmark_plan)
         watch_files.validate_model_run_config_privacy(model_run_config)
         maximum_authorized_cost = benchmark_cost_preflight(model_run_config, cases)
         runtime_attestation = attest_runtime(model_run_config)

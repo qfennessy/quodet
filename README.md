@@ -227,8 +227,9 @@ Ollama model ID, local blob SHA-256, quantization, and output-limit option
 produced by a documented reproducible conversion. Arbitrary values in a run
 config cannot satisfy this binding. Before the watcher starts, live evaluation
 reconstructs and validates the complete approved plan, runtime identity, and
-execution contract. It passes a canonical config digest to the watcher so a
-config changed after validation is rejected before any model call. After that
+execution contract. It passes canonical plan and config digests to the watcher,
+which reloads both and repeats the complete validation. A plan or config changed
+after parent validation is rejected before any model call. After that
 registration, prepare the matching local runtime:
 
 ```sh

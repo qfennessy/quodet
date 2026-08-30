@@ -13,7 +13,13 @@ from pathlib import Path
 from unittest import mock
 
 import watch_files
-from model_runner import ModelRunConfig, ModelRunResult, Pricing
+from evals.agent_changes import benchmark
+from model_runner import (
+    ModelRunConfig,
+    ModelRunResult,
+    Pricing,
+    model_run_config_sha256,
+)
 
 
 def privacy_config(
@@ -50,7 +56,7 @@ def privacy_config(
 
 
 class WatchFilesTests(unittest.TestCase):
-    def test_watcher_rejects_config_changed_after_parent_validation(self) -> None:
+    def test_watcher_rejects_incomplete_benchmark_approval_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_path = root / "model-run-config.json"
@@ -63,6 +69,65 @@ class WatchFilesTests(unittest.TestCase):
                     "watch_files.validate_model_run_config_privacy"
                 ) as privacy_validation,
                 self.assertRaisesRegex(
+                    SystemExit, "benchmark execution requires"
+                ),
+            ):
+                watch_files.main([
+                    str(root),
+                    "--model-run-config", str(config_path),
+                ])
+
+        privacy_validation.assert_not_called()
+        runtime_validation.assert_not_called()
+
+    def test_watcher_rejects_unapproved_config_before_runtime_work(self) -> None:
+        config = privacy_config()
+        plan = benchmark.load_plan()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_path = root / "model-run-config.json"
+            config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            with (
+                mock.patch("watch_files.validate_runtime") as runtime_validation,
+                mock.patch(
+                    "watch_files.validate_model_run_config_privacy"
+                ) as privacy_validation,
+                self.assertRaisesRegex(SystemExit, "unknown benchmark candidate"),
+            ):
+                watch_files.main([
+                    str(root),
+                    "--model-run-config", str(config_path),
+                    "--model-run-config-sha256", model_run_config_sha256(config),
+                    "--benchmark-plan", str(benchmark.DEFAULT_PLAN),
+                    "--benchmark-plan-sha256", benchmark.plan_sha256(plan),
+                ])
+
+        privacy_validation.assert_not_called()
+        runtime_validation.assert_not_called()
+
+    def test_watcher_rejects_config_changed_after_parent_validation(self) -> None:
+        config = privacy_config()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_path = root / "model-run-config.json"
+            config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            with (
+                mock.patch(
+                    "evals.agent_changes.benchmark.load_plan", return_value={}
+                ),
+                mock.patch(
+                    "evals.agent_changes.benchmark.plan_sha256",
+                    return_value="b" * 64,
+                ),
+                mock.patch(
+                    "evals.agent_changes.benchmark."
+                    "validate_model_run_config_against_plan"
+                ),
+                mock.patch("watch_files.validate_runtime") as runtime_validation,
+                mock.patch(
+                    "watch_files.validate_model_run_config_privacy"
+                ) as privacy_validation,
+                self.assertRaisesRegex(
                     SystemExit, "changed after benchmark approval"
                 ),
             ):
@@ -70,6 +135,8 @@ class WatchFilesTests(unittest.TestCase):
                     str(root),
                     "--model-run-config", str(config_path),
                     "--model-run-config-sha256", "0" * 64,
+                    "--benchmark-plan", str(root / "plan.json"),
+                    "--benchmark-plan-sha256", "b" * 64,
                 ])
 
         privacy_validation.assert_not_called()
