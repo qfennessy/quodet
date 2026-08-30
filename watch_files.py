@@ -567,6 +567,28 @@ def redact_sensitive_values(text: str) -> tuple[str, int]:
     return redacted.text, redacted.total
 
 
+def _json_string_tokens(text: str) -> tuple[str, ...]:
+    """Return the exact lexical spelling of every string in valid JSON text."""
+    tokens: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != '"':
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == '"':
+                index += 1
+                tokens.append(text[start:index])
+                break
+            index += 1
+    return tuple(tokens)
+
+
 def redact_provider_response(
     text: str,
     *,
@@ -600,18 +622,19 @@ def redact_provider_response(
 
     shielded = text
     restore_tokens: dict[str, str] = {}
+    representations_by_path: dict[str, set[str]] = {
+        path: set() for path in approved_paths
+    }
+    for token in _json_string_tokens(text):
+        decoded = json.loads(token)
+        if isinstance(decoded, str) and decoded in approved_paths:
+            representations_by_path[decoded].add(token)
+
     for path in sorted(approved_paths):
-        representations = {
-            json.dumps(path),
-            json.dumps(path, ensure_ascii=False),
-            json.dumps(path).replace("/", r"\/"),
-            json.dumps(path, ensure_ascii=False).replace("/", r"\/"),
-        }
-        found_representation = False
+        representations = representations_by_path[path]
+        if not representations:
+            return redact_sensitive_values(text)
         for representation in sorted(representations):
-            if representation not in shielded:
-                continue
-            found_representation = True
             index = len(restore_tokens)
             placeholder = json.dumps(f"quodet-safe-path-{index}")
             while placeholder in shielded or placeholder in restore_tokens:
@@ -619,8 +642,6 @@ def redact_provider_response(
                 placeholder = json.dumps(f"quodet-safe-path-{index}")
             shielded = shielded.replace(representation, placeholder)
             restore_tokens[placeholder] = representation
-        if not found_representation:
-            return redact_sensitive_values(text)
 
     sanitized, count = redact_sensitive_values(shielded)
     for placeholder, representation in restore_tokens.items():
