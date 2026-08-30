@@ -118,6 +118,11 @@ Stop the watcher with Ctrl-C. Useful options include:
 --log               Save requests and responses in llm's local history
 ```
 
+`--debounce` must be at least as long as `--agent-edit-quiet`; otherwise
+ordinary filesystem timing could flush a direct edit before its configured
+agent coalescing window. Quodet rejects that configuration before starting the
+watcher.
+
 Quodet prints a compact summary for people by default. A review with no
 findings is one line; reviews with findings show the file, line, severity,
 confidence, concise evidence, and suggested action without dumping provider

@@ -691,18 +691,9 @@ def consume_flush_hint(
         directory.expanduser().resolve() / "flush-requests"
     )
     expected_root = os.fspath(root.resolve())
-    changed_relative: set[str] | None = None
-    if changed_paths is not None:
-        changed_relative = set()
-        for changed_path in changed_paths:
-            try:
-                changed_relative.add(
-                    changed_path.resolve(strict=False)
-                    .relative_to(root.resolve())
-                    .as_posix()
-                )
-            except ValueError:
-                continue
+    # A ready hint must not be filtered by an unrelated filesystem batch.
+    # The watcher materializes only hinted paths and requeues unrelated ones.
+    del changed_paths
     now = time.time()
     force_request_paths: list[Path] = []
     force_requested_at: float | None = None
@@ -889,11 +880,6 @@ def consume_flush_hint(
         if not active_members:
             continue
         has_current_hint = True
-        if (
-            changed_relative is not None
-            and changed_relative.isdisjoint(reviewed_by_path)
-        ):
-            continue
         forced = force_ready or (
             force_requested_at is not None
             and active_members[-1].created_at <= force_requested_at

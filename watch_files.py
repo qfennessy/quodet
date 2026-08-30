@@ -1336,15 +1336,6 @@ def next_triggered_batch(
             return materialize_hint(hint, batch)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            if hint_source is not None:
-                hint = hint_source.consume_flush_hint(
-                    tuple(batch),
-                    quiet_seconds=agent_edit_quiet,
-                    max_age_seconds=agent_edit_max_age,
-                    force_ready=True,
-                )
-                if hint is not None:
-                    return materialize_hint(hint, batch)
             return TriggeredBatch(batch, None, suppressed_paths)
         try:
             wait = min(remaining, 0.025) if hint_source is not None else remaining
@@ -1448,6 +1439,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.agent_edit_quiet > args.agent_edit_max_age:
         raise SystemExit("--agent-edit-quiet must not exceed --agent-edit-max-age")
+    if args.debounce < args.agent_edit_quiet:
+        raise SystemExit("--debounce must not be shorter than --agent-edit-quiet")
     model_run_config = (
         load_model_run_config(args.model_run_config)
         if args.model_run_config is not None
