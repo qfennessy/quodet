@@ -439,6 +439,57 @@ class WatchFilesTests(unittest.TestCase):
                 [watch_files.Attachment(regular, "text/plain")],
             )
 
+    def test_cargo_target_is_ignored_without_excluding_source_named_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            package = root / "uniqc"
+            package.mkdir()
+            (package / "Cargo.toml").write_text("[package]\nname = 'uniqc'\n")
+            artifact = package / "target" / "debug" / "deps" / "generated.o"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"\x00binary")
+            source = root / "src" / "target" / "model.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("pub struct Target;\n")
+
+            self.assertTrue(
+                watch_files.is_excluded(
+                    artifact.relative_to(root), [], root=root
+                )
+            )
+            self.assertFalse(
+                watch_files.is_excluded(source.relative_to(root), [], root=root)
+            )
+
+    def test_generated_secret_like_path_is_excluded_without_crashing_notice(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory)
+            relative_path = Path(
+                "uniqc/target/debug/incremental/uniqc-301qpvbt5k143/"
+                "s-hlbag6lh6v-1cbztni-12345678901234567890123456789012/"
+                "06ffsa74st652mllftm2v9x9l.o"
+            )
+            snapshot = watch_files.SourceSnapshot(
+                path=destination / relative_path,
+                relative_path=relative_path,
+                contents="synthetic artifact metadata\n",
+                sha256="0" * 64,
+                size=2_000_000,
+            )
+
+            sanitized = watch_files.sanitize_attachments(
+                [snapshot], destination=destination
+            )
+
+            self.assertEqual(sanitized.attachments, ())
+            self.assertEqual(sanitized.snapshots, ())
+            self.assertGreater(sanitized.redactions.total, 0)
+            self.assertTrue(sanitized.redactions.notices)
+
     def test_exact_snapshot_rechecks_size_after_collection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()

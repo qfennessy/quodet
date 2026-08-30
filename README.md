@@ -186,9 +186,11 @@ Ignored environments and installed dependencies include `.venv`, `venv`,
 `.tox`, `.nox`, `.direnv`, Python `site-packages`/`dist-packages`,
 `__pypackages__`, `node_modules`, package-manager caches, and bundled dependency
 directories. Arbitrarily named Python environments are recognized by their
-`pyvenv.cfg` marker. Dependency manifests and lockfiles remain eligible because
-they are development inputs. Excluded events are discarded before debouncing,
-so dependency installation churn cannot trigger or delay a review batch.
+`pyvenv.cfg` marker, and a `target` directory beneath a Cargo package is treated
+as generated Rust build output. Dependency manifests and lockfiles remain
+eligible because they are development inputs. Excluded events are discarded
+before debouncing, so dependency installation and build churn cannot trigger or
+delay a review batch.
 
 ## Agent-change evaluation
 
