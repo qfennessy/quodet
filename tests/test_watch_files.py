@@ -578,7 +578,15 @@ class WatchFilesTests(unittest.TestCase):
                 effective_config={},
             )
             output = io.StringIO()
+            attestation = {
+                "runtime": {"name": "llm-ollama", "version": "1.0"},
+                "model_registry_entry": "fixture",
+            }
             with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime",
+                    return_value=attestation,
+                ) as runtime_attestation,
                 mock.patch("watch_files.run_model", return_value=failed),
                 contextlib.redirect_stdout(output),
             ):
@@ -597,6 +605,40 @@ class WatchFilesTests(unittest.TestCase):
             self.assertIn("[REDACTED]", event["raw_response"])
             self.assertIn("[REDACTED]", event["stderr"])
             self.assertIn("[REDACTED]", event["model_run_result"]["stdout"])
+            self.assertEqual(event["runtime_attestation"], attestation)
+            runtime_attestation.assert_called_once_with(mock.sentinel.config)
+
+    def test_runtime_attestation_failure_blocks_each_benchmark_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "source.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            model_config = privacy_config()
+            with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime",
+                    side_effect=ValueError("runtime blob changed"),
+                ) as runtime_attestation,
+                mock.patch("watch_files.run_model") as model_call,
+                contextlib.redirect_stdout(output),
+            ):
+                result = watch_files.review_files(
+                    [source], root=root, exclude_patterns=[], max_bytes=2_000_000,
+                    model="test-model", prompt="review", log=False,
+                    review_timeout=60, reasoning_effort=None,
+                    evaluation_events=True,
+                    model_run_config=model_config,
+                )
+
+            event = json.loads(output.getvalue().splitlines()[-1])[
+                "quodet_evaluation_event"
+            ]
+            self.assertIsNone(result)
+            self.assertEqual(event["status"], "provider-error")
+            self.assertIn("runtime blob changed", event["stderr"])
+            runtime_attestation.assert_called_once_with(model_config)
+            model_call.assert_not_called()
 
     def test_review_handles_malformed_nonzero_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

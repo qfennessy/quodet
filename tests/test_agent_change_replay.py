@@ -397,15 +397,21 @@ class AgentChangeReplayTests(unittest.TestCase):
         output: queue.Queue[str] = queue.Queue()
         response = {"findings": [provider_finding("service.py", "Concrete failure path.")]}
         raw_response = json.dumps(response) + "\n"
+        runtime_attestation = {
+            "runtime": {"name": "llm-ollama", "version": "1.0"},
+            "model_registry_entry": "fixture",
+        }
         output.put("Reviewing 1 changed file(s): service.py\n")
         output.put(json.dumps({"quodet_evaluation_event": {
             "status": "success", "returncode": 0,
             "raw_response": raw_response, "stderr": "",
+            "runtime_attestation": runtime_attestation,
         }}) + "\n")
         outcome = live_eval.wait_for_outcome(output, timeout=1)
         self.assertEqual(outcome.status, "schema-valid")
         self.assertEqual(outcome.raw_response, raw_response)
         self.assertEqual(outcome.parsed_response, response)
+        self.assertEqual(outcome.runtime_attestation, runtime_attestation)
         self.assertGreaterEqual(outcome.latency_ms, 0)
 
     def test_live_schema_validation_matches_recorded_schema_and_strict_json(self) -> None:
