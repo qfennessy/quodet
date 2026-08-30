@@ -815,6 +815,8 @@ def review_files(
             redactions = summary.build()
             if not redactions.total:
                 return None
+            if session_generation is None and review_coordinator is not None:
+                session_generation = review_coordinator.capture_session_generation()
             batch = parse_review_output(
                 '{"findings":[]}',
                 root=root,
@@ -824,9 +826,12 @@ def review_files(
                 debounce_ms=debounce_ms,
                 provider_ms=0.0,
                 first_observed_at=first_observed_at,
+                session_generation=session_generation,
+                batch_flushed_at=batch_flushed_at,
                 redactions=redactions,
             )
-            (sink or ConsoleSink()).publish(batch)
+            published_batch = replace(batch, published_at=time.time())
+            (sink or ConsoleSink()).publish(published_batch)
             if review_coordinator is not None:
                 review_coordinator.retire_reviewed_flush_hints(
                     tuple(
@@ -838,7 +843,7 @@ def review_files(
                         for snapshot in snapshots
                     )
                 )
-            return batch
+            return published_batch
 
         labels = [
             _safe_path_label(snapshot.relative_path)
