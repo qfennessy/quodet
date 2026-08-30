@@ -502,6 +502,8 @@ def hook_configuration(
     }
     if route.agent == "codex":
         edit_hook["matcher"] = "^(Write|Edit|apply_patch)$"
+    elif legacy_claude:
+        edit_hook["matcher"] = "^(Write|Edit)$"
     return {
         "hooks": {
             event: [edit_hook],

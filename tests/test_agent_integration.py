@@ -455,11 +455,53 @@ class AgentIntegrationTests(unittest.TestCase):
         route_file.write_text(json.dumps(payload), encoding="utf-8")
         route_file.chmod(0o600)
         legacy_route = agent_integration.load_route(route_file)
-        legacy_settings = agent_integration.hook_configuration(
-            legacy_route,
-            hook_command=hook_command,
-            agent_command=agent_command,
+        common = (
+            f"{hook_command} --spool-dir {self.spool} "
+            f"--session-id claude-route --root {self.root}"
         )
+        legacy_settings = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": "^(Write|Edit)$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{common} --event PostToolUse",
+                                "timeout": 10,
+                                "statusMessage": "Delivering Quodet feedback",
+                            }
+                        ],
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{common} --event Stop --stop-grace 2",
+                                "timeout": 10,
+                            }
+                        ]
+                    }
+                ],
+                "SessionEnd": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    f"{agent_command} cleanup --config "
+                                    f"{agent_integration.route_path(self.spool)} "
+                                    "--from-hook"
+                                ),
+                                "timeout": 3,
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
         settings_file.write_text(json.dumps(legacy_settings), encoding="utf-8")
         settings_file.chmod(0o600)
         route_before = route_file.read_bytes()
