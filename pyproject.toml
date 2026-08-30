@@ -23,6 +23,7 @@ py-modules = [
     "feedback",
     "redaction",
     "review_output",
+    "review_lifecycle",
     "codex_feedback_hook",
     "agent_integration",
     "model_runner",

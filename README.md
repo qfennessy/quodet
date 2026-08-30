@@ -823,6 +823,37 @@ contain only protocol field names, hashes, sizes, route identity, and
 timings—not source code or finding text. `status` reports median and p95 values
 for each segment instead of blending them.
 
+Each review also receives a short random identifier such as `qdt-3f8a120c`.
+Progress and failure lines use that identifier and report total elapsed time
+plus the available debounce, provider, publication, and agent-delivery stages.
+An empty review finishes with one line such as:
+
+```text
+qdt-3f8a120c reviewed 1 file in 2.80s: no confident findings [debounce 250.0ms, provider 2549.0ms, publication 1.0ms]
+```
+
+While a watcher remains running, Quodet relates findings in successive
+snapshots using a fingerprint of normalized relative path and provider title;
+source text and explanation prose are never fingerprint inputs. A repeated
+fingerprint is `retained` even if its line moves. A different fingerprint in
+the same file is `replaced`. If a later review omits a prior fingerprint,
+Quodet says `no longer reported in the latest snapshot`—never `resolved`,
+because model omission is not proof of a repair. A result whose reviewed hash
+is no longer current, or which completes behind a newer snapshot, is `stale`
+and cannot clear or replace current state. Restarting the watcher starts a new
+comparison history.
+
+To keep lifecycle metadata bounded before it is generated, the in-memory
+comparison history retains snapshot ordering for the 100 most recent files and
+finding identities for the 50 most recent findings. Older identities age out
+of comparison history; completed lifecycle conclusions are never silently
+truncated to fit the spool envelope.
+
+Validated spool JSON retains the full UUID, lifecycle events, stale relative
+paths, source-free fingerprints, and stage timestamps for integrations. The
+terminal uses only the short identifier and aggregate lifecycle counts; it
+does not print fingerprints or absolute paths in progress summaries.
+
 Agent feedback is currently supported only on POSIX systems that provide
 `flock`, descriptor-relative `open`, `O_NOFOLLOW`, and enforceable owner-only
 Unix modes. Initialization, route loading, watcher startup, and spool creation

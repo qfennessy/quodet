@@ -17,12 +17,15 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Mapping, Protocol, Sequence, TextIO
+from typing import TYPE_CHECKING, Mapping, Protocol, Sequence, TextIO
 
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_review
 from redaction import RedactionSummary, redaction_summary_from_document, redact_text
 
 from recommendation_grounding import evaluate_recommendation
+
+if TYPE_CHECKING:
+    from review_lifecycle import FindingLifecycle
 
 try:
     import fcntl
@@ -90,6 +93,8 @@ class ReviewBatch:
     provider_completed_at: float = 0.0
     published_at: float = 0.0
     redactions: RedactionSummary = RedactionSummary()
+    lifecycle: tuple[FindingLifecycle, ...] = ()
+    stale_files: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -227,6 +232,7 @@ def parse_review_output(
     provider_started_at: float | None = None,
     provider_completed_at: float | None = None,
     redactions: RedactionSummary = RedactionSummary(),
+    batch_id: str | None = None,
 ) -> ReviewBatch:
     """Parse and strictly validate one provider response."""
     if len(output.encode("utf-8")) > MAX_PROVIDER_OUTPUT_BYTES:
@@ -306,8 +312,13 @@ def parse_review_output(
     completed_at = provider_completed_at or created_at
     started_at = provider_started_at or completed_at - provider_ms / 1_000
     flushed_at = batch_flushed_at or started_at
+    parsed_batch_id = batch_id or str(uuid.uuid4())
+    try:
+        uuid.UUID(parsed_batch_id)
+    except (ValueError, AttributeError) as error:
+        raise ReviewValidationError("batch id must be a UUID") from error
     return ReviewBatch(
-        batch_id=str(uuid.uuid4()),
+        batch_id=parsed_batch_id,
         root=os.fspath(root),
         created_at=created_at,
         reviewed_files=tuple(reviewed_files),
@@ -330,6 +341,8 @@ def parse_review_output(
 
 def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
     """Remove findings for files that no longer match the reviewed bytes."""
+    from review_lifecycle import stale_lifecycle
+
     root = Path(batch.root).resolve()
     fresh_paths: set[str] = set()
     for reviewed in batch.reviewed_files:
@@ -340,7 +353,42 @@ def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
                 fresh_paths.add(reviewed.path)
         except (OSError, ValueError):
             pass
-    return replace(batch, findings=tuple(f for f in batch.findings if f.file in fresh_paths))
+    stale_paths = tuple(
+        sorted(item.path for item in batch.reviewed_files if item.path not in fresh_paths)
+    )
+    stale_findings = tuple(
+        finding for finding in batch.findings if finding.file not in fresh_paths
+    )
+    lifecycle: list[FindingLifecycle] = []
+    stale_keys: set[tuple[str, str, int]] = set()
+    for event in batch.lifecycle:
+        if event.file not in stale_paths:
+            lifecycle.append(event)
+            continue
+        stale_event = replace(
+            event,
+            status="stale",
+            previous_fingerprint=None,
+            reason="source_changed",
+        )
+        key = (stale_event.fingerprint, stale_event.file, stale_event.line)
+        if key not in stale_keys:
+            lifecycle.append(stale_event)
+            stale_keys.add(key)
+    for finding in stale_findings:
+        stale_event = stale_lifecycle(finding, reason="source_changed")
+        key = (stale_event.fingerprint, stale_event.file, stale_event.line)
+        if key not in stale_keys:
+            lifecycle.append(stale_event)
+            stale_keys.add(key)
+    if len(lifecycle) > MAX_FINDINGS * 2:
+        raise ReviewValidationError("finding lifecycle exceeds bounded tracker state")
+    return replace(
+        batch,
+        findings=tuple(f for f in batch.findings if f.file in fresh_paths),
+        lifecycle=tuple(lifecycle),
+        stale_files=tuple(sorted(set(batch.stale_files) | set(stale_paths))),
+    )
 
 
 class ConsoleSink:
@@ -1406,11 +1454,16 @@ def validate_spooled_payload(
         "provider_completed_at",
         "published_at",
     }
+    presentation_fields = {"lifecycle", "stale_files"}
     accepted_fields_without_redactions = (
         base_fields,
         base_fields | generation_fields,
         base_fields | lifecycle_fields,
         base_fields | generation_fields | lifecycle_fields,
+        base_fields | presentation_fields,
+        base_fields | generation_fields | presentation_fields,
+        base_fields | lifecycle_fields | presentation_fields,
+        base_fields | generation_fields | lifecycle_fields | presentation_fields,
     )
     accepted_fields = accepted_fields_without_redactions + tuple(
         fields | {"redactions"} for fields in accepted_fields_without_redactions
@@ -1440,6 +1493,8 @@ def validate_spooled_payload(
                 "published_at": created_at,
             }
         )
+    if not presentation_fields.issubset(payload):
+        payload.update({"lifecycle": [], "stale_files": []})
     if payload["root"] != os.fspath(root.resolve()) or payload["session_id"] != session_id:
         raise ReviewValidationError("spooled batch ownership does not match")
     try:
@@ -1515,6 +1570,78 @@ def validate_spooled_payload(
         ):
             raise ReviewValidationError("invalid reviewed file size")
         reviewed.append(ReviewedFile(path=path, sha256=digest, size=size))
+    reviewed_paths = {item.path for item in reviewed}
+    stale_files = payload["stale_files"]
+    if (
+        not isinstance(stale_files, list)
+        or len(stale_files) > len(reviewed)
+        or any(not isinstance(path, str) or path not in reviewed_paths for path in stale_files)
+        or len(set(stale_files)) != len(stale_files)
+    ):
+        raise ReviewValidationError("invalid stale file collection")
+    raw_lifecycle = payload["lifecycle"]
+    if not isinstance(raw_lifecycle, list) or len(raw_lifecycle) > MAX_FINDINGS * 2:
+        raise ReviewValidationError("invalid finding lifecycle collection")
+    lifecycle: list[dict[str, object]] = []
+    from review_lifecycle import LIFECYCLE_STATUSES, STALE_REASONS
+
+    lifecycle_fields_set = {
+        "status",
+        "fingerprint",
+        "file",
+        "line",
+        "previous_fingerprint",
+        "reason",
+    }
+    for item in raw_lifecycle:
+        if not isinstance(item, dict) or set(item) != lifecycle_fields_set:
+            raise ReviewValidationError("invalid finding lifecycle event")
+        status = item["status"]
+        fingerprint = item["fingerprint"]
+        previous = item["previous_fingerprint"]
+        event_file = item["file"]
+        line = item["line"]
+        reason = item["reason"]
+        if not isinstance(status, str) or status not in LIFECYCLE_STATUSES:
+            raise ReviewValidationError("invalid finding lifecycle status")
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or (
+                previous is not None
+                and (
+                    not isinstance(previous, str)
+                    or len(previous) != 64
+                    or any(character not in "0123456789abcdef" for character in previous)
+                )
+            )
+        ):
+            raise ReviewValidationError("invalid finding lifecycle fingerprint")
+        if (
+            not isinstance(event_file, str)
+            or event_file not in reviewed_paths
+            or isinstance(line, bool)
+            or not isinstance(line, int)
+            or line < 1
+            or (
+                status in {"retained", "replaced", "no_longer_reported"}
+                and previous is None
+            )
+            or (status in {"new", "stale"} and previous is not None)
+            or (
+                status == "stale"
+                and (not isinstance(reason, str) or reason not in STALE_REASONS)
+            )
+            or (status != "stale" and reason is not None)
+            or (
+                status in {"retained", "no_longer_reported"}
+                and previous != fingerprint
+            )
+            or (status == "replaced" and previous == fingerprint)
+        ):
+            raise ReviewValidationError("invalid finding lifecycle metadata")
+        lifecycle.append(item.copy())
     normalized = parse_review_output(
         json.dumps({"findings": payload["findings"]}),
         root=root.resolve(),
@@ -1534,6 +1661,8 @@ def validate_spooled_payload(
     result["findings"] = [asdict(item) for item in normalized.findings]
     result["reviewed_files"] = [asdict(item) for item in reviewed]
     result["redactions"] = asdict(normalized.redactions)
+    result["lifecycle"] = lifecycle
+    result["stale_files"] = sorted(stale_files)
     return result
 
 
@@ -1561,10 +1690,61 @@ def fresh_spooled_payload(payload: dict[str, object], *, root: Path) -> dict[str
                 fresh.add(relative_path)
         except (OSError, ValueError):
             pass
+    stale_paths = set(reviewed) - fresh
+    raw_findings = payload["findings"]  # type: ignore[assignment]
     result = payload.copy()
     result["findings"] = [
         finding
-        for finding in payload["findings"]  # type: ignore[union-attr]
+        for finding in raw_findings  # type: ignore[union-attr]
         if finding["file"] in fresh
     ]
+    stale_findings = [
+        finding
+        for finding in raw_findings  # type: ignore[union-attr]
+        if finding["file"] not in fresh
+    ]
+    if stale_paths:
+        from review_lifecycle import stale_lifecycle
+
+        # A changed reviewed file invalidates every lifecycle conclusion for that
+        # file, including an omission-only conclusion with no current finding.
+        # Convert existing events in place so repeated hook delivery cannot grow
+        # the bounded lifecycle collection past its validated maximum.
+        lifecycle: list[dict[str, object]] = []
+        seen: set[tuple[str, str, int]] = set()
+        for raw_event in payload.get("lifecycle", []):
+            event = dict(raw_event)  # type: ignore[arg-type]
+            if event.get("file") not in stale_paths:
+                lifecycle.append(event)
+                continue
+            event.update(
+                {
+                    "status": "stale",
+                    "previous_fingerprint": None,
+                    "reason": "source_changed",
+                }
+            )
+            key = (
+                str(event.get("fingerprint")),
+                str(event.get("file")),
+                int(event.get("line", 0)),
+            )
+            if key not in seen:
+                lifecycle.append(event)
+                seen.add(key)
+        for finding in stale_findings:
+            event = asdict(
+                stale_lifecycle(
+                    ReviewFinding(**finding),  # type: ignore[arg-type]
+                    reason="source_changed",
+                )
+            )
+            key = (str(event["fingerprint"]), str(event["file"]), int(event["line"]))
+            if key not in seen:
+                lifecycle.append(event)
+                seen.add(key)
+        result["lifecycle"] = lifecycle[: MAX_FINDINGS * 2]
+        result["stale_files"] = sorted(
+            set(payload.get("stale_files", [])) | stale_paths
+        )
     return result

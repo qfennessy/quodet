@@ -973,7 +973,10 @@ class WatchFilesTests(unittest.TestCase):
             self.assertIsNotNone(batch)
             assert batch is not None
             self.assertEqual(document["timing"]["published_at"], batch.published_at)
-            self.assertIn("Reviewing 1 changed file", stderr.getvalue())
+            self.assertRegex(
+                stderr.getvalue(),
+                r"qdt-[0-9a-f]{8} reviewing 1 changed file",
+            )
             self.assertNotIn("Reviewing", stdout.getvalue())
 
     def test_review_handles_malformed_nonzero_and_timeout(self) -> None:
@@ -1024,8 +1027,15 @@ class WatchFilesTests(unittest.TestCase):
                     "output_exceeded": False,
                 },
             )()
-            with mock.patch("watch_files.run_bounded_command", return_value=failed):
+            failure_output = io.StringIO()
+            with mock.patch(
+                "watch_files.run_bounded_command", return_value=failed
+            ), mock.patch("sys.stderr", failure_output):
                 self.assertIsNone(watch_files.review_files(**common))
+            self.assertRegex(
+                failure_output.getvalue(),
+                r"qdt-[0-9a-f]{8} failed after [0-9.]+s: provider exited with status 2",
+            )
 
             with mock.patch(
                 "watch_files.run_bounded_command",

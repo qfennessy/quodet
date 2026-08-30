@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import threading
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -55,6 +56,7 @@ from redaction import (
     redact_path,
     redact_text,
 )
+from review_lifecycle import FindingLifecycleTracker, short_batch_id
 
 try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -862,6 +864,7 @@ def review_files(
     review_coordinator: SpoolSink | None = None,
     agent_session_id: str | None = None,
     model_run_config: ModelRunConfig | None = None,
+    lifecycle_tracker: FindingLifecycleTracker | None = None,
 ) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
@@ -876,6 +879,7 @@ def review_files(
     if not snapshots:
         return None
 
+    batch_id = str(uuid.uuid4())
     with tempfile.TemporaryDirectory(prefix="quodet-sanitized-") as temporary_directory:
         sanitized_batch = sanitize_attachments(
             snapshots,
@@ -901,6 +905,7 @@ def review_files(
                 session_generation=session_generation,
                 batch_flushed_at=batch_flushed_at,
                 redactions=redactions,
+                batch_id=batch_id,
             )
             published_batch = replace(batch, published_at=time.time())
             (sink or ConsoleSink()).publish(published_batch)
@@ -925,7 +930,8 @@ def review_files(
             for snapshot in sanitized_batch.snapshots
         ]
         print(
-            f"\nReviewing {len(labels)} changed file(s): {', '.join(labels)}",
+            f"\n{short_batch_id(batch_id)} reviewing {len(labels)} changed "
+            f"file(s): {', '.join(labels)}",
             file=sys.stderr,
             flush=True,
         )
@@ -981,6 +987,8 @@ def review_files(
                 schema_json=schema_json,
                 provider_path_map=provider_path_map,
                 log=log,
+                batch_id=batch_id,
+                lifecycle_tracker=lifecycle_tracker,
             )
         finally:
             if review_coordinator is not None:
@@ -1018,6 +1026,8 @@ def _execute_review_command(
     schema_json: str,
     provider_path_map: dict[str, str],
     log: bool,
+    batch_id: str,
+    lifecycle_tracker: FindingLifecycleTracker | None,
 ) -> ReviewBatch | None:
     provider_started_at = time.time()
     provider_started = time.monotonic()
@@ -1079,6 +1089,7 @@ def _execute_review_command(
                 f"llm review timed out after {review_timeout:g} seconds",
                 file=sys.stderr,
             )
+            _print_failed_review(batch_id, first_observed_at, "provider timed out")
         return None
 
     except (OSError, ValueError) as error:
@@ -1095,6 +1106,7 @@ def _execute_review_command(
             }}), flush=True)
         else:
             print(f"Could not run llm: {error}", file=sys.stderr)
+            _print_failed_review(batch_id, first_observed_at, "provider could not start")
         return None
     provider_completed_at = time.time()
     provider_ms = (time.monotonic() - provider_started) * 1_000
@@ -1141,6 +1153,7 @@ def _execute_review_command(
             }}), flush=True)
         else:
             print(diagnostic, file=sys.stderr)
+            _print_failed_review(batch_id, first_observed_at, "provider output rejected")
         return None
     if evaluation_events:
         print(json.dumps({"quodet_evaluation_event": {
@@ -1160,6 +1173,11 @@ def _execute_review_command(
             if diagnostic:
                 print(diagnostic[:2_000], file=sys.stderr)
             print(f"llm exited with status {result.returncode}", file=sys.stderr)
+            _print_failed_review(
+                batch_id,
+                first_observed_at,
+                f"provider exited with status {result.returncode}",
+            )
         return None
 
     reviewed_paths = set(provider_path_map.values())
@@ -1202,6 +1220,7 @@ def _execute_review_command(
             provider_started_at=provider_started_at,
             provider_completed_at=provider_completed_at,
             redactions=redactions,
+            batch_id=batch_id,
         )
     except ReviewValidationError as error:
         _report_failed_review_redactions(redactions)
@@ -1210,6 +1229,7 @@ def _execute_review_command(
             "Review discarded; no console or agent feedback was published.",
             file=sys.stderr,
         )
+        _print_failed_review(batch_id, first_observed_at, "provider response invalid")
         return None
 
     fresh_batch = fresh_findings(batch)
@@ -1218,9 +1238,22 @@ def _execute_review_command(
             "Discarded stale finding(s) because source changed during review.",
             file=sys.stderr,
         )
+    if lifecycle_tracker is not None:
+        fresh_batch = lifecycle_tracker.classify(fresh_batch)
     published_batch = replace(fresh_batch, published_at=time.time())
     (sink or ConsoleSink()).publish(published_batch)
     return published_batch
+
+
+def _print_failed_review(
+    batch_id: str, first_observed_at: float | None, reason: str
+) -> None:
+    started_at = first_observed_at or time.time()
+    elapsed = max(0.0, time.time() - started_at)
+    print(
+        f"{short_batch_id(batch_id)} failed after {elapsed:.2f}s: {reason}",
+        file=sys.stderr,
+    )
 
 
 class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -1574,12 +1607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         spool_sink = SpoolSink(
             args.spool_dir, root=root, session_id=args.session_id
         )
-        sink = CompositeSink(
-            [
-                sink,
-                spool_sink,
-            ]
-        )
+        sink = CompositeSink((sink, spool_sink))
     changes: queue.Queue[Path] = queue.Queue()
     observed_at: dict[Path, float] = {}
     observed_at_lock = threading.Lock()
@@ -1603,6 +1631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     suppression = MaterializedPathSuppression(
         root, ttl_seconds=min(5.0, max(1.0, args.debounce))
     )
+    lifecycle_tracker = FindingLifecycleTracker()
     try:
         while True:
             triggered = next_triggered_batch(
@@ -1661,6 +1690,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         review_coordinator=spool_sink,
                         agent_session_id=agent_session_id,
                         model_run_config=model_run_config,
+                        lifecycle_tracker=lifecycle_tracker,
                     )
             finally:
                 if triggered.flush_hint is not None:
