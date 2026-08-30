@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import queue
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -744,6 +745,25 @@ class AgentChangeReplayTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "blob differs"),
         ):
             live_eval.attest_runtime(config)
+
+    def test_runtime_attestation_commands_share_a_bounded_deadline(self) -> None:
+        config = approved_qwen_config(plan_with_approved_qwen_artifact())
+        timeout = subprocess.TimeoutExpired(["llm", "--version"], 10)
+        with (
+            mock.patch(
+                "evals.agent_changes.live_eval.subprocess.run",
+                side_effect=timeout,
+            ) as command,
+            self.assertRaisesRegex(ValueError, "runtime attestation timed out"),
+        ):
+            live_eval.attest_runtime(config)
+
+        invoked_timeout = command.call_args.kwargs["timeout"]
+        self.assertGreater(invoked_timeout, 0)
+        self.assertLessEqual(
+            invoked_timeout, live_eval.MAX_RUNTIME_ATTESTATION_SECONDS,
+        )
+        self.assertLessEqual(invoked_timeout, config.timeout_seconds)
 
     def test_benchmark_scorecard_retains_failed_attempts_and_no_auto_selection(self) -> None:
         plan = plan_with_approved_qwen_artifact()

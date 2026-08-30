@@ -37,6 +37,7 @@ OLLAMA_LOCAL_BLOB = re.compile(
 )
 WATCHER_PATH = REPOSITORY_ROOT / "watch_files.py"
 DEFAULT_RESULTS_DIRECTORY = REPOSITORY_ROOT / "eval-results"
+MAX_RUNTIME_ATTESTATION_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -435,15 +436,27 @@ def benchmark_cost_preflight(
 
 
 def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
-    version_result = subprocess.run(
-        ["llm", "--version"], check=False, capture_output=True, text=True,
+    deadline = time.monotonic() + min(
+        MAX_RUNTIME_ATTESTATION_SECONDS, config.timeout_seconds,
     )
-    plugins_result = subprocess.run(
-        ["llm", "plugins"], check=False, capture_output=True, text=True,
-    )
-    models_result = subprocess.run(
-        ["llm", "models", "list"], check=False, capture_output=True, text=True,
-    )
+
+    def run_attestation_command(
+        command: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("runtime attestation timed out")
+        try:
+            return subprocess.run(
+                command, check=False, capture_output=True, text=True,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("runtime attestation timed out") from error
+
+    version_result = run_attestation_command(["llm", "--version"])
+    plugins_result = run_attestation_command(["llm", "plugins"])
+    models_result = run_attestation_command(["llm", "models", "list"])
     if any(
         result.returncode != 0
         for result in (version_result, plugins_result, models_result)
@@ -498,11 +511,8 @@ def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
                 "local llm alias does not resolve to the configured non-cloud "
                 "runtime_model_id"
             )
-        model_result = subprocess.run(
+        model_result = run_attestation_command(
             ["ollama", "show", "--modelfile", runtime_model_id],
-            check=False,
-            capture_output=True,
-            text=True,
         )
         if model_result.returncode != 0:
             raise ValueError("could not attest the configured Ollama model")
