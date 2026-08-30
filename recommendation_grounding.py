@@ -41,7 +41,8 @@ _SPEC_SYMBOL = re.compile(
     re.IGNORECASE,
 )
 _SPEC_TEST_CONTEXT = re.compile(
-    r"\brspec\b|\bspec\s+(?:suite|tests?|cases?)\b",
+    r"\brspec\b|\bspecs?\s+"
+    r"(?:suite|tests?|cases?|folders?|director(?:y|ies))\b",
     re.IGNORECASE,
 )
 _MUTATION_VERB = re.compile(

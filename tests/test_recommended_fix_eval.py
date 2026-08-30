@@ -243,6 +243,8 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         for recommendation in (
             "Extend missing_spec in the RSpec suite with a boundary assertion.",
             "Edit missing_spec in the spec suite to assert the boundary.",
+            "Extend missing_spec in the spec folder with a boundary assertion.",
+            "Edit missing_spec in the specs directory to assert the boundary.",
         ):
             with self.subTest(recommendation=recommendation):
                 result = scoring.evaluate_recommendation(
