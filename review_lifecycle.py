@@ -113,6 +113,7 @@ class FindingLifecycleTracker:
 
     def classify(self, batch: ReviewBatch) -> ReviewBatch:
         events = list(batch.lifecycle)
+        stale_files = set(batch.stale_files)
         current_by_file: dict[str, list[ReviewFinding]] = {}
         for finding in batch.findings:
             current_by_file.setdefault(finding.file, []).append(finding)
@@ -131,6 +132,7 @@ class FindingLifecycleTracker:
             )
             previous_state = self._files.get(path)
             if previous_state is not None and snapshot_at < previous_state.snapshot_at:
+                stale_files.add(path)
                 events.extend(
                     FindingLifecycle(
                         status="stale",
@@ -202,4 +204,8 @@ class FindingLifecycleTracker:
                 for item in unmatched_current[replacement_count:]
             )
             self._files[path] = _FileState(snapshot_at, tuple(current))
-        return replace(batch, lifecycle=tuple(events))
+        return replace(
+            batch,
+            lifecycle=tuple(events),
+            stale_files=tuple(sorted(stale_files)),
+        )

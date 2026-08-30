@@ -905,6 +905,7 @@ def review_files(
                 session_generation=session_generation,
                 batch_flushed_at=batch_flushed_at,
                 redactions=redactions,
+                batch_id=batch_id,
             )
             published_batch = replace(batch, published_at=time.time())
             (sink or ConsoleSink()).publish(published_batch)

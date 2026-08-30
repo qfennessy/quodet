@@ -117,6 +117,11 @@ class ReviewLifecycleTests(unittest.TestCase):
         self.assertEqual(out_of_order.lifecycle[0].status, "stale")
         self.assertEqual(out_of_order.lifecycle[0].reason, "out_of_order")
 
+        empty_out_of_order = tracker.classify(self.batch(title=None, sequence=2))
+        self.assertEqual(empty_out_of_order.findings, ())
+        self.assertEqual(empty_out_of_order.stale_files, ("src/service.py",))
+        self.assertIn("discarded", render_human_review(empty_out_of_order))
+
         source_changed = self.batch(sequence=4)
         self.source.write_text("value = 2\n", encoding="utf-8")
         stale = tracker.classify(fresh_findings(source_changed))
