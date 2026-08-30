@@ -201,6 +201,8 @@ class WatchFilesTests(unittest.TestCase):
             "properties"
         ]["confidence"]
         self.assertEqual(confidence["minimum"], 0.95)
+        self.assertIn("Raw model-reported", confidence["description"])
+        self.assertIn("not a calibrated probability", confidence["description"])
         item_schema = watch_files.REVIEW_SCHEMA["properties"]["findings"]["items"]
         self.assertIn("line", item_schema["required"])
         self.assertFalse(item_schema["additionalProperties"])

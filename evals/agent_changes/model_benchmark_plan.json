@@ -6,18 +6,19 @@
   "status": "frozen-awaiting-authorized-runs",
   "current_default": "gpt-5.6-luna",
   "fixture": {
-    "revision": 2,
-    "manifest_sha256": "fceed79e9c9a23b54cbb6dfd84e2cee3cf39b70049ca3bc802b5e0b1eb4fecab",
-    "fixture_tree_sha256": "e5ff11177b49893cf692d5b625cac52bb5c513f834375522d4b54921429b5984",
-    "provider_payload_sha256": "65822daeb51c1c24629b834269f08a8c09be491e95938ae2b49c4749989b41b7",
+    "revision": 3,
+    "manifest_sha256": "b1c1f0a3437765cae04a1d77e48fe3dad483e3be069d22865c055ef0e91df540",
+    "fixture_tree_sha256": "aa81b2ed3a2655f8a86496181cf9f1a32d8442c8871cfbd5071f006f0f7ae56f",
+    "provider_payload_sha256": "24653681ade776d1fca1396ad6e2f0bea3d5eb868b9ade4ac893d21e757ae801",
+    "revision_note": "v3 appends the observed cancellation false-positive as a clean control before any benchmark inference was run",
     "required_splits": ["calibration", "holdout", "clean-control"],
     "reserved_splits": ["temporal", "confirmation"]
   },
   "review_contract": {
     "prompt_revision": "quodet-review-v2",
     "prompt_sha256": "9a0be118a5d3e9cfc2a0a4c42e7549c74fbd5825f4f2b97426a1a380901e62fb",
-    "schema_revision": "quodet-findings-v2",
-    "schema_sha256": "3502a80a1e358619634f2ab421b3fb8f28aae1de4edfe24d0de647479d508847",
+    "schema_revision": "quodet-findings-v3",
+    "schema_sha256": "d2b3627c6547348b62f1e30c4e89e3b6c2b898c181911c1ebe74f2f1f991ec5a",
     "attempts_per_case": 1,
     "repair_or_fallback": false
   },

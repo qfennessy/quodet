@@ -6,8 +6,9 @@ community for building and launching AI prototypes every Sunday.
 Quodet's goal is to integrate directly with coding-agent workflows and provide
 extremely low-latency code-quality feedback while an agent is still working.
 The independent watcher batches related file changes, reviews the current code,
-and is designed to return high-confidence defects quickly enough for the coding
-agent to verify and address them in the same development loop.
+and is designed to return defects with high model-reported confidence quickly
+enough for the coding agent to verify and address them in the same development
+loop. That raw score is a reviewer claim, not a calibrated probability.
 
 See [EXAMPLES.md](EXAMPLES.md) for complete buggy evaluation snippets and the
 focused fixes Quodet recommended during a live review.
@@ -15,7 +16,10 @@ focused fixes Quodet recommended during a live review.
 `quodet` recursively watches a directory. After file writes settle for three
 seconds, it sends all changed files in that batch to Codex Luna through Simon
 Willison's [`llm`](https://llm.datasette.io/) CLI. The default review requests
-only negative findings that Luna is at least 95% confident are real defects.
+only negative findings for which Luna reports confidence of at least 0.95.
+Until an exact model revision and review contract have enough adjudicated
+calibration evidence, the score remains `uncalibrated` and must not be presented
+as a probability of correctness.
 It asks the model to trace a concrete execution path to an observable failure
 and to discard findings that rely on speculation about missing code. Severity
 is calibrated only from demonstrated impact, without assuming an unknown blast
@@ -232,6 +236,68 @@ adjudicated recommended-fix quality score. For each true positive, set
 `fix_quality` to `actionable`, `partially-actionable`, or `not-actionable`.
 Filename equality is diagnostic only: a finding on the expected file with the
 wrong explanation is an FP and leaves the expected defect as an FN.
+
+### Confidence calibration
+
+Quodet retains `raw_confidence` exactly as the model reported it. A separate
+`calibrated_score` is available only when enough adjudicated findings occupy
+that fixed confidence bucket. It means observed correctness in that bucket for
+the exact versioned review contract; it does not make an unreachable or
+source-ungrounded claim publishable. A null calibrated score is reported as
+`uncalibrated`, never formatted as a probability.
+
+Fit an artifact from a scored calibration run only. Declare the precision,
+sample, bucket, and raw-confidence-floor targets before looking at other splits:
+
+```sh
+uv run python -m evals.agent_changes.calibration fit \
+  eval-results/CALIBRATION.scored.json \
+  --minimum-precision 0.90 \
+  --minimum-publication-samples 20 \
+  --minimum-bucket-samples 10 \
+  --minimum-raw-confidence 0.80 \
+  --output eval-results/CALIBRATION.calibration.json
+```
+
+The fitter mechanically reads findings and adjudications from the
+`calibration` split and rejects runs exposing holdout, temporal, clean-control,
+confirmation, or challenge labels. It selects the lowest observed
+raw-confidence threshold
+that satisfies every predeclared target. Sparse evidence produces an
+`uncalibrated` artifact with no publication threshold.
+
+Freeze that artifact before applying it to a separately adjudicated holdout or
+clean-control run:
+
+```sh
+uv run python -m evals.agent_changes.calibration report \
+  eval-results/HOLDOUT.scored.json \
+  --artifact eval-results/CALIBRATION.calibration.json \
+  --output eval-results/HOLDOUT.calibrated.json
+```
+
+The report includes raw and calibrated values per finding, reliability buckets
+and empirical correctness by split, thresholded precision and recall, sample
+counts, and raw versus thresholded clean-control false-positive case rates.
+Changing the exact model revision, model or reasoning options, prompt or schema
+digest, fixture revision or any recorded fixture/payload digest, context or
+output limits, timeout, output-limit option, watcher debounce, or replay
+inter-file delay invalidates the artifact and suppresses all calibrated
+publication decisions. These values are bound by one
+versioned canonical calibration-identity digest. Legacy or structurally
+incomplete identity artifacts fail closed. A run that records only a mutable
+model alias without an exact revision remains `uncalibrated`.
+
+Fixture revision 3 adds `26_clean_settled_async_rollback`, the observed
+cancellation false-positive, as a deterministic clean control. Its visible
+schedule fails the right insert before the delayed left insert can commit; the
+test oracle probes normal failure and multiple cancellation times and requires
+the repository to remain empty. This control is evaluation evidence only and
+is never used to fit the calibration mapping.
+
+No provider inference or confidence fitting was performed while adding this
+framework. The repository therefore does not claim a calibrated operating
+point yet.
 
 ## Frozen open-model benchmark
 
