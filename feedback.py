@@ -1579,11 +1579,35 @@ def validate_spooled_payload(
         or len(set(stale_files)) != len(stale_files)
     ):
         raise ReviewValidationError("invalid stale file collection")
+    normalized = parse_review_output(
+        json.dumps({"findings": payload["findings"]}),
+        root=root.resolve(),
+        reviewed_files=reviewed,
+        session_id=session_id,
+        feedback_round=feedback_round,
+        debounce_ms=float(payload["debounce_ms"]),
+        provider_ms=float(payload["provider_ms"]),
+        first_observed_at=float(payload["first_observed_at"]),
+        session_generation=session_generation,
+        batch_flushed_at=float(payload["batch_flushed_at"]),
+        provider_started_at=float(payload["provider_started_at"]),
+        provider_completed_at=float(payload["provider_completed_at"]),
+        redactions=_validated_redactions(payload.get("redactions")),
+    )
     raw_lifecycle = payload["lifecycle"]
     if not isinstance(raw_lifecycle, list) or len(raw_lifecycle) > MAX_FINDINGS * 2:
         raise ReviewValidationError("invalid finding lifecycle collection")
     lifecycle: list[dict[str, object]] = []
-    from review_lifecycle import LIFECYCLE_STATUSES, STALE_REASONS
+    from review_lifecycle import (
+        LIFECYCLE_STATUSES,
+        STALE_REASONS,
+        finding_fingerprint,
+    )
+
+    current_finding_identities = {
+        (finding_fingerprint(finding), finding.file, finding.line)
+        for finding in normalized.findings
+    }
 
     lifecycle_fields_set = {
         "status",
@@ -1639,24 +1663,13 @@ def validate_spooled_payload(
                 and previous != fingerprint
             )
             or (status == "replaced" and previous == fingerprint)
+            or (
+                status in {"new", "retained", "replaced"}
+                and (fingerprint, event_file, line) not in current_finding_identities
+            )
         ):
             raise ReviewValidationError("invalid finding lifecycle metadata")
         lifecycle.append(item.copy())
-    normalized = parse_review_output(
-        json.dumps({"findings": payload["findings"]}),
-        root=root.resolve(),
-        reviewed_files=reviewed,
-        session_id=session_id,
-        feedback_round=feedback_round,
-        debounce_ms=float(payload["debounce_ms"]),
-        provider_ms=float(payload["provider_ms"]),
-        first_observed_at=float(payload["first_observed_at"]),
-        session_generation=session_generation,
-        batch_flushed_at=float(payload["batch_flushed_at"]),
-        provider_started_at=float(payload["provider_started_at"]),
-        provider_completed_at=float(payload["provider_completed_at"]),
-        redactions=_validated_redactions(payload.get("redactions")),
-    )
     result = payload.copy()
     result["findings"] = [asdict(item) for item in normalized.findings]
     result["reviewed_files"] = [asdict(item) for item in reviewed]

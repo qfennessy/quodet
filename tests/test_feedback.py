@@ -306,7 +306,7 @@ class FeedbackTests(unittest.TestCase):
         )
         lifecycle = tuple(
             FindingLifecycle(
-                "new",
+                "new" if index == 0 else "no_longer_reported",
                 (
                     finding_fingerprint(batch.findings[1])
                     if index == 0
@@ -314,6 +314,7 @@ class FeedbackTests(unittest.TestCase):
                 ),
                 "src/quiet.py" if index == 0 else "src/app.py",
                 2 if index == 0 else index + 1,
+                previous_fingerprint=None if index == 0 else f"{index:064x}",
             )
             for index in range(MAX_FINDINGS * 2)
         )
@@ -386,7 +387,10 @@ class FeedbackTests(unittest.TestCase):
             published_at=current.created_at,
             lifecycle=(
                 FindingLifecycle(
-                    "new", "a" * 64, "src/app.py", 7,
+                    "new",
+                    finding_fingerprint(current.findings[0]),
+                    "src/app.py",
+                    7,
                 ),
                 FindingLifecycle(
                     "no_longer_reported",
@@ -808,10 +812,11 @@ class FeedbackTests(unittest.TestCase):
         )
         lifecycle = tuple(
             FindingLifecycle(
-                "new",
+                "no_longer_reported",
                 f"{index:064x}",
                 "src/app.py" if index else "src/quiet.py",
                 index + 1,
+                previous_fingerprint=f"{index:064x}",
             )
             for index in range(MAX_FINDINGS * 2)
         )

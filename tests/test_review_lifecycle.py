@@ -21,6 +21,7 @@ from review_lifecycle import (
     FindingLifecycleTracker,
     MAX_TRACKED_FINDINGS,
     batch_timing,
+    finding_fingerprint,
     short_batch_id,
 )
 from review_output import render_human_review
@@ -90,6 +91,12 @@ class ReviewLifecycleTests(unittest.TestCase):
             second.lifecycle[0].fingerprint,
             second.lifecycle[0].previous_fingerprint,
         )
+
+    def test_fingerprint_preserves_distinct_unicode_titles(self) -> None:
+        first = self.batch(title="缓存泄漏", sequence=1).findings[0]
+        second = self.batch(title="权限绕过", sequence=2).findings[0]
+
+        self.assertNotEqual(finding_fingerprint(first), finding_fingerprint(second))
 
     def test_replacement_and_model_omission_are_distinct(self) -> None:
         tracker = FindingLifecycleTracker()
@@ -263,6 +270,49 @@ class ReviewLifecycleTests(unittest.TestCase):
         )
         for mutation in mutations:
             payload = json.loads(json.dumps(original))
+            payload["lifecycle"][0].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(
+                ReviewValidationError
+            ):
+                validate_spooled_payload(
+                    payload, root=self.root, session_id="agent-a"
+                )
+
+    def test_spool_binds_current_lifecycle_to_validated_findings(self) -> None:
+        tracker = FindingLifecycleTracker()
+        batch = tracker.classify(self.batch(sequence=1))
+        spool = self.base / "unbound-lifecycle" / "feedback"
+        sink = SpoolSink(spool, root=self.root, session_id="agent-a")
+        self.addCleanup(sink.close)
+        self.assertTrue(sink.publish(batch))
+        original = json.loads(next((spool / "pending").glob("*.json")).read_text())
+
+        other = self.root / "src" / "other.py"
+        other.write_text("value = 2\n", encoding="utf-8")
+        raw = other.read_bytes()
+        alternate_file = {
+            "path": "src/other.py",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+        }
+        mutations = (
+            {"fingerprint": "b" * 64},
+            {"line": original["lifecycle"][0]["line"] + 1},
+            {"file": "src/other.py"},
+            {
+                "status": "retained",
+                "fingerprint": "b" * 64,
+                "previous_fingerprint": "b" * 64,
+            },
+            {
+                "status": "replaced",
+                "fingerprint": "b" * 64,
+                "previous_fingerprint": "c" * 64,
+            },
+        )
+        for mutation in mutations:
+            payload = json.loads(json.dumps(original))
+            payload["reviewed_files"].append(alternate_file)
             payload["lifecycle"][0].update(mutation)
             with self.subTest(mutation=mutation), self.assertRaises(
                 ReviewValidationError

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import time
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -63,7 +63,13 @@ def short_batch_id(batch_id: str) -> str:
 
 def finding_fingerprint(finding: ReviewFinding) -> str:
     """Hash normalized provider metadata, never source text or explanation prose."""
-    normalized_title = re.sub(r"[^a-z0-9]+", " ", finding.title.casefold()).strip()
+    folded_title = unicodedata.normalize("NFKC", finding.title).casefold()
+    normalized_title = " ".join(
+        "".join(
+            character if character.isalnum() else " "
+            for character in folded_title
+        ).split()
+    )
     encoded = f"quodet-finding-v1\0{finding.file}\0{normalized_title}".encode()
     return hashlib.sha256(encoded).hexdigest()
 
