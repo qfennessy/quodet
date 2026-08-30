@@ -26,6 +26,7 @@ from feedback import (
     fresh_spooled_payload,
     matching_review_in_flight,
     publish_flush_hint,
+    request_flush_hint,
     read_bounded_beneath_root,
     read_session_state,
     retire_reviewed_flush_hints,
@@ -569,6 +570,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Could not publish watcher flush hint: {error}", file=sys.stderr)
 
     if event == "Stop":
+        try:
+            request_flush_hint(
+                args.spool_dir,
+                root=args.root,
+                session_id=args.session_id,
+                agent_session_id=agent_session_id,
+                ttl_seconds=min(10.0, max(0.1, args.stop_grace or 0.1)),
+            )
+        except OSError as error:
+            print(f"Could not request watcher flush: {error}", file=sys.stderr)
+        except ValueError:
+            # A producer may have exited between lease verification and Stop.
+            # With no active watcher there is nothing to flush or wait for.
+            pass
         claim = _claim_with_stop_grace(
             args.spool_dir,
             root=args.root,

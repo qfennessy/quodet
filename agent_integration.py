@@ -567,7 +567,7 @@ def _initialize_artifacts(
     _private_directory(route.spool_path)
     for name in (
         "pending", "claimed", "acknowledged", "rejected", "dedupe", "sessions",
-        "metrics", "flush-hints", "in-flight"
+        "metrics", "flush-hints", "flush-requests", "in-flight"
     ):
         _private_directory(route.spool_path / name)
     if not route_file.exists():
@@ -746,6 +746,7 @@ def route_status(route: RouteConfig) -> dict[str, object]:
         "rejected",
         "dedupe",
         "flush-hints",
+        "flush-requests",
         "in-flight",
     ):
         directory = _private_directory(route.spool_path / name)
@@ -904,6 +905,7 @@ def cleanup_route(
                 "rejected",
                 "dedupe",
                 "flush-hints",
+                "flush-requests",
                 "in-flight",
             )
             for name in states:

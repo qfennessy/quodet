@@ -18,8 +18,10 @@ import watch_files
 from feedback import (
     ReviewedFile,
     SpoolSink,
+    matching_review_in_flight,
     parse_review_output,
     publish_flush_hint,
+    request_flush_hint,
 )
 
 
@@ -529,13 +531,483 @@ class AgentIntegrationTests(unittest.TestCase):
             changes, 1.0, hint_source=sink
         )
 
-        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(triggered.paths, {self.source})
         self.assertIsNotNone(triggered.flush_hint)
         self.assertEqual(
             triggered.flush_hint.agent_session_id,  # type: ignore[union-attr]
             "live-agent-session",
         )
+
+    def test_three_sequential_claude_write_events_form_one_review_batch(self) -> None:
+        route, _ = self._route("claude")
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        paths = tuple(
+            self.root / "scratch" / "challenging" / name
+            for name in ("__init__.py", "repository.py", "service.py")
+        )
+        for index, (path, created_at) in enumerate(
+            zip(paths, (100.0, 100.08, 100.16), strict=True), start=1
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"value = {index}\n", encoding="utf-8")
+            event = self._fixture("claude", "post_tool_use.input.json")
+            event["tool_name"] = "Write"
+            event["tool_input"] = {"file_path": os.fspath(path)}
+            event["tool_use_id"] = f"tool-{index}"
+            with mock.patch("feedback.time.time", return_value=created_at):
+                self.assertIsNone(self._invoke(route, "PostToolUse", event))
+
+        changes: queue.Queue[Path] = queue.Queue()
+        for path in paths:
+            changes.put(path)
+        with mock.patch("feedback.time.time", return_value=100.42):
+            triggered = watch_files.next_triggered_batch(
+                changes,
+                3.0,
+                hint_source=sink,
+                agent_edit_quiet=0.25,
+                agent_edit_max_age=1.0,
+            )
+
+        hint = triggered.flush_hint
+        self.assertIsNotNone(hint)
+        self.assertEqual(triggered.paths, set(paths))
+        self.assertEqual(
+            {item.path for item in hint.reviewed_files},  # type: ignore[union-attr]
+            {
+                "scratch/challenging/__init__.py",
+                "scratch/challenging/repository.py",
+                "scratch/challenging/service.py",
+            },
+        )
+        self.assertEqual(len(hint.paths), 3)  # type: ignore[union-attr]
+
+    def test_single_agent_edit_flushes_before_filesystem_debounce(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        with mock.patch("feedback.time.time", return_value=100.2):
+            self.assertIsNone(
+                sink.consume_flush_hint(quiet_seconds=0.25, max_age_seconds=1.0)
+            )
+        with mock.patch("feedback.time.time", return_value=100.26):
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(hint)
+        self.assertLess(0.26, watch_files.DEFAULT_DEBOUNCE_SECONDS)
+
+    def test_spaced_agent_edits_remain_separate_batches(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        second = self.root / "src" / "second.py"
+        second.write_text("value = 2\n", encoding="utf-8")
+        second_raw = second.read_bytes()
+        metadata = (
+            self._batch(route).reviewed_files,
+            (
+                ReviewedFile(
+                    "src/second.py",
+                    hashlib.sha256(second_raw).hexdigest(),
+                    len(second_raw),
+                ),
+            ),
+        )
+        for created_at, reviewed_files in zip(
+            (100.0, 100.5), metadata, strict=True
+        ):
+            with mock.patch("feedback.time.time", return_value=created_at):
+                publish_flush_hint(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                    reviewed_files=reviewed_files,
+                )
+        with mock.patch("feedback.time.time", return_value=100.6):
+            first = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+        )
+        self.assertEqual(
+            {item.path for item in first.reviewed_files},  # type: ignore[union-attr]
+            {"src/app.py"},
+        )
+        sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=first,
+        )
+        with mock.patch("feedback.time.time", return_value=100.76):
+            second_hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertEqual(
+            {item.path for item in second_hint.reviewed_files},  # type: ignore[union-attr]
+            {"src/second.py"},
+        )
+
+    def test_continuous_agent_writes_flush_at_max_batch_age(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        for index, created_at in enumerate((100.0, 100.09, 100.18, 100.27, 100.36)):
+            path = self.root / "src" / f"continuous_{index}.py"
+            path.write_text(f"value = {index}\n", encoding="utf-8")
+            raw = path.read_bytes()
+            with mock.patch("feedback.time.time", return_value=created_at):
+                publish_flush_hint(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                    reviewed_files=(
+                        ReviewedFile(
+                            f"src/continuous_{index}.py",
+                            hashlib.sha256(raw).hexdigest(),
+                            len(raw),
+                        ),
+                    ),
+                )
+        with mock.patch("feedback.time.time", return_value=100.37):
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.1, max_age_seconds=0.3
+            )
+        self.assertIsNotNone(hint)
+        self.assertEqual(len(hint.reviewed_files), 5)  # type: ignore[union-attr]
+        self.assertEqual(len(list((self.spool / "flush-hints").glob("*.json"))), 5)
+
+    def test_repeated_same_file_edits_keep_oldest_max_age_anchor(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        latest_raw = b""
+        for index, created_at in enumerate((100.0, 100.08, 100.16, 100.24, 100.32)):
+            latest_raw = f"value = {index}\n".encode()
+            self.source.write_bytes(latest_raw)
+            with mock.patch("feedback.time.time", return_value=created_at):
+                publish_flush_hint(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                    reviewed_files=(
+                        ReviewedFile(
+                            "src/app.py",
+                            hashlib.sha256(latest_raw).hexdigest(),
+                            len(latest_raw),
+                        ),
+                    ),
+                )
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(self.source)
+
+        with mock.patch("feedback.time.time", return_value=100.33):
+            triggered = watch_files.next_triggered_batch(
+                changes,
+                3.0,
+                hint_source=sink,
+                agent_edit_quiet=0.1,
+                agent_edit_max_age=0.3,
+            )
+
+        hint = triggered.flush_hint
+        self.assertIsNotNone(hint)
+        self.assertAlmostEqual(hint.created_at, 100.0)  # type: ignore[union-attr]
+        self.assertEqual(len(hint.paths), 5)  # type: ignore[union-attr]
+        self.assertEqual(
+            hint.reviewed_files,  # type: ignore[union-attr]
+            (
+                ReviewedFile(
+                    "src/app.py",
+                    hashlib.sha256(latest_raw).hexdigest(),
+                    len(latest_raw),
+                ),
+            ),
+        )
+        marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=hint,
+        )
+        sink.finish_review(marker)
+        self.assertEqual(list((self.spool / "flush-hints").glob("*.json")), [])
+
+    def test_spaced_same_file_replacements_start_new_age_anchor(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+
+        with mock.patch("feedback.time.time", return_value=200.0):
+            first_path = publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        with mock.patch("feedback.time.time", return_value=200.26):
+            first = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertEqual(first.paths, (first_path,))  # type: ignore[union-attr]
+        first_marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=first,
+        )
+        sink.finish_review(first_marker)
+
+        replacement = b"value = 2\n"
+        self.source.write_bytes(replacement)
+        replacement_metadata = (
+            ReviewedFile(
+                "src/app.py",
+                hashlib.sha256(replacement).hexdigest(),
+                len(replacement),
+            ),
+        )
+        with mock.patch("feedback.time.time", return_value=200.6):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=replacement_metadata,
+            )
+        with mock.patch("feedback.time.time", return_value=200.7):
+            self.assertIsNone(
+                sink.consume_flush_hint(quiet_seconds=0.25, max_age_seconds=1.0)
+            )
+        with mock.patch("feedback.time.time", return_value=200.86):
+            second = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertAlmostEqual(second.created_at, 200.6)  # type: ignore[union-attr]
+        self.assertEqual(second.reviewed_files, replacement_metadata)  # type: ignore[union-attr]
+
+    def test_stop_request_forces_only_already_pending_session_hints(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        with self.assertRaisesRegex(ValueError, "active watcher and agent session"):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="wrong-session",
+            )
+        with mock.patch("feedback.time.time", return_value=100.05):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+        self.assertIsNotNone(hint)
+        self.assertEqual(list((self.spool / "flush-requests").glob("*.json")), [])
+
+    def test_stop_liveness_preserves_current_member_of_superseded_hint(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        sibling = self.root / "src" / "sibling.py"
+        sibling.write_text("sibling = 1\n", encoding="utf-8")
+        sibling_raw = sibling.read_bytes()
+        first_metadata = (
+            self._batch(route).reviewed_files[0],
+            ReviewedFile(
+                "src/sibling.py",
+                hashlib.sha256(sibling_raw).hexdigest(),
+                len(sibling_raw),
+            ),
+        )
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=first_metadata,
+            )
+        replacement = b"value = 2\n"
+        self.source.write_bytes(replacement)
+        replacement_metadata = ReviewedFile(
+            "src/app.py",
+            hashlib.sha256(replacement).hexdigest(),
+            len(replacement),
+        )
+        with mock.patch("feedback.time.time", return_value=100.1):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=(replacement_metadata,),
+            )
+        with mock.patch("feedback.time.time", return_value=100.11):
+            request_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+            )
+            self.assertTrue(
+                matching_review_in_flight(
+                    self.spool,
+                    root=self.root,
+                    session_id=route.session_id,
+                    agent_session_id="live-agent-session",
+                )
+            )
+            self.assertEqual(
+                len(list((self.spool / "flush-hints").glob("*.json"))), 2
+            )
+            hint = sink.consume_flush_hint(
+                quiet_seconds=0.25, max_age_seconds=1.0
+            )
+
+        self.assertIsNotNone(hint)
+        self.assertEqual(
+            {item.path: item for item in hint.reviewed_files},  # type: ignore[union-attr]
+            {
+                "src/app.py": replacement_metadata,
+                "src/sibling.py": first_metadata[1],
+            },
+        )
+
+    def test_unhinted_watch_event_keeps_normal_debounce(self) -> None:
+        route, _ = self._route()
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(self.source)
+        started = time.monotonic()
+        triggered = watch_files.next_triggered_batch(
+            changes,
+            0.03,
+            hint_source=sink,
+            agent_edit_quiet=0.01,
+            agent_edit_max_age=0.02,
+        )
+        self.assertGreaterEqual(time.monotonic() - started, 0.02)
+        self.assertIsNone(triggered.flush_hint)
+        self.assertEqual(triggered.paths, {self.source})
+
+    def test_ready_hint_does_not_drain_unrelated_queued_watch_event(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        unrelated = self.root / "src" / "shell_generated.py"
+        unrelated.write_text("value = 2\n", encoding="utf-8")
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(unrelated)
+
+        with mock.patch("feedback.time.time", return_value=100.26):
+            hinted = watch_files.next_triggered_batch(
+                changes,
+                0.03,
+                hint_source=sink,
+                agent_edit_quiet=0.25,
+                agent_edit_max_age=1.0,
+            )
+
+        self.assertEqual(hinted.paths, {self.source})
+        self.assertIsNotNone(hinted.flush_hint)
+        marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=hinted.flush_hint,
+        )
+        sink.finish_review(marker)
+        started = time.monotonic()
+        filesystem = watch_files.next_triggered_batch(
+            changes,
+            0.03,
+            hint_source=sink,
+            agent_edit_quiet=0.01,
+            agent_edit_max_age=0.02,
+        )
+        self.assertGreaterEqual(time.monotonic() - started, 0.02)
+        self.assertEqual(filesystem.paths, {unrelated})
+        self.assertIsNone(filesystem.flush_hint)
 
     def test_duplicate_hint_event_preserves_original_observation_timing(self) -> None:
         route, _ = self._route()

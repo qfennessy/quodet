@@ -101,6 +101,11 @@ Stop the watcher with Ctrl-C. Useful options include:
 --model MODEL       Select another llm model or alias
 --reasoning-effort  auto, low, medium, or high
 --prompt TEXT       Override the review prompt
+--debounce S        Quiet window for ordinary filesystem changes (default: 3)
+--agent-edit-quiet S
+                     Coalesce rapid direct agent edits (default: 0.25)
+--agent-edit-max-age S
+                     Flush continuous direct agent edits by this age (default: 1)
 --exclude GLOB      Ignore matching paths; may be repeated
 --max-bytes BYTES   Skip larger individual files
 --review-timeout S  Stop a stalled provider review (default: 60 seconds)
@@ -535,16 +540,20 @@ documentation](https://learn.chatgpt.com/docs/hooks). A shortened form is:
 
 `PostToolUse` sends the watcher a private, session-owned flush hint after a
 direct edit, then returns without waiting for provider inference. The watcher
-keeps its OS-level coverage for shell writes and other processes, but a known
-agent edit can bypass the remaining quiet-window delay. Before provider
-invocation it publishes an expiring in-flight marker for that exact root,
-configured route, and real agent session.
+coalesces rapid hints from the same root, route, and real agent session for
+250 ms, so sequential `Write` or `Edit` calls that implement one change reach
+the provider as one snapshot. This agent-edit window is capped at one second,
+so continuous writes cannot postpone review indefinitely, and it remains well
+below the three-second filesystem debounce. Ordinary shell and watcher events
+without authenticated hints retain the normal debounce. Before provider
+invocation Quodet publishes an expiring in-flight marker for the exact route.
 
-When no feedback is ready, `Stop` waits up to the route's `--stop-grace` only
-if that same session has a live flush hint or review marker. An idle turn
-returns immediately. A review completed inside the grace window is delivered
-without a second user prompt; a slower result stays durable for the next
-matching boundary. `Stop` blocks completion once when it delivers a batch,
+When no feedback is ready, `Stop` first asks the watcher to flush that
+session's already-pending edit group, then waits up to the route's
+`--stop-grace` only while the hint or review remains live. An idle turn returns
+immediately. A review completed inside the grace window is delivered without a
+second user prompt; a slower result stays durable for the next matching
+boundary. `Stop` blocks completion once when it delivers a batch,
 allowing Codex to continue and independently inspect the suggestion. Every
 delivery is explicitly labelled as untrusted automated review data that must
 be verified before editing. Quodet never bypasses Codex permissions or
@@ -670,7 +679,10 @@ same fail-closed root and session lease checks apply. See the official
 
 The filesystem watcher still observes writes from shell commands and other
 processes even though the `PostToolUse` matcher names Claude's direct editing
-tools. The `Stop` hook is the fallback delivery boundary for those changes.
+tools. Rapid sequential Claude `Write` calls share the bounded agent-edit
+window rather than being reviewed as incomplete one-file snapshots. The
+`Stop` hook forces an already-pending direct-edit group and remains the fallback
+delivery boundary for other changes.
 Project hooks can execute commands, so review `.claude/settings.json` before
 trusting the repository. Attaching Quodet to another agent still requires that
 agent to expose a documented hook or steering interface.

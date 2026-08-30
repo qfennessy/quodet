@@ -39,6 +39,8 @@ MAX_EXPLANATION_LENGTH = 8_000
 MAX_FIX_LENGTH = 2_000
 DEFAULT_ROUND_RESET_SECONDS = 900
 DEFAULT_FLUSH_HINT_TTL_SECONDS = 30.0
+DEFAULT_AGENT_EDIT_QUIET_SECONDS = 0.25
+DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS = 1.0
 MAX_IN_FLIGHT_SECONDS = 3_600.0
 UNTRUSTED_NOTICE = (
     "Untrusted automated review suggestions follow. Independently verify every "
@@ -103,6 +105,12 @@ class FlushHint:
     created_at: float
     path: Path
     reviewed_files: tuple[ReviewedFile, ...]
+    constituent_paths: tuple[Path, ...] = ()
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        """Return every durable hint represented by this logical edit group."""
+        return self.constituent_paths or (self.path,)
 
 
 def read_bounded_beneath_root(
@@ -534,9 +542,11 @@ def _reviewed_files_are_current(root: Path, reviewed_files: Sequence[ReviewedFil
     return True
 
 
-def _raw_hint_files_are_current(root: Path, value: object) -> bool:
+def _parse_raw_hint_files(
+    root: Path, value: object
+) -> tuple[ReviewedFile, ...] | None:
     if not isinstance(value, list) or not 0 < len(value) <= MAX_REVIEWED_FILES:
-        return False
+        return None
     reviewed: list[ReviewedFile] = []
     for item in value:
         if (
@@ -552,15 +562,23 @@ def _raw_hint_files_are_current(root: Path, value: object) -> bool:
             or not isinstance(item["size"], int)
             or not 0 <= item["size"] <= MAX_REVIEWED_FILE_BYTES
         ):
-            return False
+            return None
         try:
             path = _normalize_finding_path(
                 item["path"], root.resolve(), {item["path"]}
             )
         except ReviewValidationError:
-            return False
+            return None
         reviewed.append(ReviewedFile(path, item["sha256"], item["size"]))
-    return _reviewed_files_are_current(root, reviewed)
+    return tuple(reviewed)
+
+
+def _raw_hint_has_current_file(root: Path, value: object) -> bool:
+    """Validate the complete hint shape but retain any current member."""
+    reviewed = _parse_raw_hint_files(root, value)
+    return reviewed is not None and any(
+        _reviewed_files_are_current(root, (item,)) for item in reviewed
+    )
 
 
 def publish_flush_hint(
@@ -614,15 +632,64 @@ def publish_flush_hint(
     return destination
 
 
+def request_flush_hint(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    agent_session_id: str,
+    ttl_seconds: float = 10.0,
+) -> Path:
+    """Ask the watcher to flush edits already hinted by this exact session."""
+    if (
+        not 0 < ttl_seconds <= 10
+        or not _producer_is_active(root)
+        or not _session_is_owned(
+            directory,
+            root=root,
+            session_id=session_id,
+            agent_session_id=agent_session_id,
+        )
+    ):
+        raise ValueError(
+            "flush request does not match an active watcher and agent session"
+        )
+    requests = _ensure_private_directory(
+        directory.expanduser().resolve() / "flush-requests"
+    )
+    created_at = time.time()
+    destination = requests / f"{time.time_ns()}-{uuid.uuid4()}.json"
+    _atomic_private_json(
+        destination,
+        {
+            "version": 1,
+            "root": os.fspath(root.resolve()),
+            "session_id": session_id,
+            "agent_session_id": agent_session_id,
+            "created_at": created_at,
+            "expires_at": created_at + ttl_seconds,
+        },
+    )
+    return destination
+
+
 def consume_flush_hint(
     directory: Path,
     *,
     root: Path,
     session_id: str,
     changed_paths: Sequence[Path] | None = None,
+    quiet_seconds: float = 0.0,
+    max_age_seconds: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+    force_ready: bool = False,
 ) -> FlushHint | None:
-    """Consume the oldest valid hint for this exact route and real agent session."""
+    """Consume one quiet or max-aged logical edit group for this exact route."""
+    if not 0 <= quiet_seconds <= 10 or not 0 < max_age_seconds <= 30:
+        raise ValueError("invalid agent edit coalescing window")
     hints = _ensure_private_directory(directory.expanduser().resolve() / "flush-hints")
+    requests = _ensure_private_directory(
+        directory.expanduser().resolve() / "flush-requests"
+    )
     expected_root = os.fspath(root.resolve())
     changed_relative: set[str] | None = None
     if changed_paths is not None:
@@ -637,12 +704,57 @@ def consume_flush_hint(
             except ValueError:
                 continue
     now = time.time()
+    force_request_paths: list[Path] = []
+    force_requested_at: float | None = None
+    for request_path in requests.glob("*.json"):
+        value = _load_bounded_object(request_path)
+        created_at = value.get("created_at") if value is not None else None
+        expires_at = value.get("expires_at") if value is not None else None
+        valid = (
+            value is not None
+            and set(value) == {
+                "version",
+                "root",
+                "session_id",
+                "agent_session_id",
+                "created_at",
+                "expires_at",
+            }
+            and value.get("version") == 1
+            and value.get("root") == expected_root
+            and value.get("session_id") == session_id
+            and isinstance(value.get("agent_session_id"), str)
+            and isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(created_at) <= now < float(expires_at)
+            and 0 < float(expires_at) - float(created_at) <= 10
+            and _session_is_owned(
+                directory,
+                root=root,
+                session_id=session_id,
+                agent_session_id=str(value.get("agent_session_id")),
+            )
+        )
+        if not valid:
+            request_path.unlink(missing_ok=True)
+            continue
+        force_request_paths.append(request_path)
+        requested_at = float(created_at)
+        force_requested_at = (
+            requested_at
+            if force_requested_at is None
+            else max(force_requested_at, requested_at)
+        )
+
     candidates: list[tuple[float, Path]] = []
     for path in hints.glob("*.json"):
         try:
             candidates.append((path.stat().st_mtime, path))
         except FileNotFoundError:
             continue
+    valid_hints: list[FlushHint] = []
     for _, path in sorted(candidates):
         value = _load_bounded_object(path)
         valid_shape = value is not None and set(value) == {
@@ -721,23 +833,91 @@ def consume_flush_hint(
                 agent_session_id=agent_session_id,
             )
         )
+        if valid:
+            valid_hints.append(
+                FlushHint(
+                    agent_session_id,
+                    float(created_at),
+                    path,
+                    tuple(reviewed_files),
+                )
+            )
+        else:
+            path.unlink(missing_ok=True)
+
+    groups: list[list[FlushHint]] = []
+    for hint in sorted(valid_hints, key=lambda item: (item.created_at, item.path.name)):
+        if not groups:
+            groups.append([hint])
+            continue
+        group = groups[-1]
+        known_paths = {
+            reviewed.path for member in group for reviewed in member.reviewed_files
+        }
+        added_paths = {item.path for item in hint.reviewed_files} - known_paths
         if (
-            valid
-            and reviewed_files
-            and changed_relative is not None
-            and changed_relative.isdisjoint(item.path for item in reviewed_files)
+            hint.agent_session_id != group[0].agent_session_id
+            or hint.created_at - group[-1].created_at > quiet_seconds
+            or len(known_paths) + len(added_paths) > MAX_REVIEWED_FILES
+        ):
+            groups.append([hint])
+        else:
+            group.append(hint)
+
+    has_current_hint = False
+    for group in groups:
+        latest_by_path: dict[str, ReviewedFile] = {}
+        for member in group:
+            for reviewed in member.reviewed_files:
+                latest_by_path[reviewed.path] = reviewed
+        reviewed_by_path = {
+            path: reviewed
+            for path, reviewed in latest_by_path.items()
+            if _reviewed_files_are_current(root, (reviewed,))
+        }
+        active_members = [
+            member
+            for member in group
+            if any(item.path in reviewed_by_path for item in member.reviewed_files)
+        ]
+        active_hint_paths = {member.path for member in active_members}
+        inactive_members = [
+            member for member in group if member.path not in active_hint_paths
+        ]
+        for member in inactive_members:
+            member.path.unlink(missing_ok=True)
+        if not active_members:
+            continue
+        has_current_hint = True
+        if (
+            changed_relative is not None
+            and changed_relative.isdisjoint(reviewed_by_path)
         ):
             continue
-        if valid and not _reviewed_files_are_current(root, reviewed_files):
-            valid = False
-        if valid:
-            return FlushHint(
-                agent_session_id,
-                float(created_at),
-                path,
-                tuple(reviewed_files),
-            )
-        path.unlink(missing_ok=True)
+        forced = force_ready or (
+            force_requested_at is not None
+            and active_members[-1].created_at <= force_requested_at
+        )
+        ready = (
+            forced
+            or now - active_members[-1].created_at >= quiet_seconds
+            or now - active_members[0].created_at >= max_age_seconds
+            or len(reviewed_by_path) == MAX_REVIEWED_FILES
+        )
+        if not ready:
+            return None
+        for request_path in force_request_paths:
+            request_path.unlink(missing_ok=True)
+        return FlushHint(
+            active_members[0].agent_session_id,
+            active_members[0].created_at,
+            active_members[0].path,
+            tuple(reviewed_by_path.values()),
+            tuple(member.path for member in active_members),
+        )
+    if force_request_paths and not has_current_hint:
+        for request_path in force_request_paths:
+            request_path.unlink(missing_ok=True)
     return None
 
 
@@ -828,7 +1008,7 @@ def matching_review_in_flight(
             and 0 < len(reviewed_files) <= MAX_REVIEWED_FILES
             and (
                 not validate_hint_files
-                or _raw_hint_files_are_current(root, reviewed_files)
+                or _raw_hint_has_current_file(root, reviewed_files)
             )
             and _session_is_owned(
                 directory,
@@ -904,6 +1084,7 @@ class SpoolSink:
         _ensure_private_directory(self.directory / "dedupe")
         _ensure_private_directory(self.directory / "sessions")
         _ensure_private_directory(self.directory / "flush-hints")
+        _ensure_private_directory(self.directory / "flush-requests")
         _ensure_private_directory(self.directory / "in-flight")
         if fcntl is None:
             raise RuntimeError("spool delivery requires process-exclusive file locks")
@@ -1040,13 +1221,21 @@ class SpoolSink:
         return hashlib.sha256(encoded).hexdigest()
 
     def consume_flush_hint(
-        self, changed_paths: Sequence[Path] | None = None
+        self,
+        changed_paths: Sequence[Path] | None = None,
+        *,
+        quiet_seconds: float = 0.0,
+        max_age_seconds: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+        force_ready: bool = False,
     ) -> FlushHint | None:
         return consume_flush_hint(
             self.directory,
             root=self.root,
             session_id=self.session_id,
             changed_paths=changed_paths,
+            quiet_seconds=quiet_seconds,
+            max_age_seconds=max_age_seconds,
+            force_ready=force_ready,
         )
 
     def begin_review(
@@ -1080,8 +1269,10 @@ class SpoolSink:
                 "expires_at": started_at + lifetime,
             },
         )
-        if flush_hint is not None and flush_hint.path.parent == self.directory / "flush-hints":
-            flush_hint.path.unlink(missing_ok=True)
+        if flush_hint is not None:
+            for hint_path in flush_hint.paths:
+                if hint_path.parent == self.directory / "flush-hints":
+                    hint_path.unlink(missing_ok=True)
         return marker
 
     def finish_review(self, marker: Path | None) -> None:
