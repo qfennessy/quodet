@@ -980,7 +980,9 @@ class AgentIntegrationTests(unittest.TestCase):
         changes: queue.Queue[Path] = queue.Queue()
         changes.put(unrelated)
 
-        with mock.patch("feedback.time.time", return_value=100.26):
+        with mock.patch(
+            "feedback.time.time", side_effect=(100.05, 100.26)
+        ):
             hinted = watch_files.next_triggered_batch(
                 changes,
                 0.03,

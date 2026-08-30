@@ -59,6 +59,22 @@ def privacy_config(
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_watcher_rejects_debounce_shorter_than_agent_quiet_window(self) -> None:
+        with (
+            mock.patch("watch_files.validate_runtime") as runtime_validation,
+            self.assertRaisesRegex(
+                SystemExit,
+                "--debounce must not be shorter than --agent-edit-quiet",
+            ),
+        ):
+            watch_files.main([
+                ".",
+                "--debounce", "0.1",
+                "--agent-edit-quiet", "0.25",
+            ])
+
+        runtime_validation.assert_not_called()
+
     def test_watcher_rejects_incomplete_benchmark_approval_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
