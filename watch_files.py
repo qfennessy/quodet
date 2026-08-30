@@ -24,6 +24,7 @@ from feedback import (
     CompositeSink,
     ConsoleSink,
     FeedbackSink,
+    FlushHint,
     MAX_PROVIDER_OUTPUT_BYTES,
     MAX_REVIEWED_FILES,
     ReviewBatch,
@@ -710,6 +711,9 @@ def review_files(
     feedback_round: int = 1,
     debounce_ms: float = 0.0,
     first_observed_at: float | None = None,
+    batch_flushed_at: float | None = None,
+    review_coordinator: SpoolSink | None = None,
+    agent_session_id: str | None = None,
 ) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
@@ -750,41 +754,93 @@ def review_files(
             log=log,
             reasoning_effort=reasoning_effort,
         )
-
-        provider_started = time.monotonic()
-        try:
-            result = run_bounded_command(
-                command,
-                cwd=root,
-                timeout=review_timeout,
-                output_limit=MAX_PROVIDER_OUTPUT_BYTES,
+        marker = (
+            review_coordinator.begin_review(
+                agent_session_id=agent_session_id,
+                review_timeout=review_timeout,
             )
-        except subprocess.TimeoutExpired as error:
-            if evaluation_events:
-                print(json.dumps({"quodet_evaluation_event": {
-                    "status": "timeout",
-                    "returncode": None,
-                    "raw_response": _subprocess_output_text(error.stdout),
-                    "stderr": _subprocess_output_text(error.stderr),
-                }}), flush=True)
-            else:
-                print(
-                    f"llm review timed out after {review_timeout:g} seconds",
-                    file=sys.stderr,
+            if review_coordinator is not None
+            else None
+        )
+        try:
+            return _execute_review_command(
+                command,
+                snapshots=snapshots,
+                root=root,
+                review_timeout=review_timeout,
+                evaluation_events=evaluation_events,
+                sink=sink,
+                session_id=session_id,
+                feedback_round=feedback_round,
+                debounce_ms=debounce_ms,
+                first_observed_at=first_observed_at,
+                batch_flushed_at=batch_flushed_at,
+            )
+        finally:
+            if review_coordinator is not None:
+                review_coordinator.retire_reviewed_flush_hints(
+                    tuple(
+                        ReviewedFile(
+                            snapshot.relative_path.as_posix(),
+                            snapshot.sha256,
+                            snapshot.size,
+                        )
+                        for snapshot in snapshots
+                    )
                 )
-            return None
-        except OSError as error:
-            if evaluation_events:
-                print(json.dumps({"quodet_evaluation_event": {
-                    "status": "provider-error",
-                    "returncode": None,
-                    "raw_response": None,
-                    "stderr": str(error),
-                }}), flush=True)
-            else:
-                print(f"Could not run llm: {error}", file=sys.stderr)
-            return None
-        provider_ms = (time.monotonic() - provider_started) * 1_000
+                review_coordinator.finish_review(marker)
+
+
+def _execute_review_command(
+    command: Sequence[str],
+    *,
+    snapshots: Sequence[SourceSnapshot],
+    root: Path,
+    review_timeout: float,
+    evaluation_events: bool,
+    sink: FeedbackSink | None,
+    session_id: str | None,
+    feedback_round: int,
+    debounce_ms: float,
+    first_observed_at: float | None,
+    batch_flushed_at: float | None,
+) -> ReviewBatch | None:
+    provider_started_at = time.time()
+    provider_started = time.monotonic()
+    try:
+        result = run_bounded_command(
+            command,
+            cwd=root,
+            timeout=review_timeout,
+            output_limit=MAX_PROVIDER_OUTPUT_BYTES,
+        )
+    except subprocess.TimeoutExpired as error:
+        if evaluation_events:
+            print(json.dumps({"quodet_evaluation_event": {
+                "status": "timeout",
+                "returncode": None,
+                "raw_response": _subprocess_output_text(error.stdout),
+                "stderr": _subprocess_output_text(error.stderr),
+            }}), flush=True)
+        else:
+            print(
+                f"llm review timed out after {review_timeout:g} seconds",
+                file=sys.stderr,
+            )
+        return None
+    except OSError as error:
+        if evaluation_events:
+            print(json.dumps({"quodet_evaluation_event": {
+                "status": "provider-error",
+                "returncode": None,
+                "raw_response": None,
+                "stderr": str(error),
+            }}), flush=True)
+        else:
+            print(f"Could not run llm: {error}", file=sys.stderr)
+        return None
+    provider_completed_at = time.time()
+    provider_ms = (time.monotonic() - provider_started) * 1_000
 
     if result.output_exceeded:
         diagnostic = (
@@ -834,6 +890,9 @@ def review_files(
             debounce_ms=debounce_ms,
             provider_ms=provider_ms,
             first_observed_at=first_observed_at,
+            batch_flushed_at=batch_flushed_at,
+            provider_started_at=provider_started_at,
+            provider_completed_at=provider_completed_at,
         )
     except ReviewValidationError as error:
         print(f"Rejected invalid llm response: {error}", file=sys.stderr)
@@ -901,18 +960,51 @@ class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
 
 def next_batch(changes: queue.Queue[Path], debounce: float) -> set[Path]:
     """Block for one change, then collect changes until the quiet period expires."""
+    return next_triggered_batch(changes, debounce).paths
+
+
+@dataclass(frozen=True)
+class TriggeredBatch:
+    paths: set[Path]
+    flush_hint: FlushHint | None
+
+
+def next_triggered_batch(
+    changes: queue.Queue[Path],
+    debounce: float,
+    *,
+    hint_source: SpoolSink | None = None,
+) -> TriggeredBatch:
+    """Collect a quiet-window batch, or flush it at an authenticated edit hint."""
     batch = {changes.get()}
     deadline = time.monotonic() + debounce
 
     while True:
+        hint = (
+            hint_source.consume_flush_hint(tuple(batch))
+            if hint_source is not None
+            else None
+        )
+        if hint is not None:
+            batch.update(
+                hint_source.root / Path(item.path)
+                for item in hint.reviewed_files
+            )
+            while True:
+                try:
+                    batch.add(changes.get_nowait())
+                except queue.Empty:
+                    return TriggeredBatch(batch, hint)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return batch
+            return TriggeredBatch(batch, None)
         try:
-            batch.add(changes.get(timeout=remaining))
+            wait = min(remaining, 0.025) if hint_source is not None else remaining
+            batch.add(changes.get(timeout=wait))
             deadline = time.monotonic() + debounce
         except queue.Empty:
-            return batch
+            if hint_source is None:
+                return TriggeredBatch(batch, None)
 
 
 def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
@@ -1009,32 +1101,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Model: {args.model}; debounce: {args.debounce:g}s")
     try:
         while True:
-            event_batch = next_batch(changes, args.debounce)
+            triggered = next_triggered_batch(
+                changes,
+                args.debounce,
+                hint_source=spool_sink,
+            )
+            event_batch = triggered.paths
+            batch_flushed_at = time.time()
             with observed_at_lock:
                 first_observed_at = min(
                     (observed_at.pop(path, time.time()) for path in event_batch),
                     default=time.time(),
                 )
             measured_debounce_ms = max(0.0, (time.time() - first_observed_at) * 1_000)
-            for review_batch in bounded_review_batches(event_batch):
-                review_files(
-                    review_batch,
-                    root=root,
-                    exclude_patterns=args.exclude,
-                    max_bytes=args.max_bytes,
-                    model=args.model,
-                    prompt=args.prompt,
-                    log=args.log,
+            marker = (
+                spool_sink.begin_review(
+                    agent_session_id=triggered.flush_hint.agent_session_id,
                     review_timeout=args.review_timeout,
-                    reasoning_effort=resolve_reasoning_effort(
-                        args.model, args.reasoning_effort
-                    ),
-                    evaluation_events=args.evaluation_events,
-                    sink=sink,
-                    session_id=args.session_id,
-                    debounce_ms=measured_debounce_ms,
-                    first_observed_at=first_observed_at,
+                    flush_hint=triggered.flush_hint,
                 )
+                if spool_sink is not None and triggered.flush_hint is not None
+                else None
+            )
+            try:
+                for review_batch in bounded_review_batches(event_batch):
+                    review_files(
+                        review_batch,
+                        root=root,
+                        exclude_patterns=args.exclude,
+                        max_bytes=args.max_bytes,
+                        model=args.model,
+                        prompt=args.prompt,
+                        log=args.log,
+                        review_timeout=args.review_timeout,
+                        reasoning_effort=resolve_reasoning_effort(
+                            args.model, args.reasoning_effort
+                        ),
+                        evaluation_events=args.evaluation_events,
+                        sink=sink,
+                        session_id=args.session_id,
+                        debounce_ms=measured_debounce_ms,
+                        first_observed_at=first_observed_at,
+                        batch_flushed_at=batch_flushed_at,
+                        review_coordinator=spool_sink,
+                    )
+            finally:
+                if spool_sink is not None:
+                    spool_sink.finish_review(marker)
     except KeyboardInterrupt:
         print("\nStopping watcher.")
     finally:
