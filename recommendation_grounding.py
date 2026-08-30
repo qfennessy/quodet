@@ -42,7 +42,21 @@ _SPEC_SYMBOL = re.compile(
 )
 _SPEC_TEST_CONTEXT = re.compile(
     r"\brspec\b|\bspecs?\s+"
-    r"(?:suite|tests?|cases?|folders?|director(?:y|ies))\b",
+    r"(?:suite|tests?|cases?|folders?|director(?:y|ies))\b|"
+    r"\bspecs?/(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
+_NEGATED_TEST_REFERENCE_PREFIX = re.compile(
+    r"(?:\bwithout\s+(?:changing|editing|modifying|updating|touching)\s+"
+    r"[A-Za-z0-9_]+\s+in\s+(?:the\s+)?|"
+    r"\bwithout\s+(?:(?:changing|editing|modifying|updating|touching)\s+)?|"
+    r"\b(?:do|does|did)\s+not\s+"
+    r"(?:change|edit|modify|update|touch)\s+"
+    r"[A-Za-z0-9_]+\s+in\s+(?:the\s+)?|"
+    r"\b(?:do|does|did)\s+not\s+"
+    r"(?:(?:change|edit|modify|update|touch)\s+)?|"
+    r"\bdon't\s+(?:(?:change|edit|modify|update|touch)\s+)?|"
+    r"\bnever\s+(?:(?:change|edit|modify|update|touch)\s+)?)$",
     re.IGNORECASE,
 )
 _MUTATION_VERB = re.compile(
@@ -99,6 +113,10 @@ def extract_test_symbols(sources: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted(matches))
 
 
+def _reference_is_negated(clause: str, reference_start: int) -> bool:
+    return _NEGATED_TEST_REFERENCE_PREFIX.search(clause[:reference_start]) is not None
+
+
 def _mutates_unsupplied_test(
     clause: str, *, supplied_test_symbols: set[str]
 ) -> bool:
@@ -107,19 +125,32 @@ def _mutates_unsupplied_test(
         match.group(0)
         for match in _TEST_SYMBOL.finditer(clause)
         if match.group(0) in supplied_test_symbols
+        and not _reference_is_negated(clause, match.start())
     }
     proposed_path_spans = [
         (match.start(), match.end())
         for match in _TEST_PATH.finditer(clause)
         if _path_is_proposed(clause, match.start())
     ]
-    test_matches = list(_TEST_WORD.finditer(clause))
+    test_matches = [
+        match
+        for match in _TEST_WORD.finditer(clause)
+        if not _reference_is_negated(clause, match.start())
+    ]
     visible_spec_symbol = any(
         _SPEC_SYMBOL.fullmatch(symbol) is not None
         for symbol in visible_clause_symbols
     )
-    if test_matches or visible_spec_symbol or _SPEC_TEST_CONTEXT.search(clause):
-        test_matches.extend(_SPEC_SYMBOL.finditer(clause))
+    has_spec_context = any(
+        not _reference_is_negated(clause, match.start())
+        for match in _SPEC_TEST_CONTEXT.finditer(clause)
+    )
+    if test_matches or visible_spec_symbol or has_spec_context:
+        test_matches.extend(
+            match
+            for match in _SPEC_SYMBOL.finditer(clause)
+            if not _reference_is_negated(clause, match.start())
+        )
         test_matches.sort(key=lambda match: match.start())
     for test_match in test_matches:
         if test_match.group(0) in supplied_test_symbols:
