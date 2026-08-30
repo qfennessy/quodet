@@ -159,6 +159,19 @@ class FeedbackTests(unittest.TestCase):
             raw["findings"][0]["suggested_fix"],
         )
 
+        raw["findings"][0]["suggested_fix"] = (
+            "Preserve the existing cache regression test."
+        )
+        with self.assertRaisesRegex(
+            ReviewValidationError, "unsupported-existing-test-claim"
+        ):
+            parse_review_output(
+                json.dumps(raw),
+                root=self.root,
+                reviewed_files=reviewed,
+                session_id="agent-a",
+            )
+
     def test_parse_rejects_malformed_unexpected_traversal_and_oversized(self) -> None:
         cases = [
             "not json",

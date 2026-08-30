@@ -96,6 +96,33 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
             "unsupplied-test-path",
         )
 
+    def test_rspec_path_is_recognized_as_supplied_test_evidence(self) -> None:
+        result = scoring.evaluate_recommendation(
+            "Extend the test in spec/cache_spec.rb with an expired entry.",
+            supplied_files=["cache.rb", "spec/cache_spec.rb"],
+        )
+
+        self.assertEqual(result["status"], "grounded")
+        self.assertEqual(result["supplied_test_files"], ["spec/cache_spec.rb"])
+
+    def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
+        for recommendation in (
+            "Preserve the existing cache regression test.",
+            "Extend the cache regression test.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["cache.py", "tests/test_auth.py"],
+                )
+                self.assertEqual(result["status"], "failure")
+
+        named = scoring.evaluate_recommendation(
+            "Extend tests/test_auth.py with another unauthorized request.",
+            supplied_files=["cache.py", "tests/test_auth.py"],
+        )
+        self.assertEqual(named["status"], "grounded")
+
     def _case(self, case_id: str) -> dict[str, object]:
         return next(case for case in self.fixture["cases"] if case["id"] == case_id)
 

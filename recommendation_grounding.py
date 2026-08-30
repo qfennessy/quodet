@@ -9,7 +9,7 @@ from typing import Sequence
 
 _TEST_PATH = re.compile(
     r"(?<![A-Za-z0-9_.-])((?:[A-Za-z0-9_.-]+/)*(?:test_[A-Za-z0-9_.-]+|"
-    r"[A-Za-z0-9_.-]+_test|[A-Za-z0-9_.-]+\.(?:spec|test))\."
+    r"[A-Za-z0-9_.-]+_(?:test|spec)|[A-Za-z0-9_.-]+\.(?:spec|test))\."
     r"(?:py|js|jsx|ts|tsx|rb|go|rs|java|kt))(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
@@ -49,8 +49,13 @@ def is_test_file(path: str) -> bool:
     return (
         "test" in parts
         or "tests" in parts
+        or "spec" in parts
+        or "specs" in parts
         or name.startswith("test_")
-        or any(marker in name for marker in ("_test.", ".test.", ".spec."))
+        or any(
+            marker in name
+            for marker in ("_test.", "_spec.", ".test.", ".spec.")
+        )
     )
 
 
@@ -84,40 +89,62 @@ def evaluate_recommendation(
     supplied_tests = sorted(path for path in normalized_files if is_test_file(path))
     violations: list[dict[str, str]] = []
     clauses = _clauses(recommendation)
+    path_references = [
+        (
+            clause_index,
+            clause,
+            path_match.group(1).replace("\\", "/"),
+            _path_is_proposed(clause, path_match.start()),
+        )
+        for clause_index, clause in enumerate(clauses)
+        for path_match in _TEST_PATH.finditer(clause)
+    ]
+    supplied_references = {
+        path
+        for _, _, path, _ in path_references
+        if path in supplied_tests
+    }
 
-    if not supplied_tests:
-        if _EXISTING_TEST_CLAIM.search(recommendation):
-            violations.append(
-                {
-                    "code": "unsupported-existing-test-claim",
-                    "message": "recommendation claims a test exists but no test was supplied",
-                }
-            )
-        elif any(_mutates_unsupplied_test(clause) for clause in clauses):
-            violations.append(
-                {
-                    "code": "unsupported-test-mutation",
-                    "message": "recommendation changes a test but no test was supplied",
-                }
-            )
+    if _EXISTING_TEST_CLAIM.search(recommendation) and not supplied_references:
+        violations.append(
+            {
+                "code": "unsupported-existing-test-claim",
+                "message": (
+                    "recommendation claims a test exists without naming a "
+                    "supplied test path"
+                ),
+            }
+        )
+    elif any(
+        _mutates_unsupplied_test(clause)
+        and not any(
+            reference_clause_index == clause_index and path in supplied_tests
+            for reference_clause_index, _, path, _ in path_references
+        )
+        for clause_index, clause in enumerate(clauses)
+    ):
+        violations.append(
+            {
+                "code": "unsupported-test-mutation",
+                "message": (
+                    "recommendation changes a test without naming a supplied "
+                    "test path"
+                ),
+            }
+        )
 
     seen_paths: set[str] = set()
-    for clause in clauses:
-        for path_match in _TEST_PATH.finditer(clause):
-            normalized = path_match.group(1).replace("\\", "/")
-            if normalized in seen_paths:
-                continue
-            seen_paths.add(normalized)
-            if (
-                normalized not in normalized_files
-                and not _path_is_proposed(clause, path_match.start())
-            ):
-                violations.append(
-                    {
-                        "code": "unsupplied-test-path",
-                        "message": f"recommendation names unsupplied test path {normalized}",
-                    }
-                )
+    for _, _, normalized, is_proposed in path_references:
+        if normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        if normalized not in normalized_files and not is_proposed:
+            violations.append(
+                {
+                    "code": "unsupplied-test-path",
+                    "message": f"recommendation names unsupplied test path {normalized}",
+                }
+            )
 
     return {
         "status": "grounded" if not violations else "failure",
