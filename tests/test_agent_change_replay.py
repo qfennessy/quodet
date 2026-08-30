@@ -171,9 +171,14 @@ class AgentChangeReplayTests(unittest.TestCase):
         configuration = live_eval.evaluation_configuration(
             model="test-model", reasoning_effort="high", prompt="frozen prompt",
             fixture_revision=manifest["version"], cases=cases,
+            debounce_seconds=3.0, inter_file_delay_seconds=0.25,
         )
         self.assertEqual(configuration["model"], "test-model")
         self.assertEqual(configuration["model_options"], {"reasoning_effort": "high"})
+        self.assertEqual(configuration["batching"], {
+            "debounce_seconds": 3.0,
+            "inter_file_delay_seconds": 0.25,
+        })
         self.assertEqual(configuration["prompt"]["text"], "frozen prompt")
         self.assertEqual(
             configuration["prompt"]["sha256"],
@@ -573,6 +578,8 @@ class AgentChangeReplayTests(unittest.TestCase):
             prompt=watch_files.DEFAULT_PROMPT,
             fixture_revision=3,
             cases=[],
+            debounce_seconds=3.0,
+            inter_file_delay_seconds=0.25,
             model_run_config=config,
             benchmark_plan=plan,
             runtime_attestation={

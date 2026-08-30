@@ -25,6 +25,8 @@ IDENTITY_REQUIRED_PATHS = (
     ("format_version",),
     ("model", "requested_identifier"), ("model", "revision"),
     ("options", "evaluation"), ("options", "runtime"),
+    ("batching", "debounce_seconds"),
+    ("batching", "inter_file_delay_seconds"),
     ("execution", "context_limit"),
     ("execution", "timeout_seconds"),
     ("execution", "max_output_bytes"),
@@ -81,6 +83,9 @@ def calibration_identity(configuration: Mapping[str, Any]) -> dict[str, Any]:
     prompt = _require_mapping(configuration.get("prompt"), "configuration.prompt")
     schema = _require_mapping(configuration.get("schema"), "configuration.schema")
     fixture = _require_mapping(configuration.get("fixture"), "configuration.fixture")
+    batching = _require_mapping(
+        configuration.get("batching"), "configuration.batching"
+    )
     benchmark = configuration.get("benchmark")
     model_config: Mapping[str, Any] = {}
     candidate_id = None
@@ -111,6 +116,12 @@ def calibration_identity(configuration: Mapping[str, Any]) -> dict[str, Any]:
         "options": {
             "evaluation": configuration.get("model_options"),
             "runtime": model_config.get("model_options"),
+        },
+        "batching": {
+            "debounce_seconds": batching.get("debounce_seconds"),
+            "inter_file_delay_seconds": batching.get(
+                "inter_file_delay_seconds"
+            ),
         },
         "execution": {
             "context_limit": model_config.get("context_limit"),
@@ -165,6 +176,40 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
             "calibration identity is missing required fields: "
             + ", ".join(structurally_missing)
         )
+    for path, allow_zero in (
+        (("batching", "debounce_seconds"), False),
+        (("batching", "inter_file_delay_seconds"), True),
+        (("execution", "context_limit"), False),
+        (("execution", "timeout_seconds"), False),
+        (("execution", "max_output_bytes"), False),
+        (("execution", "max_output_tokens"), False),
+    ):
+        value: Any = identity
+        for part in path:
+            value = value[part]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (not allow_zero and value == 0)
+        ):
+            raise ValueError(
+                f"calibration identity {'.'.join(path)} is not a valid limit"
+            )
+    output_option = identity["execution"]["max_output_tokens_option"]
+    if output_option is not None and (
+        not isinstance(output_option, str) or not output_option.strip()
+    ):
+        raise ValueError(
+            "calibration identity execution.max_output_tokens_option is invalid"
+        )
+    for option_source in ("evaluation", "runtime"):
+        options = identity["options"][option_source]
+        if options is not None and not isinstance(options, Mapping):
+            raise ValueError(
+                f"calibration identity options.{option_source} must be an object"
+            )
     for path in (
         ("prompt", "sha256"), ("schema", "sha256"),
         ("fixture", "manifest_sha256"),

@@ -67,6 +67,7 @@ def manifest_sha256() -> str:
 def evaluation_configuration(
     *, model: str, reasoning_effort: str | None, prompt: str,
     fixture_revision: int, cases: Sequence[dict[str, Any]],
+    debounce_seconds: float, inter_file_delay_seconds: float,
     model_run_config: ModelRunConfig | None = None,
     benchmark_plan: dict[str, Any] | None = None,
     maximum_authorized_cost_usd: float | None = None,
@@ -76,6 +77,10 @@ def evaluation_configuration(
     configuration = {
         "model": model,
         "model_options": {"reasoning_effort": reasoning_effort},
+        "batching": {
+            "debounce_seconds": debounce_seconds,
+            "inter_file_delay_seconds": inter_file_delay_seconds,
+        },
         "prompt": {
             "revision": watch_files.PROMPT_REVISION,
             "sha256": sha256_text(prompt),
@@ -588,6 +593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         prompt=watch_files.DEFAULT_PROMPT,
         fixture_revision=manifest["version"],
         cases=cases,
+        debounce_seconds=args.debounce,
+        inter_file_delay_seconds=args.inter_file_delay,
         model_run_config=model_run_config,
         benchmark_plan=benchmark_plan,
         maximum_authorized_cost_usd=maximum_authorized_cost,

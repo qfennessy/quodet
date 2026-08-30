@@ -68,6 +68,10 @@ def scored_run(
         "configuration": {
             "model": model,
             "model_options": {"reasoning_effort": reasoning_effort},
+            "batching": {
+                "debounce_seconds": 3.0,
+                "inter_file_delay_seconds": 0.25,
+            },
             "prompt": {"revision": "prompt-v1", "sha256": prompt_sha256},
             "schema": {"revision": "schema-v1", "sha256": schema_sha256},
             "fixture": {
@@ -325,6 +329,12 @@ class ConfidenceCalibrationTests(unittest.TestCase):
             "options.evaluation.reasoning_effort": lambda run: run[
                 "configuration"
             ]["model_options"].__setitem__("reasoning_effort", "medium"),
+            "batching.debounce_seconds": lambda run: run["configuration"][
+                "batching"
+            ].__setitem__("debounce_seconds", 1.0),
+            "batching.inter_file_delay_seconds": lambda run: run[
+                "configuration"
+            ]["batching"].__setitem__("inter_file_delay_seconds", 4.0),
             "execution.context_limit": lambda run: run["configuration"][
                 "benchmark"
             ]["model_run_config"].__setitem__("context_limit", 90_000),
@@ -406,6 +416,12 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         resign(malformed)
         with self.assertRaisesRegex(ValueError, "not a SHA-256"):
             calibration.calibration_report(run, malformed)
+
+        malformed_limit = copy.deepcopy(artifact)
+        malformed_limit["identity"]["batching"]["debounce_seconds"] = "fast"
+        resign(malformed_limit)
+        with self.assertRaisesRegex(ValueError, "not a valid limit"):
+            calibration.calibration_report(run, malformed_limit)
 
     def test_tampered_artifact_is_rejected(self) -> None:
         run = scored_run([
