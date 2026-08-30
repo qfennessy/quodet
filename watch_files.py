@@ -1280,26 +1280,21 @@ def next_triggered_batch(
     suppressed_paths: set[Path] = set()
 
     def materialize_hint(hint: FlushHint, batch: set[Path]) -> TriggeredBatch:
-        if suppression is not None:
-            suppression.record(hint)
-            hinted_paths = {
-                hint_source.root / Path(item.path)  # type: ignore[union-attr]
-                for item in hint.reviewed_files
-            }
-            suppressed_paths.update(batch & hinted_paths)
-        batch.update(
+        hinted_paths = {
             hint_source.root / Path(item.path)  # type: ignore[union-attr]
             for item in hint.reviewed_files
+        }
+        deferred_paths = batch - hinted_paths
+        for path in sorted(deferred_paths):
+            changes.put(path)
+        if suppression is not None:
+            suppression.record(hint)
+            suppressed_paths.update(batch & hinted_paths)
+        return TriggeredBatch(
+            hinted_paths,
+            hint,
+            suppressed_paths,
         )
-        while True:
-            try:
-                path = changes.get_nowait()
-                if suppression is not None and suppression.matches(path):
-                    suppressed_paths.add(path)
-                else:
-                    batch.add(path)
-            except queue.Empty:
-                return TriggeredBatch(batch, hint, suppressed_paths)
 
     while True:
         if hint_source is not None:

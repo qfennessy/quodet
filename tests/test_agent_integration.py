@@ -881,6 +881,58 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertIsNone(triggered.flush_hint)
         self.assertEqual(triggered.paths, {self.source})
 
+    def test_ready_hint_does_not_drain_unrelated_queued_watch_event(self) -> None:
+        route, _ = self._route()
+        codex_feedback_hook.verify_session_lease(
+            self.spool,
+            root=self.root,
+            configured_session_id=route.session_id,
+            codex_session_id="live-agent-session",
+        )
+        sink = SpoolSink(self.spool, root=self.root, session_id=route.session_id)
+        self.addCleanup(sink.close)
+        with mock.patch("feedback.time.time", return_value=100.0):
+            publish_flush_hint(
+                self.spool,
+                root=self.root,
+                session_id=route.session_id,
+                agent_session_id="live-agent-session",
+                reviewed_files=self._batch(route).reviewed_files,
+            )
+        unrelated = self.root / "src" / "shell_generated.py"
+        unrelated.write_text("value = 2\n", encoding="utf-8")
+        changes: queue.Queue[Path] = queue.Queue()
+        changes.put(unrelated)
+
+        with mock.patch("feedback.time.time", return_value=100.26):
+            hinted = watch_files.next_triggered_batch(
+                changes,
+                0.03,
+                hint_source=sink,
+                agent_edit_quiet=0.25,
+                agent_edit_max_age=1.0,
+            )
+
+        self.assertEqual(hinted.paths, {self.source})
+        self.assertIsNotNone(hinted.flush_hint)
+        marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=hinted.flush_hint,
+        )
+        sink.finish_review(marker)
+        started = time.monotonic()
+        filesystem = watch_files.next_triggered_batch(
+            changes,
+            0.03,
+            hint_source=sink,
+            agent_edit_quiet=0.01,
+            agent_edit_max_age=0.02,
+        )
+        self.assertGreaterEqual(time.monotonic() - started, 0.02)
+        self.assertEqual(filesystem.paths, {unrelated})
+        self.assertIsNone(filesystem.flush_hint)
+
     def test_duplicate_hint_event_preserves_original_observation_timing(self) -> None:
         route, _ = self._route()
         codex_feedback_hook.verify_session_lease(
