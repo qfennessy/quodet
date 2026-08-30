@@ -37,6 +37,7 @@ OLLAMA_LOCAL_BLOB = re.compile(
 )
 WATCHER_PATH = REPOSITORY_ROOT / "watch_files.py"
 DEFAULT_RESULTS_DIRECTORY = REPOSITORY_ROOT / "eval-results"
+MAX_RUNTIME_ATTESTATION_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class ProviderOutcome:
     effective_config: dict[str, Any] | None = None
     model_latency_ms: int | None = None
     model_attempt_count: int | None = None
+    runtime_attestation: dict[str, Any] | None = None
+    model_attempted: bool | None = None
 
 
 def sha256_text(value: str) -> str:
@@ -120,7 +123,10 @@ def evaluation_configuration(
 def _model_result_fields(event: dict[str, Any]) -> dict[str, Any]:
     result = event.get("model_run_result")
     if not isinstance(result, dict):
-        return {}
+        return {
+            "runtime_attestation": event.get("runtime_attestation"),
+            "model_attempted": event.get("model_attempted"),
+        }
     return {
         "input_tokens": result.get("input_tokens"),
         "output_tokens": result.get("output_tokens"),
@@ -130,6 +136,8 @@ def _model_result_fields(event: dict[str, Any]) -> dict[str, Any]:
         "effective_config": result.get("effective_config"),
         "model_latency_ms": result.get("latency_ms"),
         "model_attempt_count": result.get("attempt_count"),
+        "runtime_attestation": event.get("runtime_attestation"),
+        "model_attempted": True,
     }
 
 
@@ -230,6 +238,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                 "timeout", round((time.monotonic() - started) * 1000),
                 "".join(transcript), "".join(raw_lines) or None, None,
                 f"timed out waiting for {phase}",
+                model_attempted=review_started,
             )
 
         print(line, end="", flush=True)
@@ -340,6 +349,8 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         "effective_model_config": provider.effective_config,
         "model_latency_ms": provider.model_latency_ms,
         "model_attempt_count": provider.model_attempt_count,
+        "runtime_attestation": provider.runtime_attestation,
+        "model_attempted": provider.model_attempted,
         "diagnostics": {
             "expected_files": expected_files,
             "reported_files": reported_files,
@@ -432,15 +443,27 @@ def benchmark_cost_preflight(
 
 
 def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
-    version_result = subprocess.run(
-        ["llm", "--version"], check=False, capture_output=True, text=True,
+    deadline = time.monotonic() + min(
+        MAX_RUNTIME_ATTESTATION_SECONDS, config.timeout_seconds,
     )
-    plugins_result = subprocess.run(
-        ["llm", "plugins"], check=False, capture_output=True, text=True,
-    )
-    models_result = subprocess.run(
-        ["llm", "models", "list"], check=False, capture_output=True, text=True,
-    )
+
+    def run_attestation_command(
+        command: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("runtime attestation timed out")
+        try:
+            return subprocess.run(
+                command, check=False, capture_output=True, text=True,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("runtime attestation timed out") from error
+
+    version_result = run_attestation_command(["llm", "--version"])
+    plugins_result = run_attestation_command(["llm", "plugins"])
+    models_result = run_attestation_command(["llm", "models", "list"])
     if any(
         result.returncode != 0
         for result in (version_result, plugins_result, models_result)
@@ -495,11 +518,8 @@ def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
                 "local llm alias does not resolve to the configured non-cloud "
                 "runtime_model_id"
             )
-        model_result = subprocess.run(
+        model_result = run_attestation_command(
             ["ollama", "show", "--modelfile", runtime_model_id],
-            check=False,
-            capture_output=True,
-            text=True,
         )
         if model_result.returncode != 0:
             raise ValueError("could not attest the configured Ollama model")

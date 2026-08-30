@@ -366,7 +366,10 @@ invocation only and never implements its own fallback. At run time it also
 requires the declared plugin name/version to match `llm plugins`, requires an
 exact model ID or alias match from `llm models list`, and retains that registry
 entry plus the installed `llm` version in the raw artifact. This attests the
-installed adapter, not the adapter's internal network behavior; use a
+installed adapter. The watcher repeats the full plugin/model/blob attestation
+immediately before every benchmark attempt and retains it with that case, so a
+runtime changed after parent startup cannot serve inference under stale
+provenance. This does not attest the adapter's internal network behavior; use a
 no-egress runtime sandbox when that behavior is not independently trusted.
 
 Do not describe a hosted endpoint as local merely because its weights have a
