@@ -549,7 +549,7 @@ class WatchFilesTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
-                watch_files.review_files(
+                batch = watch_files.review_files(
                     [source],
                     root=root,
                     exclude_patterns=[],
@@ -565,6 +565,12 @@ class WatchFilesTests(unittest.TestCase):
             document = json.loads(stdout.getvalue())
             self.assertEqual(document["schema_version"], "quodet-review-output-v1")
             self.assertEqual(document["findings"], [])
+            self.assertGreaterEqual(
+                document["timing"]["published_at"], document["created_at"]
+            )
+            self.assertIsNotNone(batch)
+            assert batch is not None
+            self.assertEqual(document["timing"]["published_at"], batch.published_at)
             self.assertIn("Reviewing 1 changed file", stderr.getvalue())
             self.assertNotIn("Reviewing", stdout.getvalue())
 

@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -1080,8 +1080,9 @@ def _execute_review_command(
             "Discarded stale finding(s) because source changed during review.",
             file=sys.stderr,
         )
-    (sink or ConsoleSink()).publish(fresh_batch)
-    return fresh_batch
+    published_batch = replace(fresh_batch, published_at=time.time())
+    (sink or ConsoleSink()).publish(published_batch)
+    return published_batch
 
 
 class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
