@@ -979,6 +979,7 @@ class MaterializedPathSuppression:
         self.entries: dict[Path, tuple[str, int, float]] = {}
 
     def record(self, hint: FlushHint) -> None:
+        self.prune()
         expires_at = time.monotonic() + self.ttl_seconds
         for item in hint.reviewed_files:
             self.entries[self.root / item.path] = (
@@ -986,6 +987,14 @@ class MaterializedPathSuppression:
                 item.size,
                 expires_at,
             )
+
+    def prune(self) -> None:
+        now = time.monotonic()
+        self.entries = {
+            path: entry
+            for path, entry in self.entries.items()
+            if entry[2] > now
+        }
 
     def matches(self, path: Path) -> bool:
         canonical = path.resolve(strict=False)
@@ -1209,6 +1218,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         review_coordinator=spool_sink,
                     )
             finally:
+                if triggered.flush_hint is not None:
+                    suppression.record(triggered.flush_hint)
                 if spool_sink is not None:
                     spool_sink.finish_review(marker)
     except KeyboardInterrupt:

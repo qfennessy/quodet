@@ -395,7 +395,7 @@ class AgentIntegrationTests(unittest.TestCase):
         changes: queue.Queue[Path] = queue.Queue()
         changes.put(self.source)
         suppression = watch_files.MaterializedPathSuppression(
-            self.root, ttl_seconds=1.0
+            self.root, ttl_seconds=0.02
         )
 
         triggered = watch_files.next_triggered_batch(
@@ -408,7 +408,9 @@ class AgentIntegrationTests(unittest.TestCase):
             review_timeout=1,
             flush_hint=triggered.flush_hint,
         )
+        time.sleep(0.03)
         sink.finish_review(marker)
+        suppression.record(triggered.flush_hint)  # type: ignore[arg-type]
         third = self.root / "src" / "third.py"
         third.write_text("value = 3\n")
         changes.put(second)
