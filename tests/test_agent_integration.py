@@ -558,12 +558,21 @@ class AgentIntegrationTests(unittest.TestCase):
             with mock.patch("feedback.time.time", return_value=created_at):
                 self.assertIsNone(self._invoke(route, "PostToolUse", event))
 
+        changes: queue.Queue[Path] = queue.Queue()
+        for path in paths:
+            changes.put(path)
         with mock.patch("feedback.time.time", return_value=100.42):
-            hint = sink.consume_flush_hint(
-                quiet_seconds=0.25, max_age_seconds=1.0
+            triggered = watch_files.next_triggered_batch(
+                changes,
+                3.0,
+                hint_source=sink,
+                agent_edit_quiet=0.25,
+                agent_edit_max_age=1.0,
             )
 
+        hint = triggered.flush_hint
         self.assertIsNotNone(hint)
+        self.assertEqual(triggered.paths, set(paths))
         self.assertEqual(
             {item.path for item in hint.reviewed_files},  # type: ignore[union-attr]
             {
