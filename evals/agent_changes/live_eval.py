@@ -118,6 +118,7 @@ def challenge_plan_binding(
 
 def validate_plan_for_cases(
     plan: dict[str, Any], cases: Sequence[dict[str, Any]], attempts: int,
+    *, debounce_seconds: float, inter_file_delay_seconds: float,
 ) -> None:
     """Keep ordinary one-shot comparison and repeated challenge plans disjoint."""
     expected_challenge_binding = challenge_plan_binding(cases)
@@ -138,6 +139,18 @@ def validate_plan_for_cases(
             raise ValueError(
                 "the benchmark plan is not bound to the selected challenge "
                 "fixture bytes, provider payload, and case IDs"
+            )
+        if any(len(case["files"]) > watch_files.MAX_REVIEWED_FILES for case in cases):
+            raise ValueError(
+                "challenge qualification case exceeds one provider review batch"
+            )
+        if (
+            any(len(case["files"]) > 1 for case in cases)
+            and inter_file_delay_seconds >= debounce_seconds
+        ):
+            raise ValueError(
+                "challenge qualification --inter-file-delay must be shorter "
+                "than --debounce so every case reaches one provider batch"
             )
     frozen_attempts = plan["review_contract"]["attempts_per_case"]
     if attempts != frozen_attempts:
@@ -812,7 +825,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             benchmark_plan, model_run_config,
         )
         validate_plan_for_cases(
-            benchmark_plan, cases, getattr(args, "attempts", 1)
+            benchmark_plan,
+            cases,
+            getattr(args, "attempts", 1),
+            debounce_seconds=args.debounce,
+            inter_file_delay_seconds=args.inter_file_delay,
         )
         args.model_run_config_sha256 = model_run_config_sha256(model_run_config)
         args.benchmark_plan_sha256 = benchmark.plan_sha256(benchmark_plan)

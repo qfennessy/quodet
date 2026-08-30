@@ -544,6 +544,10 @@ one attempt per case. Qualification uses a separate
 bytes and exactly three attempts. The runner rejects one- or two-attempt
 qualification plans, a CLI attempt count that differs from the frozen plan, and
 any attempt to use the repeated challenge contract for ordinary fixtures.
+For multi-file qualification cases, `--inter-file-delay` must be strictly less
+than `--debounce`, and a case must fit in one provider review batch. The runner
+rejects unsafe batching before cost preflight, runtime attestation, or provider
+work so an artifact cannot claim the all-files payload hash for a partial batch.
 
 Challenge scoring is stricter than filename matching. A true-positive
 adjudication must separately record the trigger, the complete failure path, and

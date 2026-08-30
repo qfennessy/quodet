@@ -359,18 +359,32 @@ class AgentChangeReplayTests(unittest.TestCase):
             json.loads(json.dumps(ordinary_plan)), challenge_cases
         )
         benchmark.validate_plan(qualification)
-        live_eval.validate_plan_for_cases(qualification, challenge_cases, 3)
+        live_eval.validate_plan_for_cases(
+            qualification, challenge_cases, 3,
+            debounce_seconds=3.0, inter_file_delay_seconds=0.25,
+        )
         with self.assertRaisesRegex(ValueError, "must match the frozen"):
-            live_eval.validate_plan_for_cases(qualification, challenge_cases, 2)
+            live_eval.validate_plan_for_cases(
+                qualification, challenge_cases, 2,
+                debounce_seconds=3.0, inter_file_delay_seconds=0.25,
+            )
         with self.assertRaisesRegex(ValueError, "cannot authorize ordinary"):
             live_eval.validate_plan_for_cases(
-                qualification, replay.load_manifest()["cases"][:1], 3
+                qualification, replay.load_manifest()["cases"][:1], 3,
+                debounce_seconds=3.0, inter_file_delay_seconds=0.25,
             )
         with self.assertRaisesRegex(ValueError, "cannot mix ordinary"):
             live_eval.validate_plan_for_cases(
                 qualification,
                 [*challenge_cases, replay.load_manifest()["cases"][0]],
                 3,
+                debounce_seconds=3.0,
+                inter_file_delay_seconds=0.25,
+            )
+        with self.assertRaisesRegex(ValueError, "must be shorter than --debounce"):
+            live_eval.validate_plan_for_cases(
+                qualification, challenge_cases, 3,
+                debounce_seconds=3.0, inter_file_delay_seconds=3.0,
             )
 
     def test_challenge_plan_digest_and_attempts_are_retained_in_provenance(
@@ -466,6 +480,43 @@ class AgentChangeReplayTests(unittest.TestCase):
                 live_eval.benchmark_cost_preflight(config, cases, attempts=1),
                 40.0,
             )
+
+    def test_unsafe_challenge_batching_fails_before_runtime_work(self) -> None:
+        cases = challenge.model_cases("challenge-development")[:1]
+        plan = bind_challenge_plan(plan_with_approved_qwen_artifact(), cases)
+        config = approved_qwen_config(plan)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plan_path = root / "plan.json"
+            config_path = root / "config.json"
+            artifacts.write_private_json(plan_path, plan)
+            artifacts.write_private_json(config_path, config.to_dict())
+            with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.benchmark_cost_preflight"
+                ) as cost_preflight,
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime"
+                ) as runtime_attestation,
+                mock.patch(
+                    "evals.agent_changes.live_eval.subprocess.Popen"
+                ) as watcher,
+                self.assertRaisesRegex(ValueError, "must be shorter than --debounce"),
+            ):
+                live_eval.main([
+                    cases[0]["id"],
+                    "--attempts", "3",
+                    "--debounce", "3",
+                    "--inter-file-delay", "4",
+                    "--model-run-config", str(config_path),
+                    "--benchmark-plan", str(plan_path),
+                    "--destination", str(root / "replay"),
+                    "--results-directory", str(root / "results"),
+                ])
+
+        cost_preflight.assert_not_called()
+        runtime_attestation.assert_not_called()
+        watcher.assert_not_called()
 
     def test_ordinary_benchmark_plan_cannot_authorize_challenge_bytes(self) -> None:
         plan = plan_with_approved_qwen_artifact()
