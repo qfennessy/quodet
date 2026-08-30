@@ -601,6 +601,67 @@ class WatchFilesTests(unittest.TestCase):
             self.assertNotIn(secret, sanitized)
         self.assertNotIn("private-material", sanitized)
 
+    def test_provider_response_preserves_only_allowlisted_finding_path(self) -> None:
+        provider_path = "qd_case_3f936e457da9/profile_service.py"
+        provider_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        unreviewed_path = "qd_case_123456789abc/unreviewed_service.py"
+        response = json.dumps(
+            {
+                "findings": [
+                    {
+                        "file": provider_path,
+                        "line": 1,
+                        "severity": "high",
+                        "confidence": 0.99,
+                        "title": "Synthetic defect",
+                        "explanation": f"Credential {provider_secret} fails here.",
+                        "suggested_fix": "Change the branch and add a regression test.",
+                    },
+                    {
+                        "file": unreviewed_path,
+                        "line": 1,
+                        "severity": "high",
+                        "confidence": 0.99,
+                        "title": "Unreviewed defect",
+                        "explanation": "Synthetic evidence.",
+                        "suggested_fix": "Change the branch and add a regression test.",
+                    },
+                ]
+            }
+        )
+
+        globally_redacted, _ = watch_files.redact_sensitive_values(response)
+        self.assertNotIn(provider_path, globally_redacted)
+
+        sanitized, count = watch_files.redact_provider_response(
+            response,
+            provider_paths=(provider_path,),
+        )
+        parsed = json.loads(sanitized)
+
+        self.assertEqual(parsed["findings"][0]["file"], provider_path)
+        self.assertNotIn(provider_secret, sanitized)
+        self.assertEqual(
+            parsed["findings"][0]["explanation"],
+            "Credential [REDACTED] fails here.",
+        )
+        self.assertEqual(parsed["findings"][1]["file"], "[REDACTED].py")
+        self.assertGreaterEqual(count, 2)
+
+        batch = watch_files.parse_review_output(
+            json.dumps({"findings": [parsed["findings"][0]]}),
+            root=Path("/tmp").resolve(),
+            reviewed_files=(
+                watch_files.ReviewedFile(
+                    path=provider_path,
+                    sha256="0" * 64,
+                    size=1,
+                ),
+            ),
+            provider_path_map={provider_path: provider_path},
+        )
+        self.assertEqual(batch.findings[0].file, provider_path)
+
     def test_path_redaction_preserves_descriptive_paths_but_removes_keys(self) -> None:
         ordinary = Path("03_cross_file_units/token_service.py")
         secret = Path("src/ghp_abcdefghijklmnopqrstuvwxyz1234567890.py")

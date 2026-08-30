@@ -1102,6 +1102,33 @@ class AgentChangeReplayTests(unittest.TestCase):
                 metrics["by_family"][family], {"tp": 0, "fp": 0, "fn": 0}
             )
 
+    def test_challenge_recall_is_unavailable_with_only_valid_clean_attempts(
+        self,
+    ) -> None:
+        clean = next(
+            case for case in challenge.model_cases("challenge-development")
+            if case["challenge_variant"] == "clean"
+        )
+        outcome = live_eval.case_outcome(
+            clean,
+            live_eval.ProviderOutcome(
+                "schema-valid", 0, "", '{"findings": []}', {"findings": []}, None,
+            ),
+        )
+        adjudication = {
+            "run_id": "run-1",
+            "fixture_revision": 3,
+            "cases": {outcome["sample_id"]: {"findings": []}},
+        }
+
+        metrics = scoring.score_run(raw_run([outcome]), adjudication)
+
+        split_metrics = metrics["split_metrics"]["challenge-development"]
+        self.assertEqual(split_metrics["finding_precision"], 1.0)
+        self.assertIsNone(split_metrics["finding_recall"])
+        self.assertIsNone(metrics["challenge_defect_recall"])
+        self.assertEqual(metrics["challenge_clean_twin_false_positive_rate"], 0.0)
+
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
         self.assertEqual(manifest["version"], 3)
