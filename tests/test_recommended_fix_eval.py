@@ -92,8 +92,8 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         self.assertEqual(proposed["status"], "grounded")
         self.assertEqual(mutation["status"], "failure")
         self.assertEqual(
-            mutation["violations"][0]["code"],
-            "unsupplied-test-path",
+            {violation["code"] for violation in mutation["violations"]},
+            {"unsupported-test-mutation", "unsupplied-test-path"},
         )
 
     def test_rspec_path_is_recognized_as_supplied_test_evidence(self) -> None:
@@ -137,6 +137,23 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
 
         self.assertEqual(visible["status"], "grounded")
         self.assertEqual(unknown["status"], "failure")
+
+    def test_adding_to_unknown_symbol_is_not_creation_of_a_test(self) -> None:
+        created = scoring.evaluate_recommendation(
+            "Add a new regression test named test_expired_entry.",
+            supplied_files=["cache.py"],
+        )
+        mutated = scoring.evaluate_recommendation(
+            "Add an expiry assertion to test_missing_entry.",
+            supplied_files=["cache.py"],
+        )
+
+        self.assertEqual(created["status"], "grounded")
+        self.assertEqual(mutated["status"], "failure")
+        self.assertEqual(
+            mutated["violations"][0]["code"],
+            "unsupported-test-mutation",
+        )
 
     def test_unsupplied_test_symbol_is_rejected(self) -> None:
         result = scoring.evaluate_recommendation(

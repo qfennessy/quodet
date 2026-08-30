@@ -42,6 +42,11 @@ _MUTATION_VERB = re.compile(
 _CREATION_VERB = re.compile(
     r"\b(?:add|create|write|introduce)\b", re.IGNORECASE
 )
+_NEW_TEST_MODIFIERS = re.compile(
+    r"\s*(?:(?:a|an)\s+)?"
+    r"(?:(?:another|focused|integration|narrow|new|regression|unit)\s+)*$",
+    re.IGNORECASE,
+)
 _PROPOSED_PATH_PREFIX = re.compile(
     r"\b(?:add|create|write|introduce)\s+"
     r"(?:(?:a|an)\s+)?(?:new\s+)?"
@@ -88,15 +93,33 @@ def _mutates_unsupplied_test(
     clause: str, *, supplied_test_symbols: set[str]
 ) -> bool:
     """Return whether the nearest intent verb targets a generic test mention."""
+    proposed_path_spans = [
+        (match.start(), match.end())
+        for match in _TEST_PATH.finditer(clause)
+        if _path_is_proposed(clause, match.start())
+    ]
     for test_match in _TEST_WORD.finditer(clause):
         if test_match.group(0) in supplied_test_symbols:
+            continue
+        if any(
+            start <= test_match.start() < end
+            for start, end in proposed_path_spans
+        ):
             continue
         preceding = clause[: test_match.start()]
         intents = [
             *((match.end(), "mutation") for match in _MUTATION_VERB.finditer(preceding)),
             *((match.end(), "creation") for match in _CREATION_VERB.finditer(preceding)),
         ]
-        if intents and max(intents)[1] == "mutation":
+        if not intents:
+            continue
+        intent_end, intent = max(intents)
+        if intent == "mutation":
+            return True
+        if not (
+            _NEW_TEST_MODIFIERS.fullmatch(preceding[intent_end:])
+            or _PROPOSED_PATH_PREFIX.search(preceding)
+        ):
             return True
     return False
 
