@@ -15,6 +15,7 @@ dependencies = ["watchdog>=6,<7"]
 quodet = "watch_files:main"
 quodet-codex-hook = "codex_feedback_hook:main"
 quodet-claude-hook = "codex_feedback_hook:main"
+quodet-agent = "agent_integration:main"
 
 [tool.setuptools]
-py-modules = ["watch_files", "feedback", "codex_feedback_hook"]
+py-modules = ["watch_files", "feedback", "codex_feedback_hook", "agent_integration"]

@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Sequence
 
@@ -25,6 +26,62 @@ from feedback import (
 
 MAX_DELIVERY_FINDINGS = 10
 MAX_DELIVERY_CHARS = 48_000
+MAX_HOOK_INPUT_BYTES = 1_048_576
+
+
+def _record_delivery_metric(
+    directory: Path,
+    *,
+    event: str,
+    event_input: dict[str, object],
+    payload: dict[str, object],
+    response: dict[str, object],
+    started_at: float,
+) -> None:
+    """Record bounded latency/protocol metadata without source or finding text."""
+    metrics = _private_directory(directory.expanduser().resolve(), "metrics")
+    response_bytes = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+    created_at = float(payload["created_at"])
+    first_observed_at = float(payload["first_observed_at"])
+    debounce_ms = float(payload["debounce_ms"])
+    provider_ms = float(payload["provider_ms"])
+    hook_wait_ms = max(0.0, (time.time() - created_at) * 1_000)
+    value = {
+        "version": 1,
+        "root": payload["root"],
+        "session_id": payload["session_id"],
+        "recorded_at": time.time(),
+        "event": event,
+        "input_fields": sorted(event_input),
+        "agent_session_sha256": hashlib.sha256(
+            str(event_input.get("session_id", "")).encode()
+        ).hexdigest(),
+        "tool_name": event_input.get("tool_name"),
+        "stop_hook_active": event_input.get("stop_hook_active"),
+        "response_fields": sorted(response),
+        "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
+        "response_bytes": len(response_bytes),
+        "debounce_ms": debounce_ms,
+        "provider_ms": provider_ms,
+        "hook_wait_ms": hook_wait_ms,
+        "hook_execution_ms": max(0.0, (time.perf_counter() - started_at) * 1_000),
+        "total_edit_to_feedback_ms": max(0.0, (time.time() - first_observed_at) * 1_000),
+    }
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".metric-", dir=metrics)
+    temporary = Path(temporary_name)
+    destination = metrics / f"{time.time_ns()}-{uuid.uuid4()}.json"
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _private_directory(directory: Path, name: str) -> Path:
@@ -173,7 +230,26 @@ def render_feedback_chunk(
     findings = payload.get("findings")
     if not isinstance(findings, list) or not findings:
         return None, []
-    lines = [UNTRUSTED_NOTICE]
+    created_at = payload.get("created_at")
+    debounce_ms = payload.get("debounce_ms")
+    provider_ms = payload.get("provider_ms")
+    if all(isinstance(value, (int, float)) for value in (created_at, debounce_ms, provider_ms)):
+        hook_wait_ms = max(0.0, (time.time() - float(created_at)) * 1_000)
+        first_observed_at = payload.get("first_observed_at")
+        total_ms = (
+            max(0.0, (time.time() - float(first_observed_at)) * 1_000)
+            if isinstance(first_observed_at, (int, float))
+            else float(debounce_ms) + float(provider_ms) + hook_wait_ms
+        )
+        latency_line = (
+            "Latency: watcher debounce "
+            f"{float(debounce_ms):.1f} ms; provider {float(provider_ms):.1f} ms; "
+            f"hook delivery wait {hook_wait_ms:.1f} ms; "
+            f"total edit-to-feedback {total_ms:.1f} ms."
+        )
+        lines = [UNTRUSTED_NOTICE, latency_line]
+    else:
+        lines = [UNTRUSTED_NOTICE]
     delivered = 0
     for index, finding in enumerate(findings):
         if not isinstance(finding, dict):
@@ -211,10 +287,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    hook_started_at = time.perf_counter()
     args = parse_args(argv)
     try:
-        event_input = json.load(sys.stdin)
-    except json.JSONDecodeError:
+        raw_input = sys.stdin.read(MAX_HOOK_INPUT_BYTES + 1)
+        if len(raw_input.encode("utf-8")) > MAX_HOOK_INPUT_BYTES:
+            event_input = {}
+        else:
+            event_input = json.loads(raw_input)
+    except (UnicodeEncodeError, json.JSONDecodeError):
+        event_input = {}
+    if not isinstance(event_input, dict):
         event_input = {}
     event = args.event or event_input.get("hook_event_name")
     if event not in {"PostToolUse", "Stop"}:
@@ -279,6 +362,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         response = {"decision": "block", "reason": message}
     print(json.dumps(response))
     sys.stdout.flush()
+    try:
+        _record_delivery_metric(
+            args.spool_dir,
+            event=event,
+            event_input=event_input,
+            payload=validated,
+            response=response,
+            started_at=hook_started_at,
+        )
+    except OSError as error:
+        print(f"Could not record hook latency: {error}", file=sys.stderr)
     if remaining:
         remainder = validated.copy()
         remainder["findings"] = remaining

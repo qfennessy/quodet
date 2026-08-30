@@ -1,0 +1,13 @@
+{
+  "session_id": "live-agent-session",
+  "prompt_id": "prompt-1",
+  "transcript_path": "/tmp/transcript.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {"file_path": "${ROOT}/src/app.py"},
+  "tool_response": {"success": true},
+  "tool_use_id": "tool-1",
+  "duration_ms": 12
+}

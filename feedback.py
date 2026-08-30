@@ -71,6 +71,9 @@ class ReviewBatch:
     findings: tuple[ReviewFinding, ...]
     session_id: str | None = None
     feedback_round: int = 1
+    debounce_ms: float = 0.0
+    provider_ms: float = 0.0
+    first_observed_at: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -161,6 +164,9 @@ def parse_review_output(
     reviewed_files: Sequence[ReviewedFile],
     session_id: str | None = None,
     feedback_round: int = 1,
+    debounce_ms: float = 0.0,
+    provider_ms: float = 0.0,
+    first_observed_at: float | None = None,
 ) -> ReviewBatch:
     """Parse and strictly validate one provider response."""
     if len(output.encode("utf-8")) > MAX_PROVIDER_OUTPUT_BYTES:
@@ -209,14 +215,21 @@ def parse_review_output(
                 ),
             )
         )
+    created_at = time.time()
+    observed_at = first_observed_at
+    if observed_at is None:
+        observed_at = created_at - (debounce_ms + provider_ms) / 1_000
     return ReviewBatch(
         batch_id=str(uuid.uuid4()),
         root=os.fspath(root),
-        created_at=time.time(),
+        created_at=created_at,
         reviewed_files=tuple(reviewed_files),
         findings=tuple(findings),
         session_id=session_id,
         feedback_round=feedback_round,
+        debounce_ms=debounce_ms,
+        provider_ms=provider_ms,
+        first_observed_at=observed_at,
     )
 
 
@@ -478,6 +491,9 @@ def validate_spooled_payload(
         "findings",
         "session_id",
         "feedback_round",
+        "debounce_ms",
+        "provider_ms",
+        "first_observed_at",
         "notice",
     }
     if set(payload) != expected_fields:
@@ -490,11 +506,25 @@ def validate_spooled_payload(
         raise ReviewValidationError("invalid batch id") from error
     if not isinstance(payload["created_at"], (int, float)):
         raise ReviewValidationError("invalid creation time")
+    if (
+        isinstance(payload["first_observed_at"], bool)
+        or not isinstance(payload["first_observed_at"], (int, float))
+        or not 0 < float(payload["first_observed_at"]) <= float(payload["created_at"])
+    ):
+        raise ReviewValidationError("invalid first observed time")
     feedback_round = payload["feedback_round"]
     if isinstance(feedback_round, bool) or not isinstance(feedback_round, int):
         raise ReviewValidationError("invalid feedback round")
     if not 1 <= feedback_round <= 3 or payload["notice"] != UNTRUSTED_NOTICE:
         raise ReviewValidationError("invalid feedback policy metadata")
+    for field in ("debounce_ms", "provider_ms"):
+        latency = payload[field]
+        if (
+            isinstance(latency, bool)
+            or not isinstance(latency, (int, float))
+            or not 0 <= float(latency) <= 86_400_000
+        ):
+            raise ReviewValidationError(f"invalid {field}")
     raw_reviewed = payload["reviewed_files"]
     if not isinstance(raw_reviewed, list) or len(raw_reviewed) > MAX_REVIEWED_FILES:
         raise ReviewValidationError("invalid reviewed file collection")
@@ -526,6 +556,9 @@ def validate_spooled_payload(
         reviewed_files=reviewed,
         session_id=session_id,
         feedback_round=feedback_round,
+        debounce_ms=float(payload["debounce_ms"]),
+        provider_ms=float(payload["provider_ms"]),
+        first_observed_at=float(payload["first_observed_at"]),
     )
     result = payload.copy()
     result["findings"] = [asdict(item) for item in normalized.findings]

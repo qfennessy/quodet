@@ -1,0 +1,13 @@
+{
+  "session_id": "live-agent-session",
+  "transcript_path": null,
+  "cwd": "${ROOT}",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-test",
+  "permission_mode": "default",
+  "turn_id": "turn-1",
+  "tool_name": "apply_patch",
+  "tool_use_id": "tool-1",
+  "tool_input": {"command": "*** Begin Patch"},
+  "tool_response": "Done"
+}

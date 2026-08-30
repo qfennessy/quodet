@@ -1,0 +1,10 @@
+{
+  "fixture_schema_version": 1,
+  "source_url": "https://code.claude.com/docs/en/hooks",
+  "retrieved_at": "2026-08-30",
+  "agent_version": "2.1.251 (Claude Code)",
+  "provenance": "live-capture",
+  "probe": "non-persistent Claude Code print session using a generated project hook",
+  "observed_result": "The client emitted a successful PostToolUse:Edit hook response and the agent quoted the synthetic finding title.",
+  "provider_inference": "synthetic; not exercised"
+}

@@ -1,0 +1,9 @@
+{
+  "fixture_schema_version": 1,
+  "source_url": "https://learn.chatgpt.com/docs/hooks",
+  "retrieved_at": "2026-08-30",
+  "docs_version": null,
+  "agent_version": null,
+  "provenance": "official-docs",
+  "notes": "Documentation-derived replay; not a live Codex capture."
+}

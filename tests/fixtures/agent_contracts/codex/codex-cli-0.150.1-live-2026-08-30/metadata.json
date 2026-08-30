@@ -1,0 +1,10 @@
+{
+  "fixture_schema_version": 1,
+  "source_url": "https://learn.chatgpt.com/docs/hooks",
+  "retrieved_at": "2026-08-30",
+  "agent_version": "codex-cli 0.150.1",
+  "provenance": "live-capture",
+  "probe": "ephemeral workspace-write codex exec using a generated project hook",
+  "observed_result": "The agent received and quoted the synthetic finding title after apply_patch.",
+  "provider_inference": "synthetic; not exercised"
+}
