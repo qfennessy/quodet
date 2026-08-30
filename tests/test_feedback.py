@@ -168,6 +168,18 @@ class FeedbackTests(unittest.TestCase):
         ConsoleSink(mode="json", stream=buffered_output).publish(batch)
         buffered_output.flush.assert_called_once_with()
 
+        unicode_output = json.loads(valid_output())
+        unicode_output["findings"][0]["title"] = "Incorrect cache scope 😀"
+        ascii_buffer = io.BytesIO()
+        ascii_stream = io.TextIOWrapper(ascii_buffer, encoding="ascii")
+        try:
+            ConsoleSink(mode="human", stream=ascii_stream).publish(
+                self.parse(json.dumps(unicode_output))
+            )
+            self.assertIn(b"\\U0001f600", ascii_buffer.getvalue())
+        finally:
+            ascii_stream.detach()
+
         with self.assertRaisesRegex(ValueError, "unsupported output mode"):
             ConsoleSink(mode="xml")
 
