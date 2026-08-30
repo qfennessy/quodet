@@ -241,10 +241,13 @@ uv run python -m evals.agent_changes.calibration report \
 The report includes raw and calibrated values per finding, reliability buckets
 and empirical correctness by split, thresholded precision and recall, sample
 counts, and raw versus thresholded clean-control false-positive case rates.
-Changing the exact model revision, model or reasoning options, prompt digest,
-schema digest, or fixture revision invalidates the artifact and suppresses all
-calibrated publication decisions. A run that records only a mutable model alias
-without an exact revision remains `uncalibrated`.
+Changing the exact model revision, model or reasoning options, prompt or schema
+digest, fixture revision or any recorded fixture/payload digest, context or
+output limits, timeout, or output-limit option invalidates the artifact and
+suppresses all calibrated publication decisions. These values are bound by one
+versioned canonical calibration-identity digest. Legacy or structurally
+incomplete identity artifacts fail closed. A run that records only a mutable
+model alias without an exact revision remains `uncalibrated`.
 
 Fixture revision 3 adds `26_clean_settled_async_rollback`, the observed
 cancellation false-positive, as a deterministic clean control. Its visible

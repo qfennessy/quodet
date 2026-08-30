@@ -14,12 +14,28 @@ from evals.agent_changes import artifacts, scoring
 
 
 FORMAT_VERSION = 1
+IDENTITY_FORMAT_VERSION = 2
 METHOD = "fixed-bin-empirical-v1"
 DEFAULT_BUCKET_EDGES = (0.0, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0)
 FIT_SPLIT = "calibration"
 DECLARED_NON_FIT_SPLITS = tuple(
     split for split in scoring.EVALUATION_SPLITS if split != FIT_SPLIT
 ) + ("challenge-development", "challenge-holdout")
+IDENTITY_REQUIRED_PATHS = (
+    ("format_version",),
+    ("model", "requested_identifier"), ("model", "revision"),
+    ("options", "evaluation"), ("options", "runtime"),
+    ("execution", "context_limit"),
+    ("execution", "timeout_seconds"),
+    ("execution", "max_output_bytes"),
+    ("execution", "max_output_tokens"),
+    ("execution", "max_output_tokens_option"),
+    ("prompt", "revision"), ("prompt", "sha256"),
+    ("schema", "revision"), ("schema", "sha256"),
+    ("fixture", "revision"), ("fixture", "manifest_sha256"),
+    ("fixture", "fixture_tree_sha256"),
+    ("fixture", "provider_payload_sha256"),
+)
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -61,7 +77,7 @@ def _validate_edges(edges: Sequence[float]) -> tuple[float, ...]:
 
 
 def calibration_identity(configuration: Mapping[str, Any]) -> dict[str, Any]:
-    """Return only fields whose drift invalidates a calibration artifact."""
+    """Return one canonical contract whose drift invalidates calibration."""
     prompt = _require_mapping(configuration.get("prompt"), "configuration.prompt")
     schema = _require_mapping(configuration.get("schema"), "configuration.schema")
     fixture = _require_mapping(configuration.get("fixture"), "configuration.fixture")
@@ -77,20 +93,33 @@ def calibration_identity(configuration: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(hardware, Mapping):
         hardware = {}
     return {
-        "model": configuration.get("model"),
-        "model_revision": model_config.get("model_revision"),
-        "model_artifact": model_config.get("model_artifact"),
-        "provider_model_revision": hardware.get("provider_model_revision"),
-        "runtime_model_id": hardware.get("runtime_model_id"),
-        "runtime_artifact_sha256": hardware.get("runtime_artifact_sha256"),
-        "candidate_id": candidate_id,
-        "provider": model_config.get("provider"),
-        "runtime": model_config.get("runtime"),
-        "runtime_version": model_config.get("runtime_version"),
-        "quantization": model_config.get("quantization"),
-        "model_options": {
+        "format_version": IDENTITY_FORMAT_VERSION,
+        "model": {
+            "requested_identifier": configuration.get("model"),
+            "candidate_id": candidate_id,
+            "artifact": model_config.get("model_artifact"),
+            "revision": model_config.get("model_revision"),
+            "provider_model_revision": hardware.get("provider_model_revision"),
+            "runtime_model_id": hardware.get("runtime_model_id"),
+            "runtime_artifact_sha256": hardware.get("runtime_artifact_sha256"),
+            "provider": model_config.get("provider"),
+            "runtime": model_config.get("runtime"),
+            "runtime_version": model_config.get("runtime_version"),
+            "locality": model_config.get("locality"),
+            "quantization": model_config.get("quantization"),
+        },
+        "options": {
             "evaluation": configuration.get("model_options"),
             "runtime": model_config.get("model_options"),
+        },
+        "execution": {
+            "context_limit": model_config.get("context_limit"),
+            "timeout_seconds": model_config.get("timeout_seconds"),
+            "max_output_bytes": model_config.get("max_output_bytes"),
+            "max_output_tokens": model_config.get("max_output_tokens"),
+            "max_output_tokens_option": model_config.get(
+                "max_output_tokens_option"
+            ),
         },
         "prompt": {
             "revision": prompt.get("revision"),
@@ -100,24 +129,58 @@ def calibration_identity(configuration: Mapping[str, Any]) -> dict[str, Any]:
             "revision": schema.get("revision"),
             "sha256": schema.get("sha256"),
         },
-        "fixture_revision": fixture.get("revision"),
+        "fixture": {
+            "revision": fixture.get("revision"),
+            "manifest_sha256": fixture.get("manifest_sha256"),
+            "fixture_tree_sha256": fixture.get("fixture_tree_sha256"),
+            "provider_payload_sha256": fixture.get("provider_payload_sha256"),
+        },
     }
 
 
 def _identity_missing(identity: Mapping[str, Any]) -> list[str]:
-    required_paths = (
-        ("model",), ("model_revision",), ("prompt", "revision"),
-        ("prompt", "sha256"), ("schema", "revision"),
-        ("schema", "sha256"), ("fixture_revision",),
-    )
     missing: list[str] = []
-    for path in required_paths:
+    for path in IDENTITY_REQUIRED_PATHS:
         value: Any = identity
         for part in path:
             value = value.get(part) if isinstance(value, Mapping) else None
         if value is None or value == "":
             missing.append(".".join(path))
     return missing
+
+
+def _validate_identity(identity: Mapping[str, Any]) -> None:
+    if identity.get("format_version") != IDENTITY_FORMAT_VERSION:
+        raise ValueError("unsupported calibration identity format")
+    structurally_missing: list[str] = []
+    for path in IDENTITY_REQUIRED_PATHS:
+        value: Any = identity
+        for part in path:
+            if not isinstance(value, Mapping) or part not in value:
+                structurally_missing.append(".".join(path))
+                break
+            value = value[part]
+    if structurally_missing:
+        raise ValueError(
+            "calibration identity is missing required fields: "
+            + ", ".join(structurally_missing)
+        )
+    for path in (
+        ("prompt", "sha256"), ("schema", "sha256"),
+        ("fixture", "manifest_sha256"),
+        ("fixture", "fixture_tree_sha256"),
+        ("fixture", "provider_payload_sha256"),
+    ):
+        value: Any = identity
+        for part in path:
+            value = value[part]
+        if value is not None and (
+            not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(
+                f"calibration identity {'.'.join(path)} is not a SHA-256"
+            )
 
 
 def _validate_scored_run(run: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -349,6 +412,7 @@ def validate_artifact(artifact: Mapping[str, Any]) -> None:
     if artifact.get("method") != METHOD:
         raise ValueError("unsupported calibration method")
     identity = _require_mapping(artifact.get("identity"), "artifact.identity")
+    _validate_identity(identity)
     if artifact.get("identity_sha256") != _canonical_sha256(identity):
         raise ValueError("calibration identity hash does not match")
     without_digest = dict(artifact)
@@ -358,6 +422,8 @@ def validate_artifact(artifact: Mapping[str, Any]) -> None:
     _validate_edges(artifact.get("bucket_edges", []))
     if artifact.get("status") not in {"calibrated", "uncalibrated"}:
         raise ValueError("invalid calibration status")
+    if artifact.get("status") == "calibrated" and _identity_missing(identity):
+        raise ValueError("calibrated artifact has incomplete calibration identity")
 
 
 def _identity_differences(

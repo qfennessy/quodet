@@ -70,7 +70,12 @@ def scored_run(
             "model_options": {"reasoning_effort": reasoning_effort},
             "prompt": {"revision": "prompt-v1", "sha256": prompt_sha256},
             "schema": {"revision": "schema-v1", "sha256": schema_sha256},
-            "fixture": {"revision": fixture_revision},
+            "fixture": {
+                "revision": fixture_revision,
+                "manifest_sha256": "d" * 64,
+                "fixture_tree_sha256": "e" * 64,
+                "provider_payload_sha256": "f" * 64,
+            },
             "benchmark": {
                 "candidate_id": "fixture-candidate",
                 "model_run_config": {
@@ -80,8 +85,14 @@ def scored_run(
                     "provider": "fixture-provider",
                     "runtime": "fixture-runtime",
                     "runtime_version": "1.0",
+                    "locality": "hosted",
                     "quantization": "fixture",
                     "model_options": {"temperature": 0},
+                    "context_limit": 100_000,
+                    "timeout_seconds": 60.0,
+                    "max_output_bytes": 262_144,
+                    "max_output_tokens": 4_096,
+                    "max_output_tokens_option": "max_tokens",
                     "hardware": {"provider_model_revision": "provider-rev-1"},
                 },
             },
@@ -274,7 +285,7 @@ class ConfidenceCalibrationTests(unittest.TestCase):
         ], model_revision=None)
         artifact = fit(run)
         self.assertEqual(artifact["status"], "uncalibrated")
-        self.assertIn("model_revision", artifact["status_reasons"][0])
+        self.assertIn("model.revision", artifact["status_reasons"][0])
         report = calibration.calibration_report(run, artifact)
         self.assertTrue(
             all(row["calibrated_score"] is None for row in report["findings"])
@@ -295,6 +306,7 @@ class ConfidenceCalibrationTests(unittest.TestCase):
             ("two", "calibration", [(0.98, "true-positive")]),
         ])
         artifact = fit(base)
+
         def change_fixture_revision(run: dict[str, object]) -> None:
             run["configuration"]["fixture"]["revision"] = 4
             run["adjudication"]["fixture_revision"] = 4
@@ -304,21 +316,52 @@ class ConfidenceCalibrationTests(unittest.TestCase):
             run["metrics"] = scoring.score_run(run, run["adjudication"])
 
         mutations = {
-            "model": lambda run: run["configuration"].__setitem__("model", "other"),
-            "model_revision": lambda run: run["configuration"]["benchmark"][
+            "model.requested_identifier": lambda run: run[
+                "configuration"
+            ].__setitem__("model", "other"),
+            "model.revision": lambda run: run["configuration"]["benchmark"][
                 "model_run_config"
             ].__setitem__("model_revision", "f" * 40),
-            "model_options.evaluation.reasoning_effort": lambda run: run[
+            "options.evaluation.reasoning_effort": lambda run: run[
                 "configuration"
             ]["model_options"].__setitem__("reasoning_effort", "medium"),
+            "execution.context_limit": lambda run: run["configuration"][
+                "benchmark"
+            ]["model_run_config"].__setitem__("context_limit", 90_000),
+            "execution.timeout_seconds": lambda run: run["configuration"][
+                "benchmark"
+            ]["model_run_config"].__setitem__("timeout_seconds", 30.0),
+            "execution.max_output_bytes": lambda run: run["configuration"][
+                "benchmark"
+            ]["model_run_config"].__setitem__("max_output_bytes", 131_072),
+            "execution.max_output_tokens": lambda run: run["configuration"][
+                "benchmark"
+            ]["model_run_config"].__setitem__("max_output_tokens", 2_048),
+            "execution.max_output_tokens_option": lambda run: run[
+                "configuration"
+            ]["benchmark"]["model_run_config"].__setitem__(
+                "max_output_tokens_option", "max_output_tokens"
+            ),
             "prompt.sha256": lambda run: run["configuration"]["prompt"].__setitem__(
                 "sha256", "d" * 64
             ),
             "schema.sha256": lambda run: run["configuration"]["schema"].__setitem__(
                 "sha256", "e" * 64
             ),
-            "fixture_revision": change_fixture_revision,
+            "fixture.revision": change_fixture_revision,
+            "fixture.manifest_sha256": lambda run: run["configuration"][
+                "fixture"
+            ].__setitem__("manifest_sha256", "a" * 64),
+            "fixture.fixture_tree_sha256": lambda run: run["configuration"][
+                "fixture"
+            ].__setitem__("fixture_tree_sha256", "b" * 64),
+            "fixture.provider_payload_sha256": lambda run: run["configuration"][
+                "fixture"
+            ].__setitem__("provider_payload_sha256", "c" * 64),
         }
+        unchanged = calibration.calibration_report(copy.deepcopy(base), artifact)
+        self.assertEqual(unchanged["status"], "calibrated")
+        self.assertTrue(all(row["published"] for row in unchanged["findings"]))
         for expected_path, mutate in mutations.items():
             with self.subTest(path=expected_path):
                 changed = copy.deepcopy(base)
@@ -330,6 +373,39 @@ class ConfidenceCalibrationTests(unittest.TestCase):
                 self.assertTrue(
                     all(row["calibrated_score"] is None for row in report["findings"])
                 )
+
+    def test_legacy_missing_and_malformed_identities_fail_closed(self) -> None:
+        run = scored_run([
+            ("one", "calibration", [(0.99, "true-positive")]),
+            ("two", "calibration", [(0.98, "true-positive")]),
+        ])
+        artifact = fit(run)
+
+        def resign(value: dict[str, object]) -> None:
+            value["identity_sha256"] = calibration._canonical_sha256(
+                value["identity"]
+            )
+            unsigned = dict(value)
+            unsigned.pop("artifact_sha256", None)
+            value["artifact_sha256"] = calibration._canonical_sha256(unsigned)
+
+        legacy = copy.deepcopy(artifact)
+        legacy["identity"].pop("format_version")
+        resign(legacy)
+        with self.assertRaisesRegex(ValueError, "identity format"):
+            calibration.calibration_report(run, legacy)
+
+        missing = copy.deepcopy(artifact)
+        missing["identity"]["fixture"].pop("manifest_sha256")
+        resign(missing)
+        with self.assertRaisesRegex(ValueError, "missing required fields"):
+            calibration.calibration_report(run, missing)
+
+        malformed = copy.deepcopy(artifact)
+        malformed["identity"]["fixture"]["provider_payload_sha256"] = "invalid"
+        resign(malformed)
+        with self.assertRaisesRegex(ValueError, "not a SHA-256"):
+            calibration.calibration_report(run, malformed)
 
     def test_tampered_artifact_is_rejected(self) -> None:
         run = scored_run([
