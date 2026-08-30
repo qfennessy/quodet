@@ -75,15 +75,34 @@ def provider_fixture_payload_sha256(
 
 def _matches_frozen_model_options(
     model_options: Mapping[str, Any], expected_temperature: Any,
+    expected_reasoning_effort: Any = None,
 ) -> bool:
     temperature = model_options.get("temperature")
+    expected_keys: set[str] = set()
+    temperature_matches = expected_temperature is None
+    if expected_temperature is not None:
+        expected_keys.add("temperature")
+        temperature_matches = (
+            isinstance(expected_temperature, (int, float))
+            and not isinstance(expected_temperature, bool)
+            and isinstance(temperature, (int, float))
+            and not isinstance(temperature, bool)
+            and temperature == expected_temperature
+        )
+    if expected_reasoning_effort is not None:
+        expected_keys.add("reasoning_effort")
     return (
-        isinstance(expected_temperature, (int, float))
-        and not isinstance(expected_temperature, bool)
-        and set(model_options) == {"temperature"}
-        and isinstance(temperature, (int, float))
-        and not isinstance(temperature, bool)
-        and temperature == expected_temperature
+        bool(expected_keys)
+        and set(model_options) == expected_keys
+        and temperature_matches
+        and (
+            expected_reasoning_effort is None
+            or (
+                expected_reasoning_effort in {"low", "medium", "high"}
+                and model_options.get("reasoning_effort")
+                == expected_reasoning_effort
+            )
+        )
     )
 
 
@@ -110,15 +129,37 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
     scope = plan.get("evaluation_scope")
     challenge_fixture = plan.get("challenge_fixture")
     attempts = contract.get("attempts_per_case")
+    execution = plan.get("execution_contract")
+    if not isinstance(execution, Mapping):
+        raise ValueError("benchmark plan requires an execution_contract object")
+    common_execution_keys = {
+        "timeout_seconds", "max_output_tokens", "max_output_bytes", "temperature",
+    }
     if scope == ORDINARY_PLAN_SCOPE:
         if challenge_fixture is not None:
             raise ValueError("ordinary benchmark plan cannot bind challenge fixtures")
         if attempts != 1:
             raise ValueError("ordinary benchmark must freeze exactly one attempt")
+        if set(execution) != common_execution_keys or (
+            not isinstance(execution.get("temperature"), (int, float))
+            or isinstance(execution.get("temperature"), bool)
+        ):
+            raise ValueError(
+                "ordinary benchmark must freeze only a numeric temperature"
+            )
     elif scope == CHALLENGE_PLAN_SCOPE:
         if attempts != CHALLENGE_QUALIFICATION_ATTEMPTS:
             raise ValueError(
                 "challenge qualification plan must freeze exactly three attempts"
+            )
+        if (
+            set(execution) != common_execution_keys | {"reasoning_effort"}
+            or execution.get("temperature") is not None
+            or execution.get("reasoning_effort") not in {"low", "medium", "high"}
+        ):
+            raise ValueError(
+                "challenge qualification must freeze reasoning effort without "
+                "a temperature option"
             )
         if not isinstance(challenge_fixture, Mapping) or set(challenge_fixture) != {
             "revision", "manifest_sha256", "content_sha256",
@@ -349,7 +390,9 @@ def prepare_run_config(
     if max_output_bytes != execution["max_output_bytes"]:
         raise ValueError("candidate output-byte cap differs from frozen contract")
     if not _matches_frozen_model_options(
-        model_options, execution["temperature"],
+        model_options,
+        execution["temperature"],
+        execution.get("reasoning_effort"),
     ):
         raise ValueError("candidate model options differ from frozen execution contract")
     if locality == "hosted" and not external_upload_consent:
@@ -577,7 +620,9 @@ def validate_run_against_plan(
             raise ValueError(f"run model config {key} differs from frozen contract")
     model_options = model_config.get("model_options")
     if not isinstance(model_options, Mapping) or not _matches_frozen_model_options(
-        model_options, execution["temperature"],
+        model_options,
+        execution["temperature"],
+        execution.get("reasoning_effort"),
     ):
         raise ValueError("run model options differ from frozen contract")
     for key in ("model_artifact", "model_revision", "locality"):

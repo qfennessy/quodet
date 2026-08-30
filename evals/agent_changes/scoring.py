@@ -134,6 +134,14 @@ def _add_counts(target: dict[str, int], source: dict[str, int]) -> None:
         target[key] += source[key]
 
 
+def _counts_toward_quality_metrics(outcome: dict[str, Any]) -> bool:
+    """Keep invalid challenge attempts visible without treating them as misses."""
+    return not (
+        outcome.get("challenge_pair_id")
+        and outcome["status"] != "schema-valid"
+    )
+
+
 def score_run(
     run: dict[str, Any],
     adjudications: dict[str, Any] | None,
@@ -206,14 +214,18 @@ def score_run(
         counts = _case_counts(
             outcome, adjudicated_cases.get(outcome.get("sample_id", outcome["case_id"]))
         )
-        _add_counts(totals, counts)
-        _add_counts(by_split[outcome["evaluation_split"]], counts)
+        counts_toward_quality = _counts_toward_quality_metrics(outcome)
+        if counts_toward_quality:
+            _add_counts(totals, counts)
+            _add_counts(by_split[outcome["evaluation_split"]], counts)
         if outcome["evaluation_split"] == "clean-control":
             total_control_cases += 1
             if counts["fp"]:
                 total_control_cases_with_fp += 1
         for family in outcome["failure_families"]:
-            _add_counts(by_family[family], counts)
+            family_counts = by_family[family]
+            if counts_toward_quality:
+                _add_counts(family_counts, counts)
             if outcome["evaluation_split"] == "clean-control":
                 control_cases[family] += 1
                 if counts["fp"]:
@@ -262,6 +274,11 @@ def score_run(
         split_schema_valid = sum(
             outcome["status"] == "schema-valid" for outcome in split_outcomes
         )
+        has_quality_sample = (
+            bool(split_schema_valid)
+            if split.startswith("challenge-")
+            else bool(split_outcomes)
+        )
         split_metrics[split] = {
             **counts,
             "attempted_cases": len(split_outcomes),
@@ -269,10 +286,12 @@ def score_run(
                 split_schema_valid / len(split_outcomes) if split_outcomes else None
             ),
             "finding_precision": (
-                split_tp / (split_tp + split_fp) if split_tp + split_fp else 1.0
+                split_tp / (split_tp + split_fp)
+                if split_tp + split_fp else (1.0 if has_quality_sample else None)
             ),
             "finding_recall": (
-                split_tp / (split_tp + split_fn) if split_tp + split_fn else 1.0
+                split_tp / (split_tp + split_fn)
+                if split_tp + split_fn else (1.0 if has_quality_sample else None)
             ),
             "fix_quality_score": (
                 sum(split_fix_scores) / len(split_fix_scores)
