@@ -63,11 +63,11 @@ When no confident negative findings exist, Luna returns `{"findings": []}`.
   and scheduler behavior in the supplied files. Hypothetical subclasses,
   contract violations, and schedules contradicted by visible delays do not
   qualify as high-confidence findings.
-- Each batch constrains `finding.file` to an enum of the exact sanitized
-  `Original relative path:` labels visible to the provider. Quodet maps a
-  selected label back to the private reviewed path locally, rejects path
-  aliases or guessed prefixes, and fails closed if redaction makes two labels
-  collide.
+- Each batch constrains `finding.file` to an enum of the exact
+  `Original relative path:` labels visible to the provider. Quodet excludes a
+  file when its path itself requires redaction; for files that are sent, it
+  accepts only the exact local label and rejects path aliases or guessed
+  prefixes.
 - Recommendations remain untrusted review data. Coding agents and developers
   must independently verify the diagnosis and fix; Quodet never auto-applies
   the proposed change.

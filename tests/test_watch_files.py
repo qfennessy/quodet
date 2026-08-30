@@ -516,37 +516,22 @@ class WatchFilesTests(unittest.TestCase):
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz1234567890", secret_sanitized)
         self.assertGreater(secret_count, 0)
 
-    def test_provider_path_mapping_is_private_and_rejects_redaction_collisions(
-        self,
-    ) -> None:
-        first_secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
-        second_secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+    def test_provider_path_mapping_is_exact_and_rejects_sensitive_paths(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
 
         def snapshot(relative: str) -> watch_files.SourceSnapshot:
             path = Path("/tmp") / relative
             return watch_files.SourceSnapshot(path, Path(relative), "", "0" * 64, 0)
 
-        single = watch_files.provider_path_mapping(
-            [snapshot(f"src/{first_secret}.py")]
-        )
-        provider_label = next(iter(single))
-        schema_json = watch_files.response_schema_json(tuple(single))
-        self.assertNotIn(first_secret, provider_label)
-        self.assertNotIn(first_secret, schema_json)
-        self.assertEqual(single[provider_label], f"src/{first_secret}.py")
+        mapping = watch_files.provider_path_mapping([snapshot("src/app.py")])
+        self.assertEqual(mapping, {"src/app.py": "src/app.py"})
 
         with self.assertRaisesRegex(
             watch_files.ReviewValidationError,
-            "provider-visible path labels collide",
+            "excluded before mapping",
         ) as raised:
-            watch_files.provider_path_mapping(
-                [
-                    snapshot(f"src/{first_secret}.py"),
-                    snapshot(f"src/{second_secret}.py"),
-                ]
-            )
-        self.assertNotIn(first_secret, str(raised.exception))
-        self.assertNotIn(second_secret, str(raised.exception))
+            watch_files.provider_path_mapping([snapshot(f"src/{secret}.py")])
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_review_sends_only_sanitized_temporary_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

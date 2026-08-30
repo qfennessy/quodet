@@ -555,10 +555,14 @@ def _safe_path_label(path: Path) -> str:
 def provider_path_mapping(
     snapshots: Sequence[SourceSnapshot],
 ) -> dict[str, str]:
-    """Map unique provider-visible labels back to private reviewed paths."""
+    """Map exact sent labels to local paths without retaining sensitive paths."""
     mapping: dict[str, str] = {}
     for snapshot in snapshots:
-        label, _ = redact_sensitive_path(snapshot.relative_path)
+        label, redactions = redact_sensitive_path(snapshot.relative_path)
+        if redactions:
+            raise ReviewValidationError(
+                "provider-visible path should have been excluded before mapping"
+            )
         original = snapshot.relative_path.as_posix()
         if label in mapping and mapping[label] != original:
             raise ReviewValidationError("provider-visible path labels collide")
