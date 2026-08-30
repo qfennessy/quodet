@@ -28,12 +28,21 @@ _CLAUSE_BOUNDARY = re.compile(
 )
 _TEST_WORD = re.compile(
     r"\btests?\b|(?<![A-Za-z0-9_])(?:test_[A-Za-z0-9_]+|"
-    r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
+    r"[A-Za-z0-9_]+_test)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _TEST_SYMBOL = re.compile(
     r"(?<![A-Za-z0-9_])(?:test_[A-Za-z0-9_]+|"
     r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_SPEC_SYMBOL = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z0-9_]+_spec(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_SPEC_TEST_CONTEXT = re.compile(
+    r"\brspec\b|\bspecs?\s+"
+    r"(?:suite|tests?|cases?|folders?|director(?:y|ies))\b",
     re.IGNORECASE,
 )
 _MUTATION_VERB = re.compile(
@@ -104,7 +113,15 @@ def _mutates_unsupplied_test(
         for match in _TEST_PATH.finditer(clause)
         if _path_is_proposed(clause, match.start())
     ]
-    for test_match in _TEST_WORD.finditer(clause):
+    test_matches = list(_TEST_WORD.finditer(clause))
+    visible_spec_symbol = any(
+        _SPEC_SYMBOL.fullmatch(symbol) is not None
+        for symbol in visible_clause_symbols
+    )
+    if test_matches or visible_spec_symbol or _SPEC_TEST_CONTEXT.search(clause):
+        test_matches.extend(_SPEC_SYMBOL.finditer(clause))
+        test_matches.sort(key=lambda match: match.start())
+    for test_match in test_matches:
         if test_match.group(0) in supplied_test_symbols:
             continue
         if (

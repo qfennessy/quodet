@@ -202,6 +202,62 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                     "unsupported-test-mutation",
                 )
 
+    def test_spec_suffixed_production_symbols_are_not_assumed_to_be_tests(self) -> None:
+        for recommendation in (
+            "Update API_SPEC to require tenant_id.",
+            "Change request_spec to include tenant_id.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["request.py"],
+                )
+                self.assertEqual(result["status"], "grounded")
+
+    def test_explicit_test_word_rejects_unknown_spec_symbol(self) -> None:
+        for recommendation, visible_symbol in (
+            ("Extend known_spec and missing_spec test cases.", "known_spec"),
+            (
+                "Extend known_test and missing_spec with boundary assertions.",
+                "known_test",
+            ),
+            (
+                "Extend known_spec and missing_spec with boundary assertions.",
+                "known_spec",
+            ),
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["tests/cache.py"],
+                    supplied_test_symbols=[visible_symbol],
+                )
+
+                self.assertEqual(result["status"], "failure")
+                self.assertEqual(
+                    result["violations"][0]["code"],
+                    "unsupported-test-mutation",
+                )
+
+    def test_explicit_rspec_context_rejects_unknown_spec_symbol(self) -> None:
+        for recommendation in (
+            "Extend missing_spec in the RSpec suite with a boundary assertion.",
+            "Edit missing_spec in the spec suite to assert the boundary.",
+            "Extend missing_spec in the spec folder with a boundary assertion.",
+            "Edit missing_spec in the specs directory to assert the boundary.",
+        ):
+            with self.subTest(recommendation=recommendation):
+                result = scoring.evaluate_recommendation(
+                    recommendation,
+                    supplied_files=["request.py"],
+                )
+
+                self.assertEqual(result["status"], "failure")
+                self.assertEqual(
+                    result["violations"][0]["code"],
+                    "unsupported-test-mutation",
+                )
+
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
             "Preserve the existing cache regression test.",
