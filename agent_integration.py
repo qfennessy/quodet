@@ -361,7 +361,10 @@ def initialize(
             current_settings = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"existing settings are not valid JSON: {settings}") from error
-        if current_settings not in (expected_settings, legacy_settings):
+        legacy_is_compatible = (
+            route.stop_grace_seconds == 2.0 and current_settings == legacy_settings
+        )
+        if current_settings != expected_settings and not legacy_is_compatible:
             raise FileExistsError(
                 f"refusing to overwrite existing settings: {settings}; "
                 "merge the generated hooks manually"

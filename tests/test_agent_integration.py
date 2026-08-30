@@ -277,6 +277,42 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded.stop_grace_seconds, 2.0)
         self.assertEqual(rerun, (route_path, settings_path))
 
+    def test_nondefault_stop_grace_rejects_legacy_settings_without_route(self) -> None:
+        hook_command = self._executable("legacy-grace-codex-hook")
+        agent_command = self._executable("legacy-grace-agent-command")
+        route_path, settings_path = agent_integration.initialize(
+            "codex",
+            root=self.root,
+            spool_dir=self.spool,
+            session_id="legacy-grace-route",
+            hook_command=hook_command,
+            agent_command=agent_command,
+        )
+        route = agent_integration.load_route(route_path)
+        legacy_settings = agent_integration.hook_configuration(
+            route,
+            hook_command=hook_command,
+            agent_command=agent_command,
+            include_stop_grace=False,
+        )
+        settings_path.write_text(json.dumps(legacy_settings))
+        settings_path.chmod(0o600)
+        route_path.unlink()
+
+        with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+            agent_integration.initialize(
+                "codex",
+                root=self.root,
+                spool_dir=self.spool,
+                session_id="legacy-grace-route",
+                hook_command=hook_command,
+                agent_command=agent_command,
+                stop_grace_seconds=0.75,
+            )
+
+        self.assertFalse(route_path.exists())
+        self.assertEqual(json.loads(settings_path.read_text()), legacy_settings)
+
     def test_init_cannot_overwrite_concurrently_created_settings(self) -> None:
         settings = self.root / ".codex" / "hooks.json"
         original_create = agent_integration._create_private_json
