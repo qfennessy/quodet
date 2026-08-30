@@ -33,6 +33,13 @@ from feedback import (
     parse_review_output,
     read_bounded_beneath_root,
 )
+from model_runner import (
+    ModelDocument,
+    ModelRunConfig,
+    ModelRunRequest,
+    load_model_run_config,
+    run_model,
+)
 
 try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -216,6 +223,15 @@ KNOWN_SECRET_PATTERNS = (
 HIGH_ENTROPY_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])"
 )
+CONFIG_SECRET_FIELD_RE = re.compile(
+    r"(?i)(?:^|[_-])(?:"
+    r"api[_-]?key|secret(?:[_-]?key)?|access[_-]?key|private[_-]?key|"
+    r"client[_-]?secret|signing[_-]?key|encryption[_-]?key|"
+    r"auth(?:entication)?[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"token|password|passwd|credential(?:s)?|connection[_-]?string|database[_-]?url"
+    r")(?:$|[_-])"
+)
+LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -306,6 +322,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--model-run-config",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--spool-dir",
         type=Path,
         help=(
@@ -332,6 +353,48 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
+
+
+def validate_model_run_config_privacy(config: ModelRunConfig) -> None:
+    values: dict[str, object] = {
+        "model": config.model,
+        "model_artifact": config.model_artifact,
+        "provider": config.provider,
+        "runtime": config.runtime,
+        "runtime_version": config.runtime_version,
+        "quantization": config.quantization,
+        "pricing_source": config.pricing.source,
+    }
+    unsafe: list[str] = []
+    for name, value in values.items():
+        _, redactions = redact_sensitive_values(str(value))
+        if redactions:
+            unsafe.append(name)
+
+    for collection_name, collection in (
+        ("model_option", config.model_options),
+        ("hardware", config.hardware),
+    ):
+        for key, value in collection.items():
+            name = f"{collection_name}_{key}"
+            if CONFIG_SECRET_FIELD_RE.search(key):
+                unsafe.append(name)
+                continue
+            if collection_name == "hardware" and key == "runtime_artifact_sha256":
+                if not isinstance(value, str) or LOWERCASE_SHA256_RE.fullmatch(
+                    value
+                ) is None:
+                    unsafe.append(name)
+                continue
+            if isinstance(value, str):
+                _, redactions = redact_sensitive_values(value)
+                if redactions:
+                    unsafe.append(name)
+    if unsafe:
+        raise ValueError(
+            "model run config contains potential secrets in "
+            f"{sorted(unsafe)}; use provider-managed credentials instead"
+        )
 
 
 def resolve_reasoning_effort(model: str, requested: str) -> str | None:
@@ -702,6 +765,7 @@ def review_files(
     sink: FeedbackSink | None = None,
     session_id: str | None = None,
     feedback_round: int = 1,
+    model_run_config: ModelRunConfig | None = None,
 ) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
@@ -735,45 +799,104 @@ def review_files(
                 file=sys.stderr,
             )
 
-        command = build_llm_command(
-            sanitized_attachments,
-            model=model,
-            prompt=sanitized_prompt,
-            log=log,
-            reasoning_effort=reasoning_effort,
-        )
-
-        try:
-            result = run_bounded_command(
-                command,
-                cwd=root,
-                timeout=review_timeout,
-                output_limit=MAX_PROVIDER_OUTPUT_BYTES,
+        model_result = None
+        if model_run_config is not None:
+            model_result = run_model(
+                model_run_config,
+                ModelRunRequest(
+                    documents=tuple(
+                        ModelDocument(document.path, document.media_type)
+                        for document in sanitized_attachments
+                    ),
+                    prompt=sanitized_prompt,
+                    schema_json=REVIEW_SCHEMA_JSON,
+                    cwd=root,
+                    log=log,
+                ),
             )
-        except subprocess.TimeoutExpired as error:
-            if evaluation_events:
-                print(json.dumps({"quodet_evaluation_event": {
-                    "status": "timeout",
-                    "returncode": None,
-                    "raw_response": _subprocess_output_text(error.stdout),
-                    "stderr": _subprocess_output_text(error.stderr),
-                }}), flush=True)
-            else:
-                print(
-                    f"llm review timed out after {review_timeout:g} seconds",
-                    file=sys.stderr,
+            result = BoundedProcessResult(
+                returncode=(
+                    model_result.returncode
+                    if model_result.returncode is not None else 1
+                ),
+                stdout=model_result.stdout,
+                stderr=model_result.stderr,
+                output_exceeded=model_result.status == "output-limit",
+            )
+        else:
+            command = build_llm_command(
+                sanitized_attachments,
+                model=model,
+                prompt=sanitized_prompt,
+                log=log,
+                reasoning_effort=reasoning_effort,
+            )
+
+            try:
+                result = run_bounded_command(
+                    command,
+                    cwd=root,
+                    timeout=review_timeout,
+                    output_limit=MAX_PROVIDER_OUTPUT_BYTES,
                 )
-            return None
-        except OSError as error:
+            except subprocess.TimeoutExpired as error:
+                if evaluation_events:
+                    safe_stdout, _ = redact_sensitive_values(
+                        _subprocess_output_text(error.stdout) or ""
+                    )
+                    safe_stderr, _ = redact_sensitive_values(
+                        _subprocess_output_text(error.stderr) or ""
+                    )
+                    print(json.dumps({"quodet_evaluation_event": {
+                        "status": "timeout",
+                        "returncode": None,
+                        "raw_response": safe_stdout or None,
+                        "stderr": safe_stderr or None,
+                    }}), flush=True)
+                else:
+                    print(
+                        f"llm review timed out after {review_timeout:g} seconds",
+                        file=sys.stderr,
+                    )
+                return None
+            except OSError as error:
+                if evaluation_events:
+                    safe_error, _ = redact_sensitive_values(str(error))
+                    print(json.dumps({"quodet_evaluation_event": {
+                        "status": "provider-error",
+                        "returncode": None,
+                        "raw_response": None,
+                        "stderr": safe_error,
+                    }}), flush=True)
+                else:
+                    print(f"Could not run llm: {error}", file=sys.stderr)
+                return None
+
+        safe_stdout, _ = redact_sensitive_values(result.stdout)
+        safe_stderr, _ = redact_sensitive_values(result.stderr)
+        result = BoundedProcessResult(
+            returncode=result.returncode,
+            stdout=safe_stdout,
+            stderr=safe_stderr,
+            output_exceeded=result.output_exceeded,
+        )
+        model_result_payload = None
+        if model_result is not None:
+            model_result_payload = model_result.to_dict()
+            model_result_payload["stdout"] = safe_stdout
+            model_result_payload["stderr"] = safe_stderr
+
+        if model_result is not None and model_result.status != "success":
             if evaluation_events:
                 print(json.dumps({"quodet_evaluation_event": {
-                    "status": "provider-error",
-                    "returncode": None,
-                    "raw_response": None,
-                    "stderr": str(error),
+                    "status": model_result.status,
+                    "returncode": model_result.returncode,
+                    "raw_response": safe_stdout,
+                    "stderr": safe_stderr,
+                    "model_run_result": model_result_payload,
                 }}), flush=True)
             else:
-                print(f"Could not run llm: {error}", file=sys.stderr)
+                print(safe_stderr, file=sys.stderr)
             return None
 
     if result.output_exceeded:
@@ -797,6 +920,9 @@ def review_files(
             "returncode": result.returncode,
             "raw_response": result.stdout,
             "stderr": result.stderr,
+            "model_run_result": (
+                model_result_payload
+            ),
         }}), flush=True)
     if result.returncode != 0:
         if not evaluation_events:
@@ -901,7 +1027,26 @@ def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
         yield tuple(ordered[index : index + MAX_REVIEWED_FILES])
 
 
-def validate_runtime(path: Path, model: str) -> Path:
+def _listed_model_entries(output: str) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for line in output.splitlines():
+        _, separator, details = line.partition(": ")
+        if not separator:
+            continue
+        model_id, _, aliases = details.partition(" (aliases: ")
+        entries[model_id.strip()] = line
+        if aliases.endswith(")"):
+            for alias in aliases[:-1].split(","):
+                if alias.strip():
+                    entries[alias.strip()] = line
+    return entries
+
+
+def _listed_model_ids(output: str) -> set[str]:
+    return set(_listed_model_entries(output))
+
+
+def validate_runtime(path: Path, model: str, *, strict_model: bool = False) -> Path:
     root = path.expanduser().resolve()
     if not root.is_dir():
         raise SystemExit(f"Watch path is not a directory: {root}")
@@ -922,7 +1067,12 @@ def validate_runtime(path: Path, model: str) -> Path:
     if model_check.returncode != 0:
         raise SystemExit(
             "Could not list llm models; check the llm installation.")
-    if model not in model_check.stdout:
+    if model not in _listed_model_ids(model_check.stdout):
+        if strict_model:
+            raise SystemExit(
+                f"Configured benchmark model {model!r} was not found exactly in "
+                "`llm models list`; refusing to invoke another model."
+            )
         print(
             f"Warning: model {model!r} was not found by `llm models list`; "
             "the first review may fail.",
@@ -933,7 +1083,20 @@ def validate_runtime(path: Path, model: str) -> Path:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    root = validate_runtime(args.path, args.model)
+    model_run_config = (
+        load_model_run_config(args.model_run_config)
+        if args.model_run_config is not None else None
+    )
+    if model_run_config is not None:
+        try:
+            validate_model_run_config_privacy(model_run_config)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        args.model = model_run_config.model
+        args.review_timeout = model_run_config.timeout_seconds
+    root = validate_runtime(
+        args.path, args.model, strict_model=model_run_config is not None
+    )
     if (args.spool_dir is None) != (args.session_id is None):
         raise SystemExit("--spool-dir and --session-id must be supplied together")
     sink: FeedbackSink = ConsoleSink()
@@ -979,6 +1142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     evaluation_events=args.evaluation_events,
                     sink=sink,
                     session_id=args.session_id,
+                    model_run_config=model_run_config,
                 )
     except KeyboardInterrupt:
         print("\nStopping watcher.")

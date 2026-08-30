@@ -17,4 +17,4 @@ quodet-codex-hook = "codex_feedback_hook:main"
 quodet-claude-hook = "codex_feedback_hook:main"
 
 [tool.setuptools]
-py-modules = ["watch_files", "feedback", "codex_feedback_hook"]
+py-modules = ["watch_files", "feedback", "codex_feedback_hook", "model_runner"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -18,6 +19,20 @@ DEFAULT_DESTINATION = Path("prompt_eval_workspace/agent_replay")
 
 def load_manifest() -> dict[str, Any]:
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def fixture_tree_sha256(manifest: dict[str, Any] | None = None) -> str:
+    """Hash case IDs, relative filenames, and exact provider fixture bytes."""
+    digest = hashlib.sha256()
+    for case in (manifest or load_manifest())["cases"]:
+        for filename in case["files"]:
+            relative = Path(case["id"]) / filename
+            contents = (CASES_ROOT / relative).read_bytes()
+            digest.update(relative.as_posix().encode())
+            digest.update(b"\0")
+            digest.update(len(contents).to_bytes(8, "big"))
+            digest.update(contents)
+    return digest.hexdigest()
 
 
 def case_by_id(manifest: dict[str, Any], case_id: str) -> dict[str, Any]:
@@ -38,8 +53,6 @@ def replay_case(
     target_root = destination.resolve() / case["id"]
     target_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    replay_id = time.time_ns()
-
     for index, filename in enumerate(case["files"]):
         source = source_root / filename
         if not source.is_file():
@@ -48,8 +61,6 @@ def replay_case(
         target = target_root / filename
         temporary = target.with_name(f".{target.name}.quodet-save")
         source_bytes = source.read_bytes()
-        if source.suffix == ".py":
-            source_bytes = f"# Quodet replay: {replay_id}\n".encode() + source_bytes
         temporary.write_bytes(source_bytes)
         os.replace(temporary, target)
         written.append(target)

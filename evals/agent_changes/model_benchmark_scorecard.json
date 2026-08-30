@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "experiment_id": "quodet-open-model-comparison-v1",
+  "status": "not-run",
+  "generated_from": [],
+  "candidates": {
+    "qwen35-a3b-local": {"status": "not-run"},
+    "deepseek-v4-flash-hosted": {"status": "not-run"},
+    "devstral-small-2-local": {"status": "not-run"}
+  },
+  "decision": {
+    "selection": null,
+    "current_default": "gpt-5.6-luna",
+    "outcome": "no inference was authorized or run; retain the current default",
+    "eligible_candidates": []
+  }
+}
