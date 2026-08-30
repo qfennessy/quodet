@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -64,6 +65,7 @@ class RouteConfig:
     spool_dir: str
     session_id: str
     contract: str
+    stop_grace_seconds: float
 
     @property
     def root_path(self) -> Path:
@@ -138,8 +140,18 @@ def route_path(spool_dir: Path) -> Path:
 
 
 def _validate_route_value(value: object) -> RouteConfig:
-    expected = {"version", "agent", "root", "spool_dir", "session_id", "contract"}
-    if not isinstance(value, dict) or set(value) != expected:
+    legacy = {
+        "version",
+        "agent",
+        "root",
+        "spool_dir",
+        "session_id",
+        "contract",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        legacy,
+        legacy | {"stop_grace_seconds"},
+    ):
         raise ValueError("route has unexpected or missing fields")
     if value["version"] != ROUTE_VERSION:
         raise ValueError("unsupported route version")
@@ -150,6 +162,7 @@ def _validate_route_value(value: object) -> RouteConfig:
     spool = value["spool_dir"]
     session = value["session_id"]
     contract = value["contract"]
+    stop_grace = value.get("stop_grace_seconds", 2.0)
     if not isinstance(root, str) or not Path(root).is_absolute():
         raise ValueError("route root must be absolute")
     if not isinstance(spool, str) or not Path(spool).is_absolute():
@@ -158,6 +171,13 @@ def _validate_route_value(value: object) -> RouteConfig:
         raise ValueError("route session_id is invalid")
     if contract != ADAPTERS[agent].contract:
         raise ValueError("route contract does not match the selected agent")
+    if (
+        isinstance(stop_grace, bool)
+        or not isinstance(stop_grace, (int, float))
+        or not math.isfinite(float(stop_grace))
+        or not 0 <= float(stop_grace) <= 10
+    ):
+        raise ValueError("route stop_grace_seconds must be between zero and ten")
     resolved_root = Path(root).resolve()
     resolved_spool = Path(spool).resolve()
     if os.fspath(resolved_root) != root or os.fspath(resolved_spool) != spool:
@@ -177,6 +197,7 @@ def _validate_route_value(value: object) -> RouteConfig:
         spool_dir=spool,
         session_id=session,
         contract=contract,
+        stop_grace_seconds=float(stop_grace),
     )
 
 
@@ -227,6 +248,7 @@ def hook_configuration(
     *,
     hook_command: str,
     agent_command: str,
+    include_stop_grace: bool = True,
 ) -> dict[str, object]:
     common = (
         f"{shlex.quote(hook_command)} --spool-dir "
@@ -237,6 +259,9 @@ def hook_configuration(
         f"{shlex.quote(agent_command)} cleanup --config "
         f"{shlex.quote(os.fspath(route_path(route.spool_path)))} --from-hook"
     )
+    stop = f"{common} --event Stop"
+    if include_stop_grace:
+        stop += f" --stop-grace {route.stop_grace_seconds:g}"
     matcher = "^(Write|Edit|apply_patch)$" if route.agent == "codex" else "^(Write|Edit)$"
     return {
         "hooks": {
@@ -258,8 +283,10 @@ def hook_configuration(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"{common} --event Stop",
-                            "timeout": 10,
+                            "command": stop,
+                            "timeout": max(
+                                10, math.ceil(route.stop_grace_seconds) + 2
+                            ),
                         }
                     ]
                 }
@@ -287,6 +314,7 @@ def initialize(
     session_id: str,
     hook_command: str | None = None,
     agent_command: str | None = None,
+    stop_grace_seconds: float = 2.0,
 ) -> tuple[Path, Path]:
     require_secure_platform()
     adapter = ADAPTERS[agent]
@@ -302,6 +330,7 @@ def initialize(
             "spool_dir": os.fspath(canonical_spool),
             "session_id": session_id,
             "contract": adapter.contract,
+            "stop_grace_seconds": stop_grace_seconds,
         }
     )
     resolved_hook = _resolve_command(hook_command, adapter.hook_executable)
@@ -309,6 +338,12 @@ def initialize(
     settings = canonical_root / adapter.settings_path
     expected_settings = hook_configuration(
         route, hook_command=resolved_hook, agent_command=resolved_agent
+    )
+    legacy_settings = hook_configuration(
+        route,
+        hook_command=resolved_hook,
+        agent_command=resolved_agent,
+        include_stop_grace=False,
     )
 
     # Validate every collision before creating either artifact. Existing agent
@@ -318,7 +353,7 @@ def initialize(
             current_settings = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"existing settings are not valid JSON: {settings}") from error
-        if current_settings != expected_settings:
+        if current_settings not in (expected_settings, legacy_settings):
             raise FileExistsError(
                 f"refusing to overwrite existing settings: {settings}; "
                 "merge the generated hooks manually"
@@ -331,7 +366,8 @@ def initialize(
 
     _private_directory(canonical_spool)
     for name in (
-        "pending", "claimed", "acknowledged", "rejected", "dedupe", "sessions", "metrics"
+        "pending", "claimed", "acknowledged", "rejected", "dedupe", "sessions",
+        "metrics", "flush-hints", "in-flight"
     ):
         _private_directory(canonical_spool / name)
     if not route_file.exists():
@@ -431,7 +467,15 @@ def _payload_owned(path: Path, route: RouteConfig) -> bool:
 def route_status(route: RouteConfig) -> dict[str, object]:
     _private_directory(route.spool_path)
     counts: dict[str, int] = {}
-    for name in ("pending", "claimed", "acknowledged", "rejected", "dedupe"):
+    for name in (
+        "pending",
+        "claimed",
+        "acknowledged",
+        "rejected",
+        "dedupe",
+        "flush-hints",
+        "in-flight",
+    ):
         directory = _private_directory(route.spool_path / name)
         counts[name] = sum(_payload_owned(path, route) for path in directory.glob("*.json"))
     lease = _session_lease_path(route)
@@ -457,7 +501,10 @@ def route_status(route: RouteConfig) -> dict[str, object]:
 def _latency_summary(route: RouteConfig) -> dict[str, object]:
     fields = (
         "debounce_ms",
+        "detection_to_flush_ms",
+        "flush_to_provider_ms",
         "provider_ms",
+        "publication_ms",
         "hook_wait_ms",
         "hook_execution_ms",
         "total_edit_to_feedback_ms",
@@ -532,7 +579,15 @@ def cleanup_route(
         # Latency/protocol metrics intentionally survive route cleanup so operators
         # can inspect completed-session medians and tails. They contain no source or
         # finding text and remain protected by the private route spool.
-        states = ("pending", "claimed", "acknowledged", "rejected", "dedupe")
+        states = (
+            "pending",
+            "claimed",
+            "acknowledged",
+            "rejected",
+            "dedupe",
+            "flush-hints",
+            "in-flight",
+        )
         for name in states:
             removed[name] = 0
             for path in (route.spool_path / name).glob("*.json"):
@@ -557,6 +612,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     init.add_argument("--session-id", required=True)
     init.add_argument("--hook-command")
     init.add_argument("--agent-command")
+    init.add_argument("--stop-grace", type=float, default=2.0)
     for name in ("status", "cleanup"):
         command = commands.add_parser(name)
         command.add_argument("--config", type=Path, required=True)
@@ -579,6 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_id=args.session_id,
                 hook_command=args.hook_command,
                 agent_command=args.agent_command,
+                stop_grace_seconds=args.stop_grace,
             )
             print(json.dumps({"route": os.fspath(route), "settings": os.fspath(settings)}))
             return 0

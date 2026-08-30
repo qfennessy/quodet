@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -19,7 +20,12 @@ from feedback import (
     MAX_SPOOL_PAYLOAD_BYTES,
     UNTRUSTED_NOTICE,
     ReviewValidationError,
+    ReviewedFile,
     fresh_spooled_payload,
+    matching_review_in_flight,
+    publish_flush_hint,
+    read_bounded_beneath_root,
+    retire_reviewed_flush_hints,
     validate_spooled_payload,
 )
 
@@ -27,6 +33,55 @@ from feedback import (
 MAX_DELIVERY_FINDINGS = 10
 MAX_DELIVERY_CHARS = 48_000
 MAX_HOOK_INPUT_BYTES = 1_048_576
+DEFAULT_STOP_GRACE_SECONDS = 2.0
+STOP_POLL_SECONDS = 0.025
+MAX_HINT_FILE_BYTES = 2_000_000
+
+
+def _hint_reviewed_files(
+    event_input: dict[str, object], *, root: Path
+) -> tuple[ReviewedFile, ...]:
+    """Snapshot only path/digest metadata for files named by a direct edit hook."""
+    tool_input = event_input.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return ()
+    candidates: set[str] = set()
+    file_path = tool_input.get("file_path")
+    if isinstance(file_path, str):
+        candidates.add(file_path)
+    command = tool_input.get("command")
+    if isinstance(command, str):
+        candidates.update(
+            match.group(1).strip()
+            for match in re.finditer(
+                r"^\*\*\* (?:Add|Update|Delete) File: (.+)$",
+                command,
+                flags=re.MULTILINE,
+            )
+        )
+    reviewed: list[ReviewedFile] = []
+    canonical_root = root.resolve()
+    for candidate in sorted(candidates):
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = canonical_root / path
+        try:
+            relative = path.resolve(strict=False).relative_to(canonical_root)
+            raw = read_bounded_beneath_root(
+                canonical_root, relative, max_bytes=MAX_HINT_FILE_BYTES
+            )
+        except (OSError, ValueError):
+            continue
+        if len(raw) > MAX_HINT_FILE_BYTES:
+            continue
+        reviewed.append(
+            ReviewedFile(
+                relative.as_posix(), hashlib.sha256(raw).hexdigest(), len(raw)
+            )
+        )
+        if len(reviewed) == 100:
+            break
+    return tuple(reviewed)
 
 
 def _record_delivery_metric(
@@ -41,11 +96,15 @@ def _record_delivery_metric(
     """Record bounded latency/protocol metadata without source or finding text."""
     metrics = _private_directory(directory.expanduser().resolve(), "metrics")
     response_bytes = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
-    created_at = float(payload["created_at"])
     first_observed_at = float(payload["first_observed_at"])
+    batch_flushed_at = float(payload["batch_flushed_at"])
+    provider_started_at = float(payload["provider_started_at"])
+    provider_completed_at = float(payload["provider_completed_at"])
+    published_at = float(payload["published_at"])
     debounce_ms = float(payload["debounce_ms"])
     provider_ms = float(payload["provider_ms"])
-    hook_wait_ms = max(0.0, (time.time() - created_at) * 1_000)
+    delivered_at = time.time()
+    hook_wait_ms = max(0.0, (delivered_at - published_at) * 1_000)
     value = {
         "version": 1,
         "root": payload["root"],
@@ -62,10 +121,21 @@ def _record_delivery_metric(
         "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
         "response_bytes": len(response_bytes),
         "debounce_ms": debounce_ms,
+        "detection_to_flush_ms": max(
+            0.0, (batch_flushed_at - first_observed_at) * 1_000
+        ),
+        "flush_to_provider_ms": max(
+            0.0, (provider_started_at - batch_flushed_at) * 1_000
+        ),
         "provider_ms": provider_ms,
+        "publication_ms": max(
+            0.0, (published_at - provider_completed_at) * 1_000
+        ),
         "hook_wait_ms": hook_wait_ms,
         "hook_execution_ms": max(0.0, (time.perf_counter() - started_at) * 1_000),
-        "total_edit_to_feedback_ms": max(0.0, (time.time() - first_observed_at) * 1_000),
+        "total_edit_to_feedback_ms": max(
+            0.0, (delivered_at - first_observed_at) * 1_000
+        ),
     }
     descriptor, temporary_name = tempfile.mkstemp(prefix=".metric-", dir=metrics)
     temporary = Path(temporary_name)
@@ -230,11 +300,11 @@ def render_feedback_chunk(
     findings = payload.get("findings")
     if not isinstance(findings, list) or not findings:
         return None, []
-    created_at = payload.get("created_at")
+    published_at = payload.get("published_at")
     debounce_ms = payload.get("debounce_ms")
     provider_ms = payload.get("provider_ms")
-    if all(isinstance(value, (int, float)) for value in (created_at, debounce_ms, provider_ms)):
-        hook_wait_ms = max(0.0, (time.time() - float(created_at)) * 1_000)
+    if all(isinstance(value, (int, float)) for value in (published_at, debounce_ms, provider_ms)):
+        hook_wait_ms = max(0.0, (time.time() - float(published_at)) * 1_000)
         first_observed_at = payload.get("first_observed_at")
         total_ms = (
             max(0.0, (time.time() - float(first_observed_at)) * 1_000)
@@ -283,7 +353,57 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--claim-timeout", type=float, default=300)
+    parser.add_argument("--stop-grace", type=float, default=DEFAULT_STOP_GRACE_SECONDS)
+    parser.add_argument("--flush-hint-ttl", type=float, default=30.0)
     return parser.parse_args(argv)
+
+
+def _claim_with_stop_grace(
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    agent_session_id: str,
+    claim_timeout: float,
+    stop_grace: float,
+) -> Path | None:
+    """Wait only while this exact agent session owns a live provider review."""
+    claim = claim_feedback(
+        directory,
+        root=root,
+        session_id=session_id,
+        claim_timeout=claim_timeout,
+    )
+    if claim is not None or stop_grace <= 0:
+        return claim
+    deadline = time.monotonic() + stop_grace
+    active = matching_review_in_flight(
+        directory,
+        root=root,
+        session_id=session_id,
+        agent_session_id=agent_session_id,
+    )
+    while active:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(STOP_POLL_SECONDS, remaining))
+        claim = claim_feedback(
+            directory,
+            root=root,
+            session_id=session_id,
+            claim_timeout=claim_timeout,
+        )
+        if claim is not None:
+            return claim
+        active = matching_review_in_flight(
+            directory,
+            root=root,
+            session_id=session_id,
+            agent_session_id=agent_session_id,
+            validate_hint_files=False,
+        )
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -302,6 +422,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     event = args.event or event_input.get("hook_event_name")
     if event not in {"PostToolUse", "Stop"}:
         return 0
+    if (
+        not 0 <= args.stop_grace <= 10
+        or not 0 < args.flush_hint_ttl <= 300
+    ):
+        if event == "Stop":
+            print("{}")
+        return 0
     # When Codex supplies identity/root fields, independently verify them. A
     # copied hook configuration must never consume another session's batch.
     input_cwd = event_input.get("cwd")
@@ -309,11 +436,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if event == "Stop":
             print("{}")
         return 0
+    agent_session_id = event_input.get("session_id")
     if not verify_session_lease(
         args.spool_dir,
         root=args.root,
         configured_session_id=args.session_id,
-        codex_session_id=event_input.get("session_id"),
+        codex_session_id=agent_session_id,
     ):
         if event == "Stop":
             print("{}")
@@ -321,13 +449,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     if event == "Stop" and event_input.get("stop_hook_active") is True:
         print("{}")
         return 0
+    assert isinstance(agent_session_id, str)
 
-    claim = claim_feedback(
-        args.spool_dir,
-        root=args.root,
-        session_id=args.session_id,
-        claim_timeout=args.claim_timeout,
-    )
+    if event == "PostToolUse":
+        reviewed_files = _hint_reviewed_files(event_input, root=args.root)
+        try:
+            if reviewed_files:
+                publish_flush_hint(
+                    args.spool_dir,
+                    root=args.root,
+                    session_id=args.session_id,
+                    agent_session_id=agent_session_id,
+                    ttl_seconds=args.flush_hint_ttl,
+                    reviewed_files=reviewed_files,
+                )
+        except (OSError, ValueError) as error:
+            print(f"Could not publish watcher flush hint: {error}", file=sys.stderr)
+
+    if event == "Stop":
+        claim = _claim_with_stop_grace(
+            args.spool_dir,
+            root=args.root,
+            session_id=args.session_id,
+            agent_session_id=agent_session_id,
+            claim_timeout=args.claim_timeout,
+            stop_grace=args.stop_grace,
+        )
+    else:
+        claim = claim_feedback(
+            args.spool_dir,
+            root=args.root,
+            session_id=args.session_id,
+            claim_timeout=args.claim_timeout,
+        )
     if claim is None:
         if event == "Stop":
             print("{}")
@@ -344,6 +498,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if event == "Stop":
             print("{}")
         return 0
+    retire_reviewed_flush_hints(
+        args.spool_dir,
+        root=args.root,
+        session_id=args.session_id,
+        reviewed_files=tuple(
+            ReviewedFile(
+                str(item["path"]), str(item["sha256"]), int(item["size"])
+            )
+            for item in validated["reviewed_files"]  # type: ignore[union-attr]
+        ),
+    )
     message, remaining = render_feedback_chunk(validated)
     if message is None:
         acknowledge(args.spool_dir, claim)

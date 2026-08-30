@@ -218,7 +218,8 @@ uv tool install .
 quodet init codex \
   --root /absolute/path/to/project \
   --spool-dir /absolute/private/runtime/quodet-codex \
-  --session-id codex-project-20260830
+  --session-id codex-project-20260830 \
+  --stop-grace 2
 quodet /absolute/path/to/project \
   --agent-config /absolute/private/runtime/quodet-codex/route.json
 ```
@@ -265,7 +266,7 @@ documentation](https://learn.chatgpt.com/docs/hooks). A shortened form is:
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/quodet-codex-hook --spool-dir /absolute/private/runtime/quodet-codex --session-id codex-project-20260830 --root /absolute/path/to/project --event Stop"
+            "command": "/absolute/path/to/quodet-codex-hook --spool-dir /absolute/private/runtime/quodet-codex --session-id codex-project-20260830 --root /absolute/path/to/project --event Stop --stop-grace 2"
           }
         ]
       }
@@ -274,12 +275,22 @@ documentation](https://learn.chatgpt.com/docs/hooks). A shortened form is:
 }
 ```
 
-`PostToolUse` supplies the next supported tool boundary with
-`hookSpecificOutput.additionalContext`. `Stop` blocks completion once when a
-pending batch remains, allowing Codex to continue and independently inspect
-the suggestion. Every delivery is explicitly labelled as untrusted automated
-review data that must be verified before editing. Quodet never bypasses Codex
-permissions or approvals.
+`PostToolUse` sends the watcher a private, session-owned flush hint after a
+direct edit, then returns without waiting for provider inference. The watcher
+keeps its OS-level coverage for shell writes and other processes, but a known
+agent edit can bypass the remaining quiet-window delay. Before provider
+invocation it publishes an expiring in-flight marker for that exact root,
+configured route, and real agent session.
+
+When no feedback is ready, `Stop` waits up to the route's `--stop-grace` only
+if that same session has a live flush hint or review marker. An idle turn
+returns immediately. A review completed inside the grace window is delivered
+without a second user prompt; a slower result stays durable for the next
+matching boundary. `Stop` blocks completion once when it delivers a batch,
+allowing Codex to continue and independently inspect the suggestion. Every
+delivery is explicitly labelled as untrusted automated review data that must
+be verified before editing. Quodet never bypasses Codex permissions or
+approvals.
 
 Session routing fails closed: the producer exclusively leases a canonical
 watched root to one configured session, and the consumer claims only feedback
@@ -421,13 +432,13 @@ LLM provider inference path.
 uv run python -m unittest tests.test_agent_integration -v
 ```
 
-Every delivered message separately reports time from the first observed write
-through the watcher quiet window, provider process/inference time, time waiting
-for the next eligible hook, and total edit-to-feedback latency. This keeps
-debounce cost distinct from model and delivery latency. Private `0600` metric
-records add hook execution time and contain only protocol field names, hashes,
-sizes, route identity, and timings—not source code or finding text. `status`
-reports median and p95 values instead of blending the segments.
+Every delivered message reports the headline watcher, provider, hook-wait, and
+total latency. Private `0600` metrics separately record detection-to-flush,
+flush-to-provider, provider execution, provider-completion-to-publication,
+publication-to-delivery, hook execution, and total edit-to-feedback time. They
+contain only protocol field names, hashes, sizes, route identity, and
+timings—not source code or finding text. `status` reports median and p95 values
+for each segment instead of blending them.
 
 Agent feedback is currently supported only on POSIX systems that provide
 `flock`, descriptor-relative `open`, `O_NOFOLLOW`, and enforceable owner-only
