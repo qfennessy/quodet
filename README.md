@@ -101,6 +101,8 @@ Stop the watcher with Ctrl-C. Useful options include:
 --max-bytes BYTES   Skip larger individual files
 --review-timeout S  Stop a stalled provider review (default: 60 seconds)
 --poll              Poll when native filesystem events are unavailable
+--spool-dir PATH    Also publish validated feedback to a private runtime spool
+--session-id ID     Explicit agent owner required with --spool-dir
 --log               Save requests and responses in llm's local history
 ```
 
@@ -203,6 +205,105 @@ deterministically without contacting a provider. Live-model runs remain an
 explicit, separate evaluation through `evals.agent_changes.live_eval`, which
 records exact run provenance and raw outcomes. Normal unit tests are
 deterministic and never contact a provider.
+
+## Deliver feedback to Codex
+
+Console output remains the default. To feed validated findings back to one
+active Codex session, choose a spool directory outside the watched repository
+and a unique, explicit session identifier:
+
+```sh
+SPOOL="${TMPDIR:-/tmp}/quodet-$UID/feedback"
+SESSION="codex-quodet-$(date +%s)"
+uv run quodet /absolute/path/to/project \
+  --spool-dir "$SPOOL" --session-id "$SESSION"
+```
+
+Quodet snapshots each reviewed file and records its SHA-256 digest. Provider
+JSON is parsed into bounded finding types; unexpected fields, path traversal,
+unreviewed paths, and oversized content are rejected. Immediately before
+delivery, Quodet re-hashes each cited file and drops findings whose reviewed
+bytes are no longer current.
+
+The spool uses `0700` directories and complete `0600` JSON files published by
+atomic filesystem operations. Its pending, claimed, acknowledged, and dedupe states provide a
+durable single-claim workflow: concurrent consumers cannot claim the same
+batch, abandoned claims become retryable after five minutes, acknowledged
+batches stay acknowledged, and identical review results are deduplicated.
+The spool must not be inside the watched root.
+
+Install the package, then add both hooks to `.codex/hooks.json`, replacing the
+three example arguments with the same absolute values passed to Quodet. The
+event and output shapes below follow the official [Codex hooks
+documentation](https://learn.chatgpt.com/docs/hooks):
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(Write|Edit|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "quodet-codex-hook --event PostToolUse --spool-dir /tmp/quodet-501/feedback --session-id codex-example --root /absolute/path/to/project"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "quodet-codex-hook --event Stop --spool-dir /tmp/quodet-501/feedback --session-id codex-example --root /absolute/path/to/project"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`PostToolUse` supplies the next supported tool boundary with
+`hookSpecificOutput.additionalContext`. `Stop` blocks completion once when a
+pending batch remains, allowing Codex to continue and independently inspect
+the suggestion. Every delivery is explicitly labelled as untrusted automated
+review data that must be verified before editing. Quodet never bypasses Codex
+permissions or approvals.
+
+Session routing fails closed: the producer exclusively leases a canonical
+watched root to one configured session, and the consumer claims only feedback
+whose root and session ID both match. Run simultaneous agents in separate
+worktrees; a second feedback session for the same root is rejected. On its
+first invocation, the hook atomically leases that
+configured route to Codex's real `session_id`; a second Codex session cannot use
+the same route. Delete the corresponding private `sessions/` lease only after
+the owning session has ended, or choose a new configured session ID. Producer
+ownership uses a process-exclusive lock in the per-user runtime directory
+(`$XDG_RUNTIME_DIR` when set, otherwise the platform temporary directory,
+under `quodet-$UID/active-roots`), independent of the chosen
+spool, and releases automatically when the watcher exits. A watcher sees writes
+from all processes, so exclusive worktree ownership is required for attribution.
+The spool delivers at most three consecutive review rounds for the same file;
+unrelated paths have independent budgets, and a fifteen-minute quiet interval
+resets the affected path. This prevents a self-sustaining edit/review loop.
+
+Troubleshooting:
+
+- If no feedback arrives, confirm Quodet and both hooks use byte-for-byte
+  identical absolute root, spool, and session values.
+- Pending files remain under `pending/` when ownership is ambiguous. A crashed
+  consumer leaves a file under `claimed/`; it becomes retryable after the claim
+  timeout. Successfully delivered files move to `acknowledged/`.
+- Project-local hooks load only for a trusted project. Restart Codex and inspect
+  `/hooks` after changing `hooks.json`.
+- Secure source snapshots require POSIX descriptor-relative `O_NOFOLLOW` opens,
+  and exclusive producer leases require `flock`. Delivery fails closed on
+  platforms without these primitives.
+- This integration targets Codex hooks. Attaching to an arbitrary already
+  running agent without a documented hook or steering interface is out of
+  scope.
 
 ## Privacy
 

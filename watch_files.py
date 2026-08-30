@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
 import json
 import math
 import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,6 +20,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from feedback import (
+    CompositeSink,
+    ConsoleSink,
+    FeedbackSink,
+    MAX_REVIEWED_FILES,
+    ReviewBatch,
+    ReviewValidationError,
+    ReviewedFile,
+    SpoolSink,
+    fresh_findings,
+    parse_review_output,
+)
 
 try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -110,16 +126,19 @@ REVIEW_SCHEMA = {
                 },
                 "required": [
                     "file",
+                    "line",
                     "severity",
                     "confidence",
                     "title",
                     "explanation",
                     "suggested_fix",
                 ],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["findings"],
+    "additionalProperties": False,
 }
 REVIEW_SCHEMA_JSON = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
 REDACTED = "[REDACTED]"
@@ -205,6 +224,14 @@ class Attachment:
     media_type: str
 
 
+@dataclass(frozen=True)
+class SourceSnapshot:
+    path: Path
+    relative_path: Path
+    contents: str
+    sha256: str
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -268,6 +295,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--evaluation-events",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--spool-dir",
+        type=Path,
+        help=(
+            "also publish validated feedback to this private directory outside "
+            "the watched tree"
+        ),
+    )
+    parser.add_argument(
+        "--session-id",
+        help="explicit coding-agent session owner required with --spool-dir",
     )
     return parser.parse_args(argv)
 
@@ -343,9 +382,54 @@ def is_excluded(
     )
 
 
-def is_utf8_text(path: Path) -> bool:
+def read_bounded_beneath_root(
+    root: Path, relative_path: Path, *, max_bytes: int
+) -> bytes:
+    """Open one regular file without following symlinks below the trusted root."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory_flag or os.open not in os.supports_dir_fd:
+        raise OSError(errno.ENOTSUP, "safe descriptor-relative opens are unavailable")
+    common_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    descriptors: list[int] = []
     try:
-        contents = path.read_text(encoding="utf-8")
+        current = os.open(root, common_flags | directory_flag)
+        descriptors.append(current)
+        for component in relative_path.parts[:-1]:
+            current = os.open(
+                component,
+                common_flags | directory_flag,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        file_descriptor = os.open(
+            relative_path.name,
+            common_flags,
+            dir_fd=current,
+        )
+        descriptors.append(file_descriptor)
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise OSError(errno.EINVAL, "source is not a regular file")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(file_descriptor, min(remaining, 128 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def is_utf8_text(root: Path, relative_path: Path, *, max_bytes: int) -> bool:
+    try:
+        raw = read_bounded_beneath_root(root, relative_path, max_bytes=max_bytes)
+        if len(raw) > max_bytes:
+            return False
+        contents = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
     return "\x00" not in contents
@@ -448,7 +532,7 @@ def collect_attachments(
             )
             continue
 
-        if not is_utf8_text(resolved_path):
+        if not is_utf8_text(root, relative_path, max_bytes=max_bytes):
             print(
                 f"Skipping non-UTF-8 or unreadable file (cannot safely redact): "
                 f"{relative_path}",
@@ -457,26 +541,61 @@ def collect_attachments(
             continue
         attachments.append(Attachment(
             path=resolved_path, media_type="text/plain"))
+        if len(attachments) == MAX_REVIEWED_FILES:
+            print(
+                f"Review batch capped at {MAX_REVIEWED_FILES} files; "
+                "remaining files in this event batch were skipped.",
+                file=sys.stderr,
+            )
+            break
     return attachments
 
 
+def snapshot_attachments(
+    attachments: Sequence[Attachment], *, root: Path, max_bytes: int
+) -> list[SourceSnapshot]:
+    """Read immutable review inputs and bind them to their exact source bytes."""
+    snapshots: list[SourceSnapshot] = []
+    for attachment in attachments:
+        relative_path = attachment.path.relative_to(root)
+        try:
+            source_bytes = read_bounded_beneath_root(
+                root, relative_path, max_bytes=max_bytes
+            )
+            if len(source_bytes) > max_bytes:
+                print(
+                    f"Skipping {relative_path}: exact snapshot exceeds "
+                    f"--max-bytes {max_bytes}",
+                    file=sys.stderr,
+                )
+                continue
+            contents = source_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            print(f"Skipping {relative_path}: could not snapshot: {error}", file=sys.stderr)
+            continue
+        if "\x00" in contents:
+            continue
+        snapshots.append(
+            SourceSnapshot(
+                path=attachment.path,
+                relative_path=relative_path,
+                contents=contents,
+                sha256=hashlib.sha256(source_bytes).hexdigest(),
+            )
+        )
+    return snapshots
+
+
 def sanitize_attachments(
-    attachments: Sequence[Attachment], *, root: Path, destination: Path
+    snapshots: Sequence[SourceSnapshot], *, destination: Path
 ) -> tuple[list[Attachment], int]:
     """Create provider-safe copies; a source file is never used as an attachment."""
     sanitized_attachments: list[Attachment] = []
     total_redactions = 0
 
-    for index, attachment in enumerate(attachments, start=1):
-        relative_path = attachment.path.relative_to(root)
-        try:
-            contents = attachment.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            print(
-                f"Skipping {relative_path}: could not sanitize: {error}", file=sys.stderr)
-            continue
-
-        sanitized, redaction_count = redact_sensitive_values(contents)
+    for index, snapshot in enumerate(snapshots, start=1):
+        relative_path = snapshot.relative_path
+        sanitized, redaction_count = redact_sensitive_values(snapshot.contents)
         sanitized_relative_path, path_redactions = redact_sensitive_path(relative_path)
         provider_contents = (
             f"Original relative path: {sanitized_relative_path}\n\n{sanitized}"
@@ -542,7 +661,10 @@ def review_files(
     review_timeout: float,
     reasoning_effort: str | None,
     evaluation_events: bool = False,
-) -> None:
+    sink: FeedbackSink | None = None,
+    session_id: str | None = None,
+    feedback_round: int = 1,
+) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
         root=root,
@@ -550,21 +672,23 @@ def review_files(
         max_bytes=max_bytes,
     )
     if not attachments:
-        return
+        return None
 
-    labels = [str(attachment.path.relative_to(root))
-              for attachment in attachments]
+    snapshots = snapshot_attachments(attachments, root=root, max_bytes=max_bytes)
+    if not snapshots:
+        return None
+
+    labels = [str(snapshot.relative_path) for snapshot in snapshots]
     print(
         f"\nReviewing {len(labels)} changed file(s): {', '.join(labels)}", flush=True)
 
     with tempfile.TemporaryDirectory(prefix="quodet-sanitized-") as temporary_directory:
         sanitized_attachments, redaction_count = sanitize_attachments(
-            attachments,
-            root=root,
+            snapshots,
             destination=Path(temporary_directory),
         )
         if not sanitized_attachments:
-            return
+            return None
         sanitized_prompt, prompt_redactions = redact_sensitive_values(prompt)
         redaction_count += prompt_redactions
         if redaction_count:
@@ -581,18 +705,14 @@ def review_files(
             reasoning_effort=reasoning_effort,
         )
 
-        run_options: dict[str, object] = {
-            "cwd": root,
-            "check": False,
-            "timeout": review_timeout,
-        }
-        if evaluation_events:
-            run_options.update({"capture_output": True, "text": True})
-
         try:
             result = subprocess.run(
                 command,
-                **run_options,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=review_timeout,
             )
         except subprocess.TimeoutExpired as error:
             if evaluation_events:
@@ -607,7 +727,7 @@ def review_files(
                     f"llm review timed out after {review_timeout:g} seconds",
                     file=sys.stderr,
                 )
-            return
+            return None
         except OSError as error:
             if evaluation_events:
                 print(json.dumps({"quodet_evaluation_event": {
@@ -618,7 +738,7 @@ def review_files(
                 }}), flush=True)
             else:
                 print(f"Could not run llm: {error}", file=sys.stderr)
-            return
+            return None
 
     if evaluation_events:
         print(json.dumps({"quodet_evaluation_event": {
@@ -627,8 +747,38 @@ def review_files(
             "raw_response": result.stdout,
             "stderr": result.stderr,
         }}), flush=True)
-    elif result.returncode != 0:
-        print(f"llm exited with status {result.returncode}", file=sys.stderr)
+    if result.returncode != 0:
+        if not evaluation_events:
+            diagnostic = result.stderr.strip()
+            if diagnostic:
+                print(diagnostic[:2_000], file=sys.stderr)
+            print(f"llm exited with status {result.returncode}", file=sys.stderr)
+        return None
+
+    reviewed_files = tuple(
+        ReviewedFile(path=snapshot.relative_path.as_posix(), sha256=snapshot.sha256)
+        for snapshot in snapshots
+    )
+    try:
+        batch = parse_review_output(
+            result.stdout,
+            root=root,
+            reviewed_files=reviewed_files,
+            session_id=session_id,
+            feedback_round=feedback_round,
+        )
+    except ReviewValidationError as error:
+        print(f"Rejected invalid llm response: {error}", file=sys.stderr)
+        return None
+
+    fresh_batch = fresh_findings(batch)
+    if len(fresh_batch.findings) != len(batch.findings):
+        print(
+            "Discarded stale finding(s) because source changed during review.",
+            file=sys.stderr,
+        )
+    (sink or ConsoleSink()).publish(fresh_batch)
+    return fresh_batch
 
 
 class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -722,6 +872,20 @@ def validate_runtime(path: Path, model: str) -> Path:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = validate_runtime(args.path, args.model)
+    if (args.spool_dir is None) != (args.session_id is None):
+        raise SystemExit("--spool-dir and --session-id must be supplied together")
+    sink: FeedbackSink = ConsoleSink()
+    spool_sink: SpoolSink | None = None
+    if args.spool_dir is not None:
+        spool_sink = SpoolSink(
+            args.spool_dir, root=root, session_id=args.session_id
+        )
+        sink = CompositeSink(
+            [
+                sink,
+                spool_sink,
+            ]
+        )
     changes: queue.Queue[Path] = queue.Queue()
     observer_class = PollingObserver if args.poll else Observer
     observer = observer_class()
@@ -749,12 +913,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.model, args.reasoning_effort
                 ),
                 evaluation_events=args.evaluation_events,
+                sink=sink,
+                session_id=args.session_id,
             )
     except KeyboardInterrupt:
         print("\nStopping watcher.")
     finally:
         observer.stop()
         observer.join()
+        if spool_sink is not None:
+            spool_sink.close()
     return 0
 
 
