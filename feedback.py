@@ -179,11 +179,15 @@ def _bounded_string(value: object, field: str, maximum: int) -> str:
 
 
 def _normalize_finding_path(value: object, root: Path, reviewed: set[str]) -> str:
-    raw = _bounded_string(value, "file", MAX_PATH_LENGTH).replace("\\", "/")
+    raw = _bounded_string(value, "file", MAX_PATH_LENGTH)
     candidate = PurePosixPath(raw)
     if candidate.is_absolute() or ".." in candidate.parts or raw.startswith("~"):
         raise ReviewValidationError("finding path must be relative and cannot traverse")
     normalized = candidate.as_posix()
+    if raw != normalized:
+        raise ReviewValidationError(
+            "finding path must exactly match the supplied relative path"
+        )
     try:
         (root / normalized).resolve(strict=False).relative_to(root)
     except (OSError, ValueError) as error:

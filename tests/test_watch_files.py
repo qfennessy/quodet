@@ -332,6 +332,13 @@ class WatchFilesTests(unittest.TestCase):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, prompt)
 
+    def test_default_prompt_requires_exact_supplied_relative_path(self) -> None:
+        prompt = watch_files.DEFAULT_PROMPT.lower()
+
+        self.assertIn("original relative path:", prompt)
+        self.assertIn("exactly and verbatim", prompt)
+        self.assertIn("never add, remove, normalize, or guess", prompt)
+
     def test_suggested_fix_schema_is_required_bounded_and_documented(self) -> None:
         findings = watch_files.REVIEW_SCHEMA["properties"]["findings"]
         finding = findings["items"]

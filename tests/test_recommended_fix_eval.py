@@ -105,6 +105,27 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "grounded")
         self.assertEqual(result["supplied_test_files"], ["spec/cache_spec.rb"])
 
+    def test_jest_directory_is_recognized_as_supplied_test_evidence(self) -> None:
+        result = scoring.evaluate_recommendation(
+            "Extend the existing test in __tests__/cache.js with an expired entry.",
+            supplied_files=["cache.js", "__tests__/cache.js"],
+        )
+
+        self.assertEqual(result["status"], "grounded")
+        self.assertEqual(result["supplied_test_files"], ["__tests__/cache.js"])
+
+    def test_unsupplied_test_symbol_is_rejected(self) -> None:
+        result = scoring.evaluate_recommendation(
+            "Extend test_expired_entry with a stale-value assertion.",
+            supplied_files=["expired_cache.py"],
+        )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertEqual(
+            result["violations"][0]["code"],
+            "unsupported-test-mutation",
+        )
+
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
             "Preserve the existing cache regression test.",

@@ -122,8 +122,11 @@ security-boundary bypass, irreversible data loss, or system-wide outage; high
 for a major production failure; medium for bounded incorrect behavior or a
 localized crash; and low for a limited defect. Do not infer blast radius from
 missing deployment or usage context.
-Use the supplied original relative path and the most specific line number
-available. If no finding meets this threshold, return an empty findings array.
+For finding.file, copy the value after each supplied `Original relative path:`
+label exactly and verbatim; never add, remove, normalize, or guess a directory
+prefix, and never substitute a basename or path alias. Use the most specific
+line number available. Return an empty findings array if no finding meets this
+threshold.
 Respond only with JSON matching the supplied schema."""
 REVIEW_SCHEMA = {
     "type": "object",

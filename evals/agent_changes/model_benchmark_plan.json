@@ -16,7 +16,7 @@
   },
   "review_contract": {
     "prompt_revision": "quodet-review-v3",
-    "prompt_sha256": "eff10fe7da4c57bdc6c62d6391a697dd48b26abb50eae8380bc2a90ff5118f05",
+    "prompt_sha256": "50ccecf60b7bd3b1984a0704e78bc9c32c33a5c6553430bb26547d337514daf7",
     "schema_revision": "quodet-findings-v3",
     "schema_sha256": "d2b3627c6547348b62f1e30c4e89e3b6c2b898c181911c1ebe74f2f1f991ec5a",
     "attempts_per_case": 1,

@@ -188,6 +188,19 @@ class FeedbackTests(unittest.TestCase):
             with self.subTest(output=output[:30]), self.assertRaises(ReviewValidationError):
                 self.parse(output)
 
+    def test_parse_rejects_wrong_prefix_and_path_aliases(self) -> None:
+        for finding_path in (
+            "project/src/app.py",
+            "./src/app.py",
+            "src//app.py",
+            "src\\app.py",
+        ):
+            with self.subTest(finding_path=finding_path), self.assertRaisesRegex(
+                ReviewValidationError,
+                "finding path",
+            ):
+                self.parse(valid_output(finding_path))
+
     def test_freshness_removes_finding_after_file_changes(self) -> None:
         batch = self.parse(valid_output())
         (self.root / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")

@@ -8,8 +8,9 @@ from typing import Sequence
 
 
 _TEST_PATH = re.compile(
-    r"(?<![A-Za-z0-9_.-])((?:[A-Za-z0-9_.-]+/)*(?:test_[A-Za-z0-9_.-]+|"
-    r"[A-Za-z0-9_.-]+_(?:test|spec)|[A-Za-z0-9_.-]+\.(?:spec|test))\."
+    r"(?<![A-Za-z0-9_.-])((?:(?:[A-Za-z0-9_.-]+/)*__tests__/"
+    r"[A-Za-z0-9_.-]+|(?:[A-Za-z0-9_.-]+/)*(?:test_[A-Za-z0-9_.-]+|"
+    r"[A-Za-z0-9_.-]+_(?:test|spec)|[A-Za-z0-9_.-]+\.(?:spec|test)))\."
     r"(?:py|js|jsx|ts|tsx|rb|go|rs|java|kt))(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
@@ -25,7 +26,11 @@ _CLAUSE_BOUNDARY = re.compile(
     r"preserve|retain|extend|modify|update|keep)\b)",
     re.IGNORECASE,
 )
-_TEST_WORD = re.compile(r"\btests?\b", re.IGNORECASE)
+_TEST_WORD = re.compile(
+    r"\btests?\b|(?<![A-Za-z0-9_])(?:test_[A-Za-z0-9_]+|"
+    r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _MUTATION_VERB = re.compile(
     r"\b(?:preserve|retain|extend|modify|update|keep)\b", re.IGNORECASE
 )
@@ -51,6 +56,7 @@ def is_test_file(path: str) -> bool:
         or "tests" in parts
         or "spec" in parts
         or "specs" in parts
+        or "__tests__" in parts
         or name.startswith("test_")
         or any(
             marker in name
