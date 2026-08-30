@@ -117,16 +117,30 @@ def _reference_is_negated(clause: str, reference_start: int) -> bool:
     return _NEGATED_TEST_REFERENCE_PREFIX.search(clause[:reference_start]) is not None
 
 
+def _nearest_intent(clause: str, position: int) -> tuple[int, int, str] | None:
+    intents = [
+        *(
+            (match.start(), match.end(), "mutation")
+            for match in _MUTATION_VERB.finditer(clause, 0, position)
+        ),
+        *(
+            (match.start(), match.end(), "creation")
+            for match in _CREATION_VERB.finditer(clause, 0, position)
+        ),
+    ]
+    return max(intents, key=lambda intent: intent[1]) if intents else None
+
+
 def _mutates_unsupplied_test(
     clause: str, *, supplied_test_symbols: set[str]
 ) -> bool:
     """Return whether the nearest intent verb targets a generic test mention."""
-    visible_clause_symbols = {
-        match.group(0)
+    visible_symbol_matches = [
+        match
         for match in _TEST_SYMBOL.finditer(clause)
         if match.group(0) in supplied_test_symbols
         and not _reference_is_negated(clause, match.start())
-    }
+    ]
     proposed_path_spans = [
         (match.start(), match.end())
         for match in _TEST_PATH.finditer(clause)
@@ -137,27 +151,35 @@ def _mutates_unsupplied_test(
         for match in _TEST_WORD.finditer(clause)
         if not _reference_is_negated(clause, match.start())
     ]
-    visible_spec_symbol = any(
-        _SPEC_SYMBOL.fullmatch(symbol) is not None
-        for symbol in visible_clause_symbols
-    )
-    has_spec_context = any(
-        not _reference_is_negated(clause, match.start())
+    spec_context_matches = [
+        match
         for match in _SPEC_TEST_CONTEXT.finditer(clause)
+        if not _reference_is_negated(clause, match.start())
+    ]
+    context_intents = {
+        intent[0]
+        for match in (*test_matches, *visible_symbol_matches, *spec_context_matches)
+        if (intent := _nearest_intent(clause, match.start())) is not None
+    }
+    test_matches.extend(
+        match
+        for match in _SPEC_SYMBOL.finditer(clause)
+        if not _reference_is_negated(clause, match.start())
+        and (intent := _nearest_intent(clause, match.start())) is not None
+        and intent[0] in context_intents
     )
-    if test_matches or visible_spec_symbol or has_spec_context:
-        test_matches.extend(
-            match
-            for match in _SPEC_SYMBOL.finditer(clause)
-            if not _reference_is_negated(clause, match.start())
-        )
-        test_matches.sort(key=lambda match: match.start())
+    test_matches.sort(key=lambda match: match.start())
     for test_match in test_matches:
         if test_match.group(0) in supplied_test_symbols:
             continue
+        intent = _nearest_intent(clause, test_match.start())
         if (
             test_match.group(0).lower() in {"test", "tests"}
-            and visible_clause_symbols
+            and intent is not None
+            and any(
+                _nearest_intent(clause, match.start()) == intent
+                for match in visible_symbol_matches
+            )
         ):
             continue
         if any(
@@ -165,16 +187,12 @@ def _mutates_unsupplied_test(
             for start, end in proposed_path_spans
         ):
             continue
-        preceding = clause[: test_match.start()]
-        intents = [
-            *((match.end(), "mutation") for match in _MUTATION_VERB.finditer(preceding)),
-            *((match.end(), "creation") for match in _CREATION_VERB.finditer(preceding)),
-        ]
-        if not intents:
+        if intent is None:
             continue
-        intent_end, intent = max(intents)
-        if intent == "mutation":
+        _, intent_end, intent_kind = intent
+        if intent_kind == "mutation":
             return True
+        preceding = clause[: test_match.start()]
         if not (
             _NEW_TEST_MODIFIERS.fullmatch(preceding[intent_end:])
             or _PROPOSED_PATH_PREFIX.search(preceding)
