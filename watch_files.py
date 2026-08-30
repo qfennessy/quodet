@@ -567,6 +567,67 @@ def redact_sensitive_values(text: str) -> tuple[str, int]:
     return redacted.text, redacted.total
 
 
+def redact_provider_response(
+    text: str,
+    *,
+    provider_paths: Sequence[str],
+) -> tuple[str, int]:
+    """Redact provider JSON while preserving validated provider-visible file labels.
+
+    Generated evaluation labels can resemble high-entropy credentials once a
+    directory and filename are joined.  The labels have already crossed the
+    provider boundary after component-aware path redaction, so preserve only
+    exact ``finding.file`` values from that allowlist.  Every other response
+    field remains subject to the normal secret detectors.
+    """
+    try:
+        document = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        return redact_sensitive_values(text)
+    if not isinstance(document, dict) or not isinstance(
+        document.get("findings"), list
+    ):
+        return redact_sensitive_values(text)
+
+    allowed_paths = set(provider_paths)
+    approved_paths: set[str] = set()
+    for finding in document["findings"]:
+        if not isinstance(finding, dict):
+            continue
+        path = finding.get("file")
+        if isinstance(path, str) and path in allowed_paths:
+            approved_paths.add(path)
+
+    shielded = text
+    restore_tokens: dict[str, str] = {}
+    for path in sorted(approved_paths):
+        representations = {
+            json.dumps(path),
+            json.dumps(path, ensure_ascii=False),
+            json.dumps(path).replace("/", r"\/"),
+            json.dumps(path, ensure_ascii=False).replace("/", r"\/"),
+        }
+        found_representation = False
+        for representation in sorted(representations):
+            if representation not in shielded:
+                continue
+            found_representation = True
+            index = len(restore_tokens)
+            placeholder = json.dumps(f"quodet-safe-path-{index}")
+            while placeholder in shielded or placeholder in restore_tokens:
+                index += 1
+                placeholder = json.dumps(f"quodet-safe-path-{index}")
+            shielded = shielded.replace(representation, placeholder)
+            restore_tokens[placeholder] = representation
+        if not found_representation:
+            return redact_sensitive_values(text)
+
+    sanitized, count = redact_sensitive_values(shielded)
+    for placeholder, representation in restore_tokens.items():
+        sanitized = sanitized.replace(placeholder, representation)
+    return sanitized, count
+
+
 def redact_sensitive_path(path: Path) -> tuple[str, int]:
     """Redact path components without treating separators as token characters."""
     redacted = redact_path(path)
@@ -1133,7 +1194,10 @@ def _execute_review_command(
         return None
     provider_completed_at = time.time()
     provider_ms = (time.monotonic() - provider_started) * 1_000
-    safe_stdout, _ = redact_sensitive_values(result.stdout)
+    safe_stdout, _ = redact_provider_response(
+        result.stdout,
+        provider_paths=tuple(provider_path_map),
+    )
     safe_stderr, _ = redact_sensitive_values(result.stderr)
     result = BoundedProcessResult(
         returncode=result.returncode,

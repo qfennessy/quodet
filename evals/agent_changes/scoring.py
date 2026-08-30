@@ -274,10 +274,20 @@ def score_run(
         split_schema_valid = sum(
             outcome["status"] == "schema-valid" for outcome in split_outcomes
         )
+        has_expected_finding_sample = any(
+            outcome["status"] == "schema-valid"
+            and bool(outcome["expected_finding_ids"])
+            for outcome in split_outcomes
+        )
         has_quality_sample = (
             bool(split_schema_valid)
             if split.startswith("challenge-")
             else bool(split_outcomes)
+        )
+        has_recall_sample = (
+            has_expected_finding_sample
+            if split.startswith("challenge-")
+            else has_quality_sample
         )
         split_metrics[split] = {
             **counts,
@@ -291,7 +301,8 @@ def score_run(
             ),
             "finding_recall": (
                 split_tp / (split_tp + split_fn)
-                if split_tp + split_fn else (1.0 if has_quality_sample else None)
+                if split_tp + split_fn
+                else (1.0 if has_recall_sample else None)
             ),
             "fix_quality_score": (
                 sum(split_fix_scores) / len(split_fix_scores)
