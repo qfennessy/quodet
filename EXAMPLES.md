@@ -9,7 +9,21 @@ finding for the clean control.
 The recommendations are untrusted review data. A developer or coding agent
 should verify each diagnosis against the current code before making changes.
 
+> [!WARNING]
+> Every source snippet in examples 1–7 is intentionally defective evaluation
+> code. It demonstrates what Quodet reviews; it is not an implementation to
+> copy into production.
+
+Each example follows the same structure:
+
+1. **Defective evaluation code** is the source presented to Quodet.
+2. **Why the code is defective** traces the trigger to its observable impact.
+3. **Suggestion delivered to the coding agent** is the recommendation returned
+   by Quodet during the live evaluation, reproduced without alteration.
+
 ## 1. Undefined variable
+
+### Defective evaluation code
 
 Fixture: [`calculator.py`](evals/agent_changes/cases/01_obvious_runtime/calculator.py)
 
@@ -23,13 +37,22 @@ def mean(values: Sequence[float]) -> float:
     return sum(value) / len(values)
 ```
 
-For every non-empty input, `value` is undefined and `mean()` raises
-`NameError`.
+### Why this code is defective
+
+The empty-input branch works, which can hide the defect in a shallow test. For
+every non-empty sequence, execution reaches `sum(value)`, but the function
+parameter is named `values` and no local or global `value` exists. Python raises
+`NameError` before performing the sum, so `mean()` crashes for every normal
+input instead of returning a number.
+
+### Suggestion delivered to the coding agent
 
 > Change the expression to `sum(values) / len(values)`. Add a regression test
 > asserting `mean([1.0, 3.0]) == 2.0` while retaining the empty-input test.
 
 ## 2. Exclusive slice off by one
+
+### Defective evaluation code
 
 Fixture: [`pagination.py`](evals/agent_changes/cases/02_source_and_test_boundary/pagination.py)
 
@@ -49,14 +72,23 @@ def page(items: Sequence[T], page_number: int, page_size: int) -> Sequence[T]:
     return items[start:end]
 ```
 
-Python excludes the slice end, so every page contains one fewer item than
-requested; a page size of one returns an empty sequence.
+### Why this code is defective
+
+Python slices include `start` but exclude `end`. Subtracting one from the
+calculated end therefore removes a valid item rather than compensating for an
+inclusive boundary. A request for page 1 with size 2 evaluates to `items[0:1]`
+and returns one item; a page size of 1 evaluates to an empty slice. Items can be
+omitted from every page even though the input validation accepts the request.
+
+### Suggestion delivered to the coding agent
 
 > Calculate the exclusive end as `start + page_size`. Add regression checks
 > that `page([1, 2, 3, 4], 1, 2) == [1, 2]` and that a later page contains its
 > full requested range.
 
 ## 3. Milliseconds compared with seconds
+
+### Defective evaluation code
 
 Fixtures: [`token_model.py`](evals/agent_changes/cases/03_cross_file_units/token_model.py)
 and [`token_service.py`](evals/agent_changes/cases/03_cross_file_units/token_service.py)
@@ -89,8 +121,16 @@ def is_active(token: Token) -> bool:
     return token.expires_at_ms > time.time()
 ```
 
-The expiration is stored in epoch milliseconds but compared with epoch
-seconds, so expired tokens remain active far beyond their intended lifetime.
+### Why this code is defective
+
+`issue_token()` multiplies epoch seconds by 1,000 and records the result as
+milliseconds. `is_active()` compares that much larger integer directly with
+`time.time()`, which still returns seconds. After the intended deadline passes,
+the millisecond timestamp remains roughly 1,000 times larger than the seconds
+timestamp, so an expired token continues to be reported as active for an
+extremely long time.
+
+### Suggestion delivered to the coding agent
 
 > Compare values in the same unit, for example change the return expression to
 > `token.expires_at_ms > int(time.time() * 1000)`. Add a regression test that
@@ -98,6 +138,8 @@ seconds, so expired tokens remain active far beyond their intended lifetime.
 > `is_active` becomes `False` after its expiration.
 
 ## 4. Permission cache crosses tenant boundaries
+
+### Defective evaluation code
 
 Fixture: [`access_service.py`](evals/agent_changes/cases/04_tenant_cache_scope/access_service.py)
 
@@ -125,9 +167,16 @@ def can_edit(
     return _permission_cache[cache_key]
 ```
 
-The authorization result depends on `tenant_id`, but the cache key does not.
-An editor result from one tenant can therefore authorize the same identifiers
-in another tenant.
+### Why this code is defective
+
+The role lookup depends on `user_id`, `tenant_id`, and `document_id`, but the
+cache key stores only the user and document. If tenant A grants a user editor
+access and that result is cached, a later request for the same user and document
+ID in tenant B returns tenant A's `True` without calling `load_roles()` for
+tenant B. The stale cache entry therefore crosses an authorization boundary and
+can grant access in a tenant where the user has no editor role.
+
+### Suggestion delivered to the coding agent
 
 > Include `tenant_id` in the cache key, updating the cache type to
 > `dict[tuple[str, str, str], bool]` and using
@@ -137,6 +186,8 @@ in another tenant.
 > tenant's roles are evaluated independently.
 
 ## 5. Await boundary creates an inventory race
+
+### Defective evaluation code
 
 Fixture: [`inventory.py`](evals/agent_changes/cases/05_async_agent_patch/inventory.py)
 
@@ -159,8 +210,16 @@ class Inventory:
         return True
 ```
 
-Concurrent callers can both pass the availability check before either resumes
-after `_persist()`, allowing more stock to be reserved than exists.
+### Why this code is defective
+
+The availability check and decrement are intended to be one state transition,
+but `_persist()` introduces an `await` between them. With five units available,
+two concurrent `reserve(4)` calls can both observe five and pass the check.
+Both tasks then resume, subtract four, return success, and leave the inventory
+at negative three. The method confirms eight reserved units even though only
+five existed.
+
+### Suggestion delivered to the coding agent
 
 > Add an `asyncio.Lock` to `Inventory` and hold it across the availability
 > check, `_persist`, and decrement so the state transition is serialized. Add
@@ -169,6 +228,8 @@ after `_persist()`, allowing more stock to be reserved than exists.
 > exactly one result is `True` and `available == 1`.
 
 ## 6. Exception path leaks a pooled connection
+
+### Defective evaluation code
 
 Fixture: [`worker.py`](evals/agent_changes/cases/06_exception_cleanup/worker.py)
 
@@ -183,8 +244,16 @@ async def run_job(pool: ConnectionPool, job: str) -> str:
     return result
 ```
 
-If `execute()` raises or the task is cancelled, control exits before
-`release()`, eventually exhausting the pool.
+### Why this code is defective
+
+After `acquire()` succeeds, returning the connection is mandatory on every exit
+path. Here, `release()` runs only after `execute()` completes normally. If
+`execute()` raises or the task is cancelled at that await, control leaves
+`run_job()` immediately and the connection remains checked out. Repeated job
+failures consume the pool until later jobs block or fail to acquire a
+connection.
+
+### Suggestion delivered to the coding agent
 
 > Wrap the execution and result handling in `try`/`finally`, with
 > `await pool.release(connection)` in the `finally` block so every successfully
@@ -193,6 +262,8 @@ If `execute()` raises or the task is cancelled, control exits before
 > `pool.release` was called with that connection.
 
 ## 7. Duplicates inside one incoming batch survive
+
+### Defective evaluation code
 
 Fixture: [`events.py`](evals/agent_changes/cases/07_batch_deduplication/events.py)
 
@@ -211,8 +282,16 @@ def merge_events(existing: list[Event], incoming: list[Event]) -> list[Event]:
     return [*existing, *accepted]
 ```
 
-`seen_ids` is never updated while filtering `incoming`, so two new events with
-the same ID are both accepted.
+### Why this code is defective
+
+`seen_ids` contains identifiers from `existing` only. The comprehension checks
+every incoming event against that unchanged set, so the first accepted event
+does not make its ID visible to the next check. If two incoming events share a
+new ID, both are appended. Downstream code can then persist or process the same
+logical event twice even though `merge_events()` is supposed to deduplicate the
+combined batch.
+
+### Suggestion delivered to the coding agent
 
 > Iterate through `incoming`, add each accepted event's ID to `seen_ids` before
 > accepting the next event, and append only IDs not already seen. Add a
