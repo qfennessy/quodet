@@ -14,6 +14,7 @@ import stat
 import statistics
 import sys
 import tempfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -89,11 +90,17 @@ def require_secure_platform() -> None:
     required_flags = all(
         getattr(os, name, 0) for name in ("O_NOFOLLOW", "O_DIRECTORY")
     )
+    descriptor_relative = all(
+        operation in os.supports_dir_fd
+        for operation in (os.link, os.mkdir, os.open, os.stat, os.unlink)
+    )
+    no_follow = os.link in os.supports_follow_symlinks
     if (
         os.name != "posix"
         or fcntl is None
         or not hasattr(os, "getuid")
-        or os.open not in os.supports_dir_fd
+        or not descriptor_relative
+        or not no_follow
         or not required_flags
     ):
         raise RuntimeError(
@@ -139,6 +146,206 @@ def _create_private_json(path: Path, value: object) -> None:
     finally:
         try:
             temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@dataclass(frozen=True)
+class _SettingsLocation:
+    root: Path
+    root_descriptor: int
+    parent_descriptor: int
+    directory_chain: tuple[tuple[int, str, int], ...]
+    filename: str
+
+    def assert_attached(self) -> None:
+        """Verify every held directory is still attached beneath the same root."""
+        root_metadata = os.stat(self.root, follow_symlinks=False)
+        held_root = os.fstat(self.root_descriptor)
+        if (root_metadata.st_dev, root_metadata.st_ino) != (
+            held_root.st_dev,
+            held_root.st_ino,
+        ):
+            raise PermissionError("project root changed during settings setup")
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        for parent_descriptor, component, held_descriptor in self.directory_chain:
+            try:
+                current = os.open(component, flags, dir_fd=parent_descriptor)
+            except OSError as error:
+                raise PermissionError(
+                    "settings directory changed during setup"
+                ) from error
+            try:
+                current_metadata = os.fstat(current)
+                held_metadata = os.fstat(held_descriptor)
+                if (current_metadata.st_dev, current_metadata.st_ino) != (
+                    held_metadata.st_dev,
+                    held_metadata.st_ino,
+                ):
+                    raise PermissionError("settings directory changed during setup")
+            finally:
+                os.close(current)
+
+
+@contextmanager
+def _secure_settings_location(root: Path, relative_settings: str):
+    """Open/create a real settings parent beneath root without following links."""
+    relative = Path(relative_settings)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) < 2
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("agent settings path must be a nested relative path")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        root_descriptor = os.open(root, directory_flags)
+    except OSError as error:
+        raise PermissionError("project root must be a real directory") from error
+    opened: list[int] = []
+    chain: list[tuple[int, str, int]] = []
+    current_descriptor = root_descriptor
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                child_descriptor = os.open(
+                    component, directory_flags, dir_fd=current_descriptor
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    child_descriptor = os.open(
+                        component, directory_flags, dir_fd=current_descriptor
+                    )
+                except OSError as error:
+                    raise PermissionError(
+                        "agent settings parent must be a real directory beneath root"
+                    ) from error
+            except OSError as error:
+                raise PermissionError(
+                    "agent settings parent must be a real directory beneath root"
+                ) from error
+            opened.append(child_descriptor)
+            chain.append((current_descriptor, component, child_descriptor))
+            current_descriptor = child_descriptor
+        location = _SettingsLocation(
+            root=root,
+            root_descriptor=root_descriptor,
+            parent_descriptor=current_descriptor,
+            directory_chain=tuple(chain),
+            filename=relative.parts[-1],
+        )
+        location.assert_attached()
+        yield location
+        location.assert_attached()
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        os.close(root_descriptor)
+
+
+def _read_settings_json(location: _SettingsLocation) -> object | None:
+    """Read one existing regular settings file without following a target link."""
+    location.assert_attached()
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(
+            location.filename, flags, dir_fd=location.parent_descriptor
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PermissionError("agent settings target must be a regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("agent settings target must be a regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            value = json.load(stream)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    location.assert_attached()
+    return value
+
+
+def _create_settings_json(location: _SettingsLocation, value: object) -> None:
+    """Create settings relative to a held no-follow directory descriptor."""
+    location.assert_attached()
+    temporary_name = f".quodet-settings-{uuid.uuid4().hex}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(
+        temporary_name,
+        flags,
+        0o600,
+        dir_fd=location.parent_descriptor,
+    )
+    linked = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        location.assert_attached()
+        os.link(
+            temporary_name,
+            location.filename,
+            src_dir_fd=location.parent_descriptor,
+            dst_dir_fd=location.parent_descriptor,
+            follow_symlinks=False,
+        )
+        linked = True
+        os.fsync(location.parent_descriptor)
+        location.assert_attached()
+    except BaseException:
+        if linked:
+            try:
+                temporary_metadata = os.stat(
+                    temporary_name,
+                    dir_fd=location.parent_descriptor,
+                    follow_symlinks=False,
+                )
+                target_metadata = os.stat(
+                    location.filename,
+                    dir_fd=location.parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (temporary_metadata.st_dev, temporary_metadata.st_ino) == (
+                    target_metadata.st_dev,
+                    target_metadata.st_ino,
+                ):
+                    os.unlink(location.filename, dir_fd=location.parent_descriptor)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=location.parent_descriptor)
         except FileNotFoundError:
             pass
 
@@ -314,6 +521,90 @@ def hook_configuration(
     }
 
 
+def _settings_are_compatible(
+    current: object,
+    *,
+    expected: object,
+    legacy: object,
+    stop_grace_seconds: float,
+) -> bool:
+    return current == expected or (
+        stop_grace_seconds == 2.0 and current == legacy
+    )
+
+
+def _initialize_artifacts(
+    route: RouteConfig,
+    *,
+    settings: Path,
+    settings_location: _SettingsLocation,
+    expected_settings: object,
+    legacy_settings: object,
+) -> tuple[Path, Path]:
+    try:
+        current_settings = _read_settings_json(settings_location)
+    except PermissionError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing settings are not valid JSON: {settings}") from error
+    if current_settings is not None and not _settings_are_compatible(
+        current_settings,
+        expected=expected_settings,
+        legacy=legacy_settings,
+        stop_grace_seconds=route.stop_grace_seconds,
+    ):
+        raise FileExistsError(
+            f"refusing to overwrite existing settings: {settings}; "
+            "merge the generated hooks manually"
+        )
+
+    route_file = route_path(route.spool_path)
+    if route_file.exists():
+        existing_route = load_route(route_file)
+        if existing_route != route:
+            raise FileExistsError(f"refusing to overwrite existing route: {route_file}")
+
+    _private_directory(route.spool_path)
+    for name in (
+        "pending", "claimed", "acknowledged", "rejected", "dedupe", "sessions",
+        "metrics", "flush-hints", "in-flight"
+    ):
+        _private_directory(route.spool_path / name)
+    if not route_file.exists():
+        try:
+            _create_private_json(route_file, asdict(route))
+        except FileExistsError:
+            if load_route(route_file) != route:
+                raise FileExistsError(
+                    f"refusing to overwrite concurrently created route: {route_file}"
+                ) from None
+    if current_settings is None:
+        try:
+            _create_settings_json(settings_location, expected_settings)
+        except FileExistsError:
+            try:
+                winner = _read_settings_json(settings_location)
+            except PermissionError:
+                raise
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise FileExistsError(
+                    f"refusing to overwrite concurrently created settings: {settings}"
+                ) from error
+            if winner != expected_settings:
+                raise FileExistsError(
+                    f"refusing to overwrite concurrently created settings: {settings}"
+                ) from None
+    final_settings = _read_settings_json(settings_location)
+    if not _settings_are_compatible(
+        final_settings,
+        expected=expected_settings,
+        legacy=legacy_settings,
+        stop_grace_seconds=route.stop_grace_seconds,
+    ):
+        raise PermissionError("agent settings changed during setup")
+    return route_file, settings
+
+
 def initialize(
     agent: str,
     *,
@@ -354,57 +645,24 @@ def initialize(
         include_stop_grace=False,
     )
 
-    # Validate every collision before creating either artifact. Existing agent
-    # settings are never merged or overwritten implicitly.
-    if settings.exists():
-        try:
-            current_settings = json.loads(settings.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"existing settings are not valid JSON: {settings}") from error
-        legacy_is_compatible = (
-            route.stop_grace_seconds == 2.0 and current_settings == legacy_settings
+    # Preserve validation-only behavior when another route already owns the
+    # requested spool: do not even create an empty agent settings directory.
+    existing_route_file = route_path(canonical_spool)
+    if existing_route_file.exists() and load_route(existing_route_file) != route:
+        raise FileExistsError(
+            f"refusing to overwrite existing route: {existing_route_file}"
         )
-        if current_settings != expected_settings and not legacy_is_compatible:
-            raise FileExistsError(
-                f"refusing to overwrite existing settings: {settings}; "
-                "merge the generated hooks manually"
-            )
-    route_file = route_path(canonical_spool)
-    if route_file.exists():
-        existing_route = load_route(route_file)
-        if existing_route != route:
-            raise FileExistsError(f"refusing to overwrite existing route: {route_file}")
 
-    _private_directory(canonical_spool)
-    for name in (
-        "pending", "claimed", "acknowledged", "rejected", "dedupe", "sessions",
-        "metrics", "flush-hints", "in-flight"
-    ):
-        _private_directory(canonical_spool / name)
-    if not route_file.exists():
-        try:
-            _create_private_json(route_file, asdict(route))
-        except FileExistsError:
-            if load_route(route_file) != route:
-                raise FileExistsError(
-                    f"refusing to overwrite concurrently created route: {route_file}"
-                ) from None
-    if not settings.exists():
-        settings.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            _create_private_json(settings, expected_settings)
-        except FileExistsError:
-            try:
-                winner = json.loads(settings.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise FileExistsError(
-                    f"refusing to overwrite concurrently created settings: {settings}"
-                ) from error
-            if winner != expected_settings:
-                raise FileExistsError(
-                    f"refusing to overwrite concurrently created settings: {settings}"
-                ) from None
-    return route_file, settings
+    # Open every settings-path component relative to the canonical root without
+    # following links and retain those descriptors through validation/creation.
+    with _secure_settings_location(canonical_root, adapter.settings_path) as location:
+        return _initialize_artifacts(
+            route,
+            settings=settings,
+            settings_location=location,
+            expected_settings=expected_settings,
+            legacy_settings=legacy_settings,
+        )
 
 
 def _session_lease_path(route: RouteConfig) -> Path:

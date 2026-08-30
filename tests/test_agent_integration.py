@@ -209,6 +209,122 @@ class AgentIntegrationTests(unittest.TestCase):
                 agent_command=self._executable("ancestor-agent"),
             )
 
+    def test_init_rejects_symlinked_settings_parents_without_external_writes(self) -> None:
+        external = self.base / "external-settings"
+        external.mkdir()
+        for agent, directory_name, filename in (
+            ("codex", ".codex", "hooks.json"),
+            ("claude", ".claude", "settings.json"),
+        ):
+            with self.subTest(agent=agent):
+                root = self.base / f"symlink-parent-{agent}"
+                root.mkdir()
+                (root / directory_name).symlink_to(external, target_is_directory=True)
+                spool = self.base / f"symlink-parent-spool-{agent}"
+
+                with self.assertRaisesRegex(PermissionError, "real directory"):
+                    agent_integration.initialize(
+                        agent,
+                        root=root,
+                        spool_dir=spool,
+                        session_id=f"{agent}-symlink-parent",
+                        hook_command=self._executable(f"{agent}-symlink-hook"),
+                        agent_command=self._executable(f"{agent}-symlink-agent"),
+                    )
+
+                self.assertFalse((external / filename).exists())
+                self.assertFalse(spool.exists())
+
+    def test_init_rejects_symlinked_settings_targets_without_modifying_target(self) -> None:
+        for agent, directory_name, filename in (
+            ("codex", ".codex", "hooks.json"),
+            ("claude", ".claude", "settings.json"),
+        ):
+            with self.subTest(agent=agent):
+                root = self.base / f"symlink-target-{agent}"
+                settings_parent = root / directory_name
+                settings_parent.mkdir(parents=True)
+                external_target = self.base / f"external-{agent}.json"
+                external_target.write_text('{"sentinel": true}\n', encoding="utf-8")
+                (settings_parent / filename).symlink_to(external_target)
+                spool = self.base / f"symlink-target-spool-{agent}"
+
+                with self.assertRaisesRegex(PermissionError, "regular file"):
+                    agent_integration.initialize(
+                        agent,
+                        root=root,
+                        spool_dir=spool,
+                        session_id=f"{agent}-symlink-target",
+                        hook_command=self._executable(f"{agent}-target-hook"),
+                        agent_command=self._executable(f"{agent}-target-agent"),
+                    )
+
+                self.assertEqual(
+                    external_target.read_text(encoding="utf-8"),
+                    '{"sentinel": true}\n',
+                )
+                self.assertFalse(spool.exists())
+
+    def test_secure_settings_location_rejects_nested_symlink_component(self) -> None:
+        root = self.base / "nested-settings-root"
+        nested = root / "real"
+        nested.mkdir(parents=True)
+        external = self.base / "nested-external"
+        external.mkdir()
+        (nested / "redirect").symlink_to(external, target_is_directory=True)
+
+        with self.assertRaisesRegex(PermissionError, "real directory"):
+            with agent_integration._secure_settings_location(
+                root, "real/redirect/hooks.json"
+            ):
+                self.fail("nested symlink should not be opened")
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_init_accepts_existing_real_settings_directories(self) -> None:
+        for agent, directory_name, filename in (
+            ("codex", ".codex", "hooks.json"),
+            ("claude", ".claude", "settings.json"),
+        ):
+            with self.subTest(agent=agent):
+                root = self.base / f"real-settings-{agent}"
+                (root / directory_name).mkdir(parents=True)
+                spool = self.base / f"real-settings-spool-{agent}"
+
+                _, settings = agent_integration.initialize(
+                    agent,
+                    root=root,
+                    spool_dir=spool,
+                    session_id=f"{agent}-real-settings",
+                    hook_command=self._executable(f"{agent}-real-hook"),
+                    agent_command=self._executable(f"{agent}-real-agent"),
+                )
+
+                self.assertEqual(settings, root / directory_name / filename)
+                self.assertTrue(settings.is_file())
+
+    def test_init_rejects_settings_parent_replaced_before_creation(self) -> None:
+        settings_parent = self.root / ".codex"
+        settings_parent.mkdir()
+        detached_parent = self.base / "detached-codex"
+        original_create = agent_integration._create_settings_json
+
+        def replace_parent_then_create(
+            location: agent_integration._SettingsLocation, value: object
+        ) -> None:
+            settings_parent.rename(detached_parent)
+            settings_parent.mkdir()
+            original_create(location, value)
+
+        with mock.patch.object(
+            agent_integration,
+            "_create_settings_json",
+            side_effect=replace_parent_then_create,
+        ), self.assertRaisesRegex(PermissionError, "settings directory changed"):
+            self._route("codex")
+
+        self.assertFalse((settings_parent / "hooks.json").exists())
+        self.assertFalse((detached_parent / "hooks.json").exists())
+
     def test_init_persists_configurable_bounded_stop_grace(self) -> None:
         route_path, settings_path = agent_integration.initialize(
             "codex",
@@ -315,17 +431,18 @@ class AgentIntegrationTests(unittest.TestCase):
 
     def test_init_cannot_overwrite_concurrently_created_settings(self) -> None:
         settings = self.root / ".codex" / "hooks.json"
-        original_create = agent_integration._create_private_json
+        original_create = agent_integration._create_settings_json
 
-        def create_with_competitor(path: Path, value: object) -> None:
-            if path == settings:
-                path.write_text('{"hooks":{"competitor":[]}}\n', encoding="utf-8")
-                path.chmod(0o600)
-            original_create(path, value)
+        def create_with_competitor(
+            location: agent_integration._SettingsLocation, value: object
+        ) -> None:
+            settings.write_text('{"hooks":{"competitor":[]}}\n', encoding="utf-8")
+            settings.chmod(0o600)
+            original_create(location, value)
 
         with mock.patch.object(
             agent_integration,
-            "_create_private_json",
+            "_create_settings_json",
             side_effect=create_with_competitor,
         ), self.assertRaisesRegex(FileExistsError, "concurrently created settings"):
             self._route("codex")
