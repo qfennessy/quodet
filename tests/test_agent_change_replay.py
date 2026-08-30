@@ -6,13 +6,21 @@ import io
 import json
 import queue
 import subprocess
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import watch_files
-from evals.agent_changes import artifacts, benchmark, live_eval, replay, scoring
+from evals.agent_changes import (
+    artifacts,
+    benchmark,
+    challenge,
+    live_eval,
+    replay,
+    scoring,
+)
 from model_runner import ModelRunConfig, Pricing, model_run_config_sha256
 
 
@@ -282,6 +290,92 @@ class AgentChangeReplayTests(unittest.TestCase):
                     privacy_validation.assert_not_called()
                     watcher.assert_not_called()
 
+    def test_frozen_benchmark_rejects_repeated_attempt_override(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = approved_qwen_config(plan)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plan_path = root / "plan.json"
+            config_path = root / "config.json"
+            artifacts.write_private_json(plan_path, plan)
+            artifacts.write_private_json(config_path, config.to_dict())
+            with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.benchmark_cost_preflight"
+                ) as cost_preflight,
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime"
+                ) as runtime_attestation,
+                mock.patch(
+                    "evals.agent_changes.live_eval.subprocess.Popen"
+                ) as watcher,
+                self.assertRaisesRegex(
+                    ValueError, "attempts must match the frozen benchmark"
+                ),
+            ):
+                live_eval.main([
+                    "temporal",
+                    "--model-run-config", str(config_path),
+                    "--benchmark-plan", str(plan_path),
+                    "--attempts", "3",
+                    "--destination", str(root / "replay"),
+                    "--results-directory", str(root / "results"),
+                ])
+            cost_preflight.assert_not_called()
+            runtime_attestation.assert_not_called()
+            watcher.assert_not_called()
+
+    def test_ordinary_benchmark_plan_cannot_authorize_challenge_bytes(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = approved_qwen_config(plan)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plan_path = root / "plan.json"
+            config_path = root / "config.json"
+            artifacts.write_private_json(plan_path, plan)
+            artifacts.write_private_json(config_path, config.to_dict())
+            with (
+                mock.patch(
+                    "evals.agent_changes.live_eval.benchmark_cost_preflight"
+                ) as cost_preflight,
+                mock.patch(
+                    "evals.agent_changes.live_eval.attest_runtime"
+                ) as runtime_attestation,
+                mock.patch(
+                    "evals.agent_changes.live_eval.subprocess.Popen"
+                ) as watcher,
+                self.assertRaisesRegex(
+                    ValueError, "not bound to the selected challenge"
+                ),
+            ):
+                live_eval.main([
+                    "challenge-development",
+                    "--model-run-config", str(config_path),
+                    "--benchmark-plan", str(plan_path),
+                    "--destination", str(root / "replay"),
+                    "--results-directory", str(root / "results"),
+                ])
+            cost_preflight.assert_not_called()
+            runtime_attestation.assert_not_called()
+            watcher.assert_not_called()
+
+    def test_challenge_cost_preflight_uses_variant_source_directory(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = approved_qwen_config(plan)
+        case = challenge.model_cases("challenge-development")[0]
+        allowed = mock.Mock(allowed=True, maximum_cost_usd=None)
+        with mock.patch(
+            "evals.agent_changes.live_eval.preflight_model_run",
+            return_value=allowed,
+        ) as preflight:
+            self.assertIsNone(live_eval.benchmark_cost_preflight(config, [case]))
+        request = preflight.call_args.args[1]
+        source_root = case["_source_root"]
+        self.assertEqual(
+            [document.path for document in request.documents],
+            [source_root / filename for filename in case["files"]],
+        )
+
     def test_watcher_command_pins_the_validated_config_bytes(self) -> None:
         plan = plan_with_approved_qwen_artifact()
         config = approved_qwen_config(plan)
@@ -318,6 +412,144 @@ class AgentChangeReplayTests(unittest.TestCase):
             self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
+    def test_challenge_candidates_cover_eight_defects_and_six_families(self) -> None:
+        pairs = []
+        for split in challenge.SPLITS:
+            pairs.extend(challenge.load_split(split)["pairs"])
+        self.assertEqual(len(pairs), 8)
+        self.assertEqual(len({pair["id"] for pair in pairs}), 8)
+        families = {family for pair in pairs for family in pair["failure_families"]}
+        self.assertGreaterEqual(len(families), 6)
+        self.assertGreaterEqual(
+            sum(pair["scope"] in {"cross-file", "multi-step"} for pair in pairs),
+            4,
+        )
+        self.assertTrue(all(pair["qualification"]["valid_baseline_misses"] == 0 for pair in pairs))
+        self.assertTrue(all(
+            pair["qualification"]["independent_verification"] == "verified-2026-08-30"
+            for pair in pairs
+        ))
+        self.assertTrue(all(pair["qualification"]["status"] == "candidate-not-qualified" for pair in pairs))
+        by_id = {pair["id"]: pair for pair in pairs}
+        self.assertEqual(by_id["dev_retry_signal_swallowed"]["scope"], "multi-step")
+        self.assertEqual(by_id["dev_warranty_interval"]["scope"], "narrow")
+
+    def test_every_challenge_pair_has_isolated_twins_and_executable_oracle(self) -> None:
+        for split in challenge.SPLITS:
+            directory = challenge.split_directory(split)
+            for pair in challenge.load_split(split)["pairs"]:
+                with self.subTest(pair=pair["id"]):
+                    self.assertEqual(pair["oracle"]["buggy_expected_exit"], "nonzero")
+                    self.assertEqual(pair["oracle"]["clean_expected_exit"], 0)
+                    buggy_files = set(pair["buggy"]["files"])
+                    clean_files = set(pair["clean"]["files"])
+                    self.assertEqual(buggy_files, clean_files)
+                    self.assertIn("oracle_test.py", buggy_files)
+                    pair_root = directory / "cases" / pair["id"]
+                    for variant in ("buggy", "clean"):
+                        actual = {
+                            path.name for path in (pair_root / variant).iterdir()
+                            if path.is_file()
+                        }
+                        self.assertEqual(actual, set(pair[variant]["files"]))
+                    buggy = challenge.run_oracle(pair, "buggy", split=split)
+                    clean = challenge.run_oracle(pair, "clean", split=split)
+                    self.assertNotEqual(buggy.returncode, 0, buggy.stdout + buggy.stderr)
+                    self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_opening_sealed_answer_moves_pair_to_development(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "challenge"
+            shutil.copytree(challenge.CHALLENGE_ROOT, root)
+            pair_id = challenge.load_split("challenge-holdout", root)["pairs"][0]["id"]
+            challenge.unseal(pair_id, root=root)
+            development_ids = {
+                pair["id"] for pair in challenge.load_split("challenge-development", root)["pairs"]
+            }
+            holdout_ids = {
+                pair["id"] for pair in challenge.load_split("challenge-holdout", root)["pairs"]
+            }
+            self.assertIn(pair_id, development_ids)
+            self.assertNotIn(pair_id, holdout_ids)
+            self.assertTrue((root / "development" / "cases" / pair_id).is_dir())
+            self.assertFalse((root / "holdout" / "cases" / pair_id).exists())
+
+    def test_challenge_true_positive_requires_failure_path_evidence(self) -> None:
+        case = challenge.model_cases("challenge-development")[0]
+        provider = live_eval.ProviderOutcome(
+            status="schema-valid", latency_ms=1, transcript="", raw_response="{}",
+            parsed_response={"findings": [provider_finding(
+                case["expected_findings"][0]["file"], "Filename only",
+            )]}, error=None,
+        )
+        outcome = live_eval.case_outcome(case, provider)
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 3,
+            "cases": {case["id"]: {"findings": [{
+                "finding_index": 0, "verdict": "true-positive",
+                "expected_finding_id": case["expected_findings"][0]["id"],
+                "rationale": "right filename",
+                "fix_quality": "actionable",
+            }]}},
+        }
+        with self.assertRaisesRegex(ValueError, "requires trigger"):
+            scoring.score_run(raw_run([outcome]), adjudication)
+
+        adjudication["cases"][case["id"]]["findings"][0]["evidence"] = {
+            "trigger": "newer write during normalization",
+            "failure_path": "stale completion writes without revision comparison",
+            "impact": "newer state is lost",
+        }
+        metrics = scoring.score_run(raw_run([outcome]), adjudication)
+        self.assertEqual(metrics["challenge_defect_recall"], 1.0)
+
+    def test_repeated_challenge_attempts_have_unique_samples_and_pair_metrics(self) -> None:
+        case = challenge.model_cases("challenge-development")[0]
+        finding = provider_finding(
+            case["expected_findings"][0]["file"], "Concrete failure path",
+        )
+        found = live_eval.case_outcome(
+            case,
+            live_eval.ProviderOutcome(
+                "schema-valid", 1, "", "{}", {"findings": [finding]}, None,
+            ),
+            attempt_index=1,
+            attempt_count=2,
+        )
+        missed = live_eval.case_outcome(
+            case,
+            live_eval.ProviderOutcome(
+                "schema-valid", 1, "", "{}", {"findings": []}, None,
+            ),
+            attempt_index=2,
+            attempt_count=2,
+        )
+        self.assertNotEqual(found["sample_id"], missed["sample_id"])
+        adjudication = {
+            "run_id": "run-1", "fixture_revision": 3,
+            "cases": {
+                found["sample_id"]: {"findings": [{
+                    "finding_index": 0,
+                    "verdict": "true-positive",
+                    "expected_finding_id": case["expected_findings"][0]["id"],
+                    "rationale": "matches the demonstrated path",
+                    "fix_quality": "actionable",
+                    "evidence": {
+                        "trigger": "concurrent update",
+                        "failure_path": "stale write lacks revision guard",
+                        "impact": "new state is overwritten",
+                    },
+                }]},
+                missed["sample_id"]: {"findings": []},
+            },
+        }
+        metrics = scoring.score_run(raw_run([found, missed]), adjudication)
+        self.assertEqual(metrics["challenge_defect_recall"], 0.5)
+        self.assertEqual(
+            metrics["challenge_pairs"][case["challenge_pair_id"]]["buggy"]["samples"],
+            2,
+        )
+
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
         self.assertEqual(manifest["version"], 3)
@@ -334,6 +566,7 @@ class AgentChangeReplayTests(unittest.TestCase):
                 self.assertIn(case["scope"], {"narrow", "cross-file"})
                 fixture_names = sorted(
                     path.name for path in (replay.CASES_ROOT / case["id"]).iterdir()
+                    if path.is_file()
                 )
                 self.assertEqual(sorted(case["files"]), fixture_names)
                 covered_families.update(case["failure_families"])
@@ -402,6 +635,7 @@ class AgentChangeReplayTests(unittest.TestCase):
         )
         self.assertEqual(configuration["fixture"]["revision"], 3)
         self.assertEqual(configuration["fixture"]["case_ids"], [case["id"] for case in cases])
+        self.assertEqual(len(configuration["fixture"]["content_sha256"]), 64)
 
     def test_wait_for_outcome_retains_raw_schema_valid_response_and_latency(self) -> None:
         output: queue.Queue[str] = queue.Queue()

@@ -7,7 +7,7 @@
   "current_default": "gpt-5.6-luna",
   "fixture": {
     "revision": 3,
-    "manifest_sha256": "b1c1f0a3437765cae04a1d77e48fe3dad483e3be069d22865c055ef0e91df540",
+    "manifest_sha256": "a668b66df9c9909b55be0b9ce118637278a8d59eab30582a7589f3389bda50ed",
     "fixture_tree_sha256": "aa81b2ed3a2655f8a86496181cf9f1a32d8442c8871cfbd5071f006f0f7ae56f",
     "provider_payload_sha256": "24653681ade776d1fca1396ad6e2f0bea3d5eb868b9ade4ac893d21e757ae801",
     "revision_note": "v3 appends the observed cancellation false-positive as a clean control before any benchmark inference was run",

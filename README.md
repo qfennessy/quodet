@@ -480,6 +480,63 @@ secrets before sharing. The scorecard never auto-switches the production
 default: apply the pre-registered lexicographic rule explicitly, or record that
 no candidate established eligibility.
 
+### Challenge candidates
+
+`evals/agent_changes/challenge` contains eight original, repository-neutral
+defect candidates across seven failure families. Each defect has a separately
+replayed minimal clean twin and an executable oracle: the buggy oracle must fail
+and the clean oracle must pass. Six pairs require cross-file reasoning, one is
+multi-step, and one is a narrow semantic-boundary defect. Verify all pairs
+without a model:
+
+```sh
+uv run python -m evals.agent_changes.challenge verify all
+```
+
+The candidates are deliberately not described as proven model misses. No live
+baseline calls have been made, so every entry records zero valid baseline misses
+and remains `candidate-not-qualified`. A candidate becomes a qualified challenge
+only after a second reader verifies it and the same frozen baseline misses its
+real trigger and failure path in three valid attempts. Provider errors, malformed
+responses, timeouts, and unavailable runtimes do not qualify it.
+
+Development and holdout candidates live under different directories and
+manifests. This is a process seal, not encryption: directly reading a holdout
+answer or comparing its twins invalidates that pair as holdout evidence. Prompt
+work may use only `challenge-development`. Holdout twins are
+replayed one at a time, never together in one review batch. If an answer is
+opened for tuning, use the transition command; it moves the complete pair and
+its metadata out of the sealed split before exposing it for development:
+
+```sh
+uv run python -m evals.agent_changes.challenge open-answer PAIR_ID
+```
+
+After opening a holdout pair, replace it with a newly verified and qualified
+pair before treating the holdout size as restored.
+
+After freezing model, prompt, schema, timeout, and fixture revisions, the live
+runner can replay either split and retain raw responses, latency, and runtime
+provenance exactly as it does for the ordinary corpus. Artifacts include the
+Quodet commit, fixture-content and manifest hashes, Python/platform details,
+`llm` and plugin versions, runner timeouts, and every repeated attempt:
+
+```sh
+uv run python -m evals.agent_changes.live_eval challenge-development --log
+uv run python -m evals.agent_changes.live_eval challenge-holdout --attempts 3 --log
+```
+
+The ordinary model-comparison plan does not authorize challenge fixture bytes.
+When `--model-run-config` is used, the supplied plan must also contain the exact
+challenge revision, combined manifest hash, content hash, and ordered case IDs;
+the runner fails closed if that dedicated binding is absent or stale.
+
+Challenge scoring is stricter than filename matching. A true-positive
+adjudication must separately record the trigger, the complete failure path, and
+the observable impact. Reports pair buggy recall with clean-twin false-positive
+rate and keep both challenge splits separate from calibration, ordinary holdout,
+temporal, confirmation, and clean-control metrics.
+
 The watcher sees changes made by every process, not only a coding agent. Add
 generated output paths with `--exclude` to prevent noisy reviews or feedback
 loops. Files are read by `llm` when a review starts, so the review reflects the

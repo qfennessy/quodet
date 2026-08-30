@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "split": "challenge-development",
+  "sealed": false,
+  "pairs": [
+    {
+      "id": "dev_stale_profile_completion",
+      "failure_families": ["state/lifecycle", "retry/concurrency"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "re-entrant completion after a newer revision",
+      "buggy": {"files": ["profile_store.py", "profile_service.py", "oracle_test.py"]},
+      "clean": {"files": ["profile_store.py", "profile_service.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "late-profile-write-overwrites-newer-revision", "file": "profile_service.py", "summary": "a slow normalization writes without the revision it read", "trigger": "another writer updates the profile while normalization is in flight", "failure_path": "normalize_bio reads revision N, the interleaving stores N+1, then write() unconditionally stores the stale result", "impact": "the newer profile text is lost"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "development", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "dev_route_cache_membership",
+      "failure_families": ["UI/cache"],
+      "scope": "cross-file",
+      "expected_evidence_depth": "cache identity across a same-size route mutation",
+      "buggy": {"files": ["route_cache.py", "route_service.py", "oracle_test.py"]},
+      "clean": {"files": ["route_cache.py", "route_service.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "same-count-route-cache-collision", "file": "route_cache.py", "summary": "the cache key records only the number of stops", "trigger": "replace one stop while keeping the route length unchanged", "failure_path": "the second route produces the same (driver, count) key and returns the first route's plan", "impact": "a driver is sent to an obsolete destination"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "development", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "dev_retry_signal_swallowed",
+      "failure_families": ["retry/concurrency"],
+      "scope": "multi-step",
+      "expected_evidence_depth": "exception taxonomy across queue retry control flow",
+      "buggy": {"files": ["delivery_worker.py", "oracle_test.py"]},
+      "clean": {"files": ["delivery_worker.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "reschedule-control-signal-converted-to-failure", "file": "delivery_worker.py", "summary": "the broad handler swallows the queue's Reschedule signal", "trigger": "the sender asks the queue to retry later", "failure_path": "Reschedule inherits Exception and is converted to a false terminal result", "impact": "transient deliveries are never retried"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "development", "status": "candidate-not-qualified"}
+    },
+    {
+      "id": "dev_warranty_interval",
+      "failure_families": ["external API contract"],
+      "scope": "narrow",
+      "expected_evidence_depth": "syntactically valid values plus semantic ordering",
+      "buggy": {"files": ["warranty.py", "oracle_test.py"]},
+      "clean": {"files": ["warranty.py", "oracle_test.py"]},
+      "oracle": {"command": "python oracle_test.py", "buggy_expected_exit": "nonzero", "clean_expected_exit": 0},
+      "expected_finding": {"id": "reversed-warranty-interval-accepted", "file": "warranty.py", "summary": "individually valid dates are accepted without checking their order", "trigger": "the provider returns an end date before the start date", "failure_path": "both dates parse and are returned despite end < start", "impact": "downstream coverage calculations receive an impossible interval"},
+      "qualification": {"real_defect": "oracle-verified", "independent_verification": "verified-2026-08-30", "valid_baseline_misses": 0, "seal_status": "development", "status": "candidate-not-qualified"}
+    }
+  ]
+}

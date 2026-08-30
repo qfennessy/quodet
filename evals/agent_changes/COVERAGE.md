@@ -62,3 +62,26 @@ addition to the original two-file control.
   only after a reviewer adjudicates its explanation and concrete failure path
   against the expected behavior; the right filename with the wrong diagnosis
   is a false positive and leaves the expected defect as a false negative.
+
+## Challenge-candidate map
+
+These scenarios are original repository-neutral examples, not copies of the
+non-public source corpus. They are candidates until independently verified and
+missed by the frozen baseline in three valid attempts.
+
+| Pair | Family | Scope | Split |
+| --- | --- | --- | --- |
+| `dev_stale_profile_completion` | state/lifecycle; retry/concurrency | cross-file | challenge-development |
+| `dev_route_cache_membership` | UI/cache | cross-file | challenge-development |
+| `dev_retry_signal_swallowed` | retry/concurrency | multi-step | challenge-development |
+| `dev_warranty_interval` | external API contract | narrow | challenge-development |
+| `sealed_partial_index_rollback` | persistence/atomicity; retry/concurrency | cross-file | challenge-holdout |
+| `sealed_legacy_export_marker` | persistence/atomicity; state/lifecycle | cross-file | challenge-holdout |
+| `sealed_claimed_owner` | privacy/authorization | cross-file | challenge-holdout |
+| `sealed_policy_dependency` | CI/tooling | cross-file | challenge-holdout |
+
+Every row represents two isolated replays: one buggy case and one minimal clean
+twin. The deterministic oracle fails on the former and passes on the latter.
+Opening a holdout answer through the supported command moves the entire pair to
+development. Filename equality remains diagnostic; challenge adjudication also
+requires explicit trigger, failure-path, and impact evidence.

@@ -49,7 +49,7 @@ def replay_case(
     destination: Path,
     inter_file_delay: float,
 ) -> list[Path]:
-    source_root = CASES_ROOT / case["id"]
+    source_root = Path(case.get("_source_root", CASES_ROOT / case["id"]))
     target_root = destination.resolve() / case["id"]
     target_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -104,11 +104,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     manifest = load_manifest()
-    cases = (
-        manifest["cases"]
-        if args.case == "all"
-        else [case_by_id(manifest, args.case)]
-    )
+    if args.case.startswith("challenge-"):
+        from evals.agent_changes import challenge
+
+        cases = challenge.model_cases(args.case)
+    elif "__" in args.case:
+        from evals.agent_changes import challenge
+
+        cases = [challenge.case_by_id(args.case)]
+    else:
+        cases = (
+            manifest["cases"]
+            if args.case == "all"
+            else [case_by_id(manifest, args.case)]
+        )
 
     for index, case in enumerate(cases):
         written = replay_case(
