@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "description": "Quodet coding-agent change evaluation corpus",
+  "cases": [
+    {
+      "id": "01_obvious_runtime",
+      "difficulty": "obvious",
+      "files": ["calculator.py"],
+      "expected_findings": [
+        {
+          "id": "undefined-variable",
+          "file": "calculator.py",
+          "summary": "mean() passes an undefined name to sum()"
+        }
+      ]
+    },
+    {
+      "id": "02_source_and_test_boundary",
+      "difficulty": "basic",
+      "files": ["pagination.py", "test_pagination.py"],
+      "expected_findings": [
+        {
+          "id": "exclusive-slice-off-by-one",
+          "file": "pagination.py",
+          "summary": "page() returns one fewer item because the slice end is exclusive"
+        }
+      ]
+    },
+    {
+      "id": "03_cross_file_units",
+      "difficulty": "intermediate",
+      "files": ["token_model.py", "token_service.py"],
+      "expected_findings": [
+        {
+          "id": "milliseconds-seconds-mismatch",
+          "file": "token_service.py",
+          "summary": "epoch milliseconds are compared directly with epoch seconds"
+        }
+      ]
+    },
+    {
+      "id": "04_tenant_cache_scope",
+      "difficulty": "subtle",
+      "files": ["permissions.py", "access_service.py"],
+      "expected_findings": [
+        {
+          "id": "tenant-omitted-from-auth-cache",
+          "file": "access_service.py",
+          "summary": "permission results leak across tenants sharing user and document IDs"
+        }
+      ]
+    },
+    {
+      "id": "05_async_agent_patch",
+      "difficulty": "subtle",
+      "files": ["inventory.py", "test_inventory.py"],
+      "expected_findings": [
+        {
+          "id": "check-await-update-race",
+          "file": "inventory.py",
+          "summary": "concurrent reservations pass the check before either decrements stock"
+        }
+      ]
+    },
+    {
+      "id": "06_exception_cleanup",
+      "difficulty": "subtle",
+      "files": ["protocols.py", "worker.py"],
+      "expected_findings": [
+        {
+          "id": "connection-leak-on-error",
+          "file": "worker.py",
+          "summary": "exceptions or cancellation bypass pool.release()"
+        }
+      ]
+    },
+    {
+      "id": "07_batch_deduplication",
+      "difficulty": "sophisticated",
+      "files": ["events.py", "test_events.py"],
+      "expected_findings": [
+        {
+          "id": "incoming-batch-duplicates",
+          "file": "events.py",
+          "summary": "seen IDs are not updated while accepting the incoming batch"
+        }
+      ]
+    },
+    {
+      "id": "08_clean_related_change",
+      "difficulty": "clean-control",
+      "files": ["cache.py", "inventory.py"],
+      "expected_findings": []
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+*.egg-info/
+.vscode/
+.venv/
+__pycache__/
+.pytest_cache/
+dist/
+build/
+prompt_eval_workspace/
+watch_files copy.py
