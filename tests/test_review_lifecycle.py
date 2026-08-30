@@ -235,6 +235,42 @@ class ReviewLifecycleTests(unittest.TestCase):
                 payload, root=self.root, session_id="agent-a"
             )
 
+    def test_spool_rejects_unhashable_and_impossible_lifecycle_fields(self) -> None:
+        tracker = FindingLifecycleTracker()
+        batch = tracker.classify(self.batch(sequence=1))
+        spool = self.base / "invalid-lifecycle" / "feedback"
+        sink = SpoolSink(spool, root=self.root, session_id="agent-a")
+        self.addCleanup(sink.close)
+        self.assertTrue(sink.publish(batch))
+        original = json.loads(next((spool / "pending").glob("*.json")).read_text())
+
+        mutations = (
+            {"status": []},
+            {"file": []},
+            {"status": "stale", "reason": []},
+            {
+                "status": "retained",
+                "previous_fingerprint": "b" * 64,
+            },
+            {
+                "status": "replaced",
+                "previous_fingerprint": original["lifecycle"][0]["fingerprint"],
+            },
+            {
+                "status": "no_longer_reported",
+                "previous_fingerprint": "b" * 64,
+            },
+        )
+        for mutation in mutations:
+            payload = json.loads(json.dumps(original))
+            payload["lifecycle"][0].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(
+                ReviewValidationError
+            ):
+                validate_spooled_payload(
+                    payload, root=self.root, session_id="agent-a"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

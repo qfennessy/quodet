@@ -703,8 +703,19 @@ class FeedbackTests(unittest.TestCase):
             {**template, "line": line, "title": f"Finding {line}"}
             for line in range(1, 13)
         ]
+        batch = self.parse(json.dumps(raw))
+        lifecycle = tuple(
+            FindingLifecycle(
+                status="retained",
+                fingerprint=finding_fingerprint(finding),
+                file=finding.file,
+                line=finding.line,
+                previous_fingerprint=finding_fingerprint(finding),
+            )
+            for finding in batch.findings
+        )
         SpoolSink(spool, root=self.root, session_id="agent-a").publish(
-            self.parse(json.dumps(raw))
+            replace(batch, lifecycle=lifecycle)
         )
         outputs: list[dict[str, object]] = []
         event_input = json.dumps(
@@ -734,6 +745,8 @@ class FeedbackTests(unittest.TestCase):
         ]
         self.assertEqual(messages[0].count("  Suggested fix:"), 10)
         self.assertEqual(messages[1].count("  Suggested fix:"), 2)
+        self.assertIn("12 retained", messages[0])
+        self.assertNotIn("retained", messages[1])
         self.assertEqual(len(list((spool / "acknowledged").glob("*.json"))), 1)
 
     def test_feedback_presentation_covers_zero_one_and_multiple_findings(self) -> None:
@@ -838,17 +851,13 @@ class FeedbackTests(unittest.TestCase):
 
         self.assertEqual(messages[0].count("  Suggested fix:"), 10)
         self.assertEqual(messages[1].count("  Suggested fix:"), 2)
+        self.assertIn("1 stale", messages[0])
+        self.assertNotIn("stale", messages[1])
         self.assertEqual(len(list((spool / "rejected").glob("*.json"))), 0)
         acknowledged = json.loads(
             next((spool / "acknowledged").glob("*.json")).read_text()
         )
-        self.assertEqual(len(acknowledged["lifecycle"]), MAX_FINDINGS * 2)
-        stale = [
-            item for item in acknowledged["lifecycle"]
-            if item["file"] == "src/quiet.py"
-        ]
-        self.assertEqual(len(stale), 1)
-        self.assertEqual(stale[0]["status"], "stale")
+        self.assertEqual(acknowledged["lifecycle"], [])
 
     def test_delivery_character_limit_retains_whole_findings(self) -> None:
         raw = json.loads(valid_output())

@@ -699,6 +699,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if remaining:
         remainder = validated.copy()
         remainder["findings"] = remaining
+        # Lifecycle and stale-path summaries describe the whole provider batch,
+        # not each delivery chunk. They were emitted with the first chunk.
+        remainder["lifecycle"] = []
+        remainder["stale_files"] = []
         requeue_feedback(args.spool_dir, claim, remainder)
     else:
         acknowledge(args.spool_dir, claim)

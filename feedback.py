@@ -1599,9 +1599,10 @@ def validate_spooled_payload(
         status = item["status"]
         fingerprint = item["fingerprint"]
         previous = item["previous_fingerprint"]
+        event_file = item["file"]
         line = item["line"]
         reason = item["reason"]
-        if status not in LIFECYCLE_STATUSES:
+        if not isinstance(status, str) or status not in LIFECYCLE_STATUSES:
             raise ReviewValidationError("invalid finding lifecycle status")
         if (
             not isinstance(fingerprint, str)
@@ -1618,7 +1619,8 @@ def validate_spooled_payload(
         ):
             raise ReviewValidationError("invalid finding lifecycle fingerprint")
         if (
-            item["file"] not in reviewed_paths
+            not isinstance(event_file, str)
+            or event_file not in reviewed_paths
             or isinstance(line, bool)
             or not isinstance(line, int)
             or line < 1
@@ -1627,8 +1629,16 @@ def validate_spooled_payload(
                 and previous is None
             )
             or (status in {"new", "stale"} and previous is not None)
-            or (status == "stale" and reason not in STALE_REASONS)
+            or (
+                status == "stale"
+                and (not isinstance(reason, str) or reason not in STALE_REASONS)
+            )
             or (status != "stale" and reason is not None)
+            or (
+                status in {"retained", "no_longer_reported"}
+                and previous != fingerprint
+            )
+            or (status == "replaced" and previous == fingerprint)
         ):
             raise ReviewValidationError("invalid finding lifecycle metadata")
         lifecycle.append(item.copy())
