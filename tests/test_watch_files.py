@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import queue
 import tempfile
@@ -280,6 +282,39 @@ class WatchFilesTests(unittest.TestCase):
 
             self.assertIsNotNone(observed_path)
             self.assertFalse(observed_path.exists())
+
+    def test_evaluation_event_preserves_provider_streams_and_exit_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "source.py"
+            source.write_text("value = 1\n")
+
+            result = type("Result", (), {
+                "returncode": 2,
+                "stdout": '{"findings": []}\n',
+                "stderr": "provider rejected request\n",
+            })()
+            output = io.StringIO()
+            with (
+                mock.patch("watch_files.subprocess.run", return_value=result) as run,
+                contextlib.redirect_stdout(output),
+            ):
+                watch_files.review_files(
+                    [source], root=root, exclude_patterns=[], max_bytes=2_000_000,
+                    model="test-model", prompt="review", log=False,
+                    review_timeout=60, reasoning_effort=None,
+                    evaluation_events=True,
+                )
+
+            self.assertTrue(run.call_args.kwargs["capture_output"])
+            self.assertTrue(run.call_args.kwargs["text"])
+            event = json.loads(output.getvalue().splitlines()[-1])[
+                "quodet_evaluation_event"
+            ]
+            self.assertEqual(event["status"], "provider-error")
+            self.assertEqual(event["returncode"], 2)
+            self.assertEqual(event["raw_response"], '{"findings": []}\n')
+            self.assertEqual(event["stderr"], "provider rejected request\n")
 
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()

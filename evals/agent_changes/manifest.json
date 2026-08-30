@@ -1,96 +1,163 @@
 {
-  "version": 1,
-  "description": "Quodet coding-agent change evaluation corpus",
+  "version": 2,
+  "description": "Frozen, repository-neutral coding-agent change evaluation corpus",
+  "source_boundary": {
+    "corpus": "independently verified non-public review corpus",
+    "disclosure": "source location and answer-bearing records intentionally omitted",
+    "answer_bearing_source": "primary calibration entries only",
+    "forbidden_answer_sources": ["primary holdout", "temporal", "clean-control", "confirmation"]
+  },
+  "split_policy": {
+    "calibration": "Fixtures designed from issue #4 requirements and primary calibration evidence; prompt iteration is allowed only here.",
+    "holdout": "Quodet v1 fixtures frozen before corpus-derived expansion; evaluate without prompt iteration.",
+    "temporal": "Reserved boundary; no answer-bearing synthetic fixture was derived from sealed temporal entries.",
+    "clean-control": "Matched bug-free fixtures; never use their source corpus answers for prompt design.",
+    "confirmation": "Reserved sealed boundary; no confirmation answer is present in this repository."
+  },
   "cases": [
     {
-      "id": "01_obvious_runtime",
-      "difficulty": "obvious",
-      "files": ["calculator.py"],
-      "expected_findings": [
-        {
-          "id": "undefined-variable",
-          "file": "calculator.py",
-          "summary": "mean() passes an undefined name to sum()"
-        }
-      ]
+      "id": "01_obvious_runtime", "difficulty": "obvious", "files": ["calculator.py"],
+      "failure_families": ["state/lifecycle"], "scope": "narrow", "expected_evidence_depth": "local execution path", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "undefined-variable", "file": "calculator.py", "summary": "mean() passes an undefined name to sum()", "trigger": "Call mean() with any values", "impact": "NameError before a result is returned"}]
     },
     {
-      "id": "02_source_and_test_boundary",
-      "difficulty": "basic",
-      "files": ["pagination.py", "test_pagination.py"],
-      "expected_findings": [
-        {
-          "id": "exclusive-slice-off-by-one",
-          "file": "pagination.py",
-          "summary": "page() returns one fewer item because the slice end is exclusive"
-        }
-      ]
+      "id": "02_source_and_test_boundary", "difficulty": "basic", "files": ["pagination.py", "test_pagination.py"],
+      "failure_families": ["UI/cache"], "scope": "narrow", "expected_evidence_depth": "language semantics plus weak boundary test", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "exclusive-slice-off-by-one", "file": "pagination.py", "summary": "page() returns one fewer item because the slice end is exclusive", "trigger": "Request a full page", "impact": "One expected item is omitted"}]
     },
     {
-      "id": "03_cross_file_units",
-      "difficulty": "intermediate",
-      "files": ["token_model.py", "token_service.py"],
-      "expected_findings": [
-        {
-          "id": "milliseconds-seconds-mismatch",
-          "file": "token_service.py",
-          "summary": "epoch milliseconds are compared directly with epoch seconds"
-        }
-      ]
+      "id": "03_cross_file_units", "difficulty": "intermediate", "files": ["token_model.py", "token_service.py"],
+      "failure_families": ["external API contract"], "scope": "cross-file", "expected_evidence_depth": "producer-consumer unit contract", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "milliseconds-seconds-mismatch", "file": "token_service.py", "summary": "epoch milliseconds are compared directly with epoch seconds", "trigger": "Check a provider expiry expressed in milliseconds", "impact": "Expired tokens remain valid"}]
     },
     {
-      "id": "04_tenant_cache_scope",
-      "difficulty": "subtle",
-      "files": ["permissions.py", "access_service.py"],
-      "expected_findings": [
-        {
-          "id": "tenant-omitted-from-auth-cache",
-          "file": "access_service.py",
-          "summary": "permission results leak across tenants sharing user and document IDs"
-        }
-      ]
+      "id": "04_tenant_cache_scope", "difficulty": "subtle", "files": ["permissions.py", "access_service.py"],
+      "failure_families": ["privacy/authorization"], "scope": "cross-file", "expected_evidence_depth": "identity scope across cache caller and key", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "tenant-omitted-from-auth-cache", "file": "access_service.py", "summary": "permission results leak across tenants sharing user and document IDs", "trigger": "Check the same IDs in two tenants", "impact": "One tenant reuses another tenant's authorization result"}]
     },
     {
-      "id": "05_async_agent_patch",
-      "difficulty": "subtle",
-      "files": ["inventory.py", "test_inventory.py"],
-      "expected_findings": [
-        {
-          "id": "check-await-update-race",
-          "file": "inventory.py",
-          "summary": "concurrent reservations pass the check before either decrements stock"
-        }
-      ]
+      "id": "05_async_agent_patch", "difficulty": "subtle", "files": ["inventory.py", "test_inventory.py"],
+      "failure_families": ["retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "interleaving across await boundary", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "check-await-update-race", "file": "inventory.py", "summary": "concurrent reservations pass the check before either decrements stock", "trigger": "Reserve the last item concurrently", "impact": "Inventory becomes oversold"}]
     },
     {
-      "id": "06_exception_cleanup",
-      "difficulty": "subtle",
-      "files": ["protocols.py", "worker.py"],
-      "expected_findings": [
-        {
-          "id": "connection-leak-on-error",
-          "file": "worker.py",
-          "summary": "exceptions or cancellation bypass pool.release()"
-        }
-      ]
+      "id": "06_exception_cleanup", "difficulty": "subtle", "files": ["protocols.py", "worker.py"],
+      "failure_families": ["state/lifecycle", "retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "exception and cancellation resource lifecycle", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "connection-leak-on-error", "file": "worker.py", "summary": "exceptions or cancellation bypass pool.release()", "trigger": "Execution raises or is cancelled", "impact": "The acquired connection remains leased"}]
     },
     {
-      "id": "07_batch_deduplication",
-      "difficulty": "sophisticated",
-      "files": ["events.py", "test_events.py"],
-      "expected_findings": [
-        {
-          "id": "incoming-batch-duplicates",
-          "file": "events.py",
-          "summary": "seen IDs are not updated while accepting the incoming batch"
-        }
-      ]
+      "id": "07_batch_deduplication", "difficulty": "sophisticated", "files": ["events.py", "test_events.py"],
+      "failure_families": ["persistence/atomicity", "retry/concurrency"], "scope": "narrow", "expected_evidence_depth": "state update within one incoming batch", "evaluation_split": "holdout",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []},
+      "expected_findings": [{"id": "incoming-batch-duplicates", "file": "events.py", "summary": "seen IDs are not updated while accepting the incoming batch", "trigger": "Provide one ID twice in a new batch", "impact": "Duplicate events are persisted"}]
     },
     {
-      "id": "08_clean_related_change",
-      "difficulty": "clean-control",
-      "files": ["cache.py", "inventory.py"],
-      "expected_findings": []
+      "id": "08_clean_related_change", "difficulty": "clean-control", "files": ["cache.py", "inventory.py"],
+      "failure_families": ["UI/cache", "retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "related two-file behavior", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "preexisting-quodet-v1", "calibration_ids": []}, "matched_control_for": ["05_async_agent_patch"], "expected_findings": []
+    },
+    {
+      "id": "09_stale_undo_identity", "difficulty": "subtle", "files": ["editor.py"],
+      "failure_families": ["state/lifecycle"], "scope": "narrow", "expected_evidence_depth": "identity-changing state transition", "evaluation_split": "calibration",
+      "provenance": {"design_source": "primary-calibration", "calibration_ids": ["A04", "A11"]},
+      "expected_findings": [{"id": "undo-overwrites-newer-revision", "file": "editor.py", "summary": "undo applies an old title without verifying the document revision", "trigger": "Rename, receive a newer external revision, then invoke undo", "impact": "Undo overwrites newer state"}]
+    },
+    {
+      "id": "10_aggregate_cache_fingerprint", "difficulty": "subtle", "files": ["cache.py", "dashboard.py"],
+      "failure_families": ["UI/cache"], "scope": "cross-file", "expected_evidence_depth": "aggregate cache identity and child state", "evaluation_split": "calibration",
+      "provenance": {"design_source": "primary-calibration", "calibration_ids": ["A01"]},
+      "expected_findings": [{"id": "constant-total-stale-breakdown", "file": "cache.py", "summary": "the cache key ignores child counts when their total stays constant", "trigger": "Swap one ready item for one blocked item", "impact": "The dashboard returns the previous breakdown"}]
+    },
+    {
+      "id": "11_partial_async_rollback", "difficulty": "sophisticated", "files": ["repository.py", "service.py"],
+      "failure_families": ["persistence/atomicity", "retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "sibling task interleaving and rollback", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": ["A11"]},
+      "expected_findings": [{"id": "rollback-races-running-sibling", "file": "service.py", "summary": "failure rollback does not cancel and await the sibling task before removing data", "trigger": "One insert fails while the sibling is still running", "impact": "The sibling can commit after rollback and leave a partial pair"}]
+    },
+    {
+      "id": "12_semantically_invalid_external_value", "difficulty": "basic", "files": ["provider.py"],
+      "failure_families": ["external API contract"], "scope": "narrow", "expected_evidence_depth": "semantic domain validation", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": ["A17"]},
+      "expected_findings": [{"id": "latitude-range-is-longitude-range", "file": "provider.py", "summary": "latitude validation accepts values between 90 and 180 degrees", "trigger": "Provider returns latitude 120", "impact": "An impossible coordinate is accepted"}]
+    },
+    {
+      "id": "13_swallowed_retry_signal", "difficulty": "basic", "files": ["worker.py"],
+      "failure_families": ["retry/concurrency"], "scope": "narrow", "expected_evidence_depth": "exception taxonomy and caller contract", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": ["A11"]},
+      "expected_findings": [{"id": "retry-exception-swallowed", "file": "worker.py", "summary": "broad exception handling converts RetryDelivery into a permanent false result", "trigger": "send raises RetryDelivery", "impact": "The delivery system cannot schedule the requested retry"}]
+    },
+    {
+      "id": "14_stale_lease_restart", "difficulty": "subtle", "files": ["lease.py", "runner.py"],
+      "failure_families": ["state/lifecycle"], "scope": "cross-file", "expected_evidence_depth": "process lifecycle plus persisted marker", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": ["A04"]},
+      "expected_findings": [{"id": "dead-owner-lease-never-reclaimed", "file": "lease.py", "summary": "acquire rejects every existing lease without checking owner liveness or expiry", "trigger": "Restart after the lease owner dies", "impact": "No replacement worker can start"}]
+    },
+    {
+      "id": "15_unknown_timeout_spend", "difficulty": "sophisticated", "files": ["billing.py", "gateway.py"],
+      "failure_families": ["performance/cost"], "scope": "cross-file", "expected_evidence_depth": "provider timeout and accounting state", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": []},
+      "expected_findings": [{"id": "timeout-recorded-as-zero-spend", "file": "gateway.py", "summary": "a timed-out provider request is omitted from accounting even though its spend is unknown", "trigger": "Provider accepts work but the client times out before usage arrives", "impact": "Spend reporting understates or falsely treats unknown cost as zero"}]
+    },
+    {
+      "id": "16_tooling_dependency_filter", "difficulty": "subtle", "files": ["change_filter.py", "workflow.py"],
+      "failure_families": ["CI/tooling"], "scope": "cross-file", "expected_evidence_depth": "job dependency graph and path filter", "evaluation_split": "calibration",
+      "provenance": {"design_source": "primary-calibration", "calibration_ids": ["A14"]},
+      "expected_findings": [{"id": "lint-dependencies-omitted", "file": "change_filter.py", "summary": "the filter ignores changes to the lint config and runner script", "trigger": "Change only actionlint.yaml or run-actionlint.sh", "impact": "The dependent lint job is skipped"}]
+    },
+    {
+      "id": "17_partial_persistence_narrow", "difficulty": "basic", "files": ["preferences.py"],
+      "failure_families": ["persistence/atomicity"], "scope": "narrow", "expected_evidence_depth": "local mutation ordering", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": []},
+      "expected_findings": [{"id": "validation-after-first-write", "file": "preferences.py", "summary": "theme is written before locale validation can fail", "trigger": "Save a valid theme with an invalid locale", "impact": "The pair is partially persisted"}]
+    },
+    {
+      "id": "18_cost_retry_narrow", "difficulty": "subtle", "files": ["client.py"],
+      "failure_families": ["performance/cost"], "scope": "narrow", "expected_evidence_depth": "timeout ambiguity and idempotency identity", "evaluation_split": "calibration",
+      "provenance": {"design_source": "issue-4-required-pattern", "calibration_ids": []},
+      "expected_findings": [{"id": "retry-changes-idempotency-key", "file": "client.py", "summary": "the retry changes request identity after an ambiguous timeout", "trigger": "The first chargeable request succeeds remotely but times out locally", "impact": "The retry can perform and bill the work twice"}]
+    },
+    {
+      "id": "19_private_exception_logging", "difficulty": "basic", "files": ["detector.py"],
+      "failure_families": ["privacy/authorization"], "scope": "narrow", "expected_evidence_depth": "exception payload to logging sink", "evaluation_split": "calibration",
+      "provenance": {"design_source": "primary-calibration", "calibration_ids": ["B02"]},
+      "expected_findings": [{"id": "raw-exception-data-logged", "file": "detector.py", "summary": "the raw exception message is interpolated into centralized error logs", "trigger": "Detection raises with record-derived text in the exception", "impact": "Private record data can be copied into logs"}]
+    },
+    {
+      "id": "20_tool_exit_status", "difficulty": "obvious", "files": ["check_config.py"],
+      "failure_families": ["CI/tooling"], "scope": "narrow", "expected_evidence_depth": "process exit contract", "evaluation_split": "calibration",
+      "provenance": {"design_source": "primary-calibration", "calibration_ids": ["A14"]},
+      "expected_findings": [{"id": "validation-failures-reported-success", "file": "check_config.py", "summary": "all validator failures except command-not-found are treated as success", "trigger": "config-check exits 1 for invalid input", "impact": "Invalid configuration passes the operational check"}]
+    },
+    {
+      "id": "21_clean_identity_guard", "difficulty": "clean-control", "files": ["editor.py"],
+      "failure_families": ["state/lifecycle"], "scope": "narrow", "expected_evidence_depth": "identity-changing state transition", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["09_stale_undo_identity"], "expected_findings": []
+    },
+    {
+      "id": "22_clean_cache_fingerprint", "difficulty": "clean-control", "files": ["cache.py", "dashboard.py"],
+      "failure_families": ["UI/cache"], "scope": "cross-file", "expected_evidence_depth": "aggregate cache identity and child state", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["10_aggregate_cache_fingerprint"], "expected_findings": []
+    },
+    {
+      "id": "23_clean_async_rollback", "difficulty": "clean-control", "files": ["repository.py", "service.py"],
+      "failure_families": ["persistence/atomicity", "retry/concurrency"], "scope": "cross-file", "expected_evidence_depth": "atomic repository contract", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["11_partial_async_rollback"], "expected_findings": []
+    },
+    {
+      "id": "24_clean_external_validation", "difficulty": "clean-control", "files": ["provider.py"],
+      "failure_families": ["external API contract"], "scope": "narrow", "expected_evidence_depth": "semantic domain validation", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["12_semantically_invalid_external_value"], "expected_findings": []
+    },
+    {
+      "id": "25_clean_tooling_dependencies", "difficulty": "clean-control", "files": ["change_filter.py", "workflow.py"],
+      "failure_families": ["CI/tooling"], "scope": "cross-file", "expected_evidence_depth": "job dependency graph and path filter", "evaluation_split": "clean-control",
+      "provenance": {"design_source": "repository-neutral-matched-control", "calibration_ids": []}, "matched_control_for": ["16_tooling_dependency_filter"], "expected_findings": []
     }
   ]
 }
