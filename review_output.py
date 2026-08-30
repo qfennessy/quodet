@@ -41,6 +41,10 @@ class ReviewBatchLike(Protocol):
     debounce_ms: float
     provider_ms: float
     first_observed_at: float
+    batch_flushed_at: float
+    provider_started_at: float
+    provider_completed_at: float
+    published_at: float
 
 
 def _reviewed_file_document(reviewed: ReviewedFileLike) -> dict[str, object]:
@@ -83,8 +87,12 @@ def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
         "feedback_round": batch.feedback_round,
         "timing": {
             "first_observed_at": batch.first_observed_at,
+            "batch_flushed_at": batch.batch_flushed_at,
             "debounce_ms": batch.debounce_ms,
+            "provider_started_at": batch.provider_started_at,
+            "provider_completed_at": batch.provider_completed_at,
             "provider_ms": batch.provider_ms,
+            "published_at": batch.published_at,
         },
     }
 

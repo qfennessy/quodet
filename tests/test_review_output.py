@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import json
 import math
 import unittest
@@ -46,6 +46,10 @@ def batch(*findings: ReviewFinding) -> ReviewBatch:
         debounce_ms=3_000.0,
         provider_ms=425.5,
         first_observed_at=1_788_119_996.5,
+        batch_flushed_at=1_788_119_999.5,
+        provider_started_at=1_788_119_999.6,
+        provider_completed_at=1_788_120_000.0,
+        published_at=1_788_120_000.1,
     )
 
 
@@ -116,8 +120,12 @@ class ReviewOutputTests(unittest.TestCase):
             document["timing"],
             {
                 "first_observed_at": 1_788_119_996.5,
+                "batch_flushed_at": 1_788_119_999.5,
                 "debounce_ms": 3_000.0,
+                "provider_started_at": 1_788_119_999.6,
+                "provider_completed_at": 1_788_120_000.0,
                 "provider_ms": 425.5,
+                "published_at": 1_788_120_000.1,
             },
         )
         self.assertEqual(
@@ -133,6 +141,13 @@ class ReviewOutputTests(unittest.TestCase):
                 "feedback_round",
                 "timing",
             },
+        )
+        serialized_batch_fields = (
+            set(document) - {"schema_version", "timing"}
+        ) | set(document["timing"])
+        self.assertEqual(
+            serialized_batch_fields,
+            {field.name for field in fields(ReviewBatch)},
         )
 
         with self.assertRaises(ValueError):
