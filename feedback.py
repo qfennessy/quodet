@@ -356,15 +356,35 @@ def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
     stale_paths = tuple(
         sorted(item.path for item in batch.reviewed_files if item.path not in fresh_paths)
     )
-    stale_events = tuple(
-        stale_lifecycle(finding, reason="source_changed")
-        for finding in batch.findings
-        if finding.file not in fresh_paths
+    stale_findings = tuple(
+        finding for finding in batch.findings if finding.file not in fresh_paths
     )
+    lifecycle: list[FindingLifecycle] = []
+    stale_keys: set[tuple[str, str, int]] = set()
+    for event in batch.lifecycle:
+        if event.file not in stale_paths:
+            lifecycle.append(event)
+            continue
+        stale_event = replace(
+            event,
+            status="stale",
+            previous_fingerprint=None,
+            reason="source_changed",
+        )
+        key = (stale_event.fingerprint, stale_event.file, stale_event.line)
+        if key not in stale_keys:
+            lifecycle.append(stale_event)
+            stale_keys.add(key)
+    for finding in stale_findings:
+        stale_event = stale_lifecycle(finding, reason="source_changed")
+        key = (stale_event.fingerprint, stale_event.file, stale_event.line)
+        if key not in stale_keys:
+            lifecycle.append(stale_event)
+            stale_keys.add(key)
     return replace(
         batch,
         findings=tuple(f for f in batch.findings if f.file in fresh_paths),
-        lifecycle=batch.lifecycle + stale_events,
+        lifecycle=tuple(lifecycle[: MAX_FINDINGS * 2]),
         stale_files=tuple(sorted(set(batch.stale_files) | set(stale_paths))),
     )
 

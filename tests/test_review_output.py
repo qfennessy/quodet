@@ -238,5 +238,58 @@ class ReviewOutputTests(unittest.TestCase):
         self.assertEqual(document["lifecycle"][0]["status"], "no_longer_reported")
         self.assertEqual(document["stale_files"], [])
 
+    def test_partial_staleness_keeps_fresh_omission_visible(self) -> None:
+        review = replace(
+            batch(),
+            findings=(),
+            lifecycle=(
+                FindingLifecycle(
+                    status="stale",
+                    fingerprint="a" * 64,
+                    file="src/service.py",
+                    line=10,
+                    reason="source_changed",
+                ),
+                FindingLifecycle(
+                    status="no_longer_reported",
+                    fingerprint="b" * 64,
+                    file="src/repository.py",
+                    line=20,
+                    previous_fingerprint="b" * 64,
+                ),
+            ),
+            stale_files=("src/service.py",),
+        )
+
+        rendered = render_human_review(review)
+
+        self.assertIn("1 prior finding no longer reported", rendered)
+        self.assertIn("1 stale reviewed file discarded", rendered)
+        self.assertNotIn("discarded after", rendered)
+
+    def test_mixed_findings_show_omissions_in_lifecycle_summary(self) -> None:
+        review = replace(
+            batch(finding()),
+            lifecycle=(
+                FindingLifecycle(
+                    status="new",
+                    fingerprint="a" * 64,
+                    file="src/service.py",
+                    line=10,
+                ),
+                FindingLifecycle(
+                    status="no_longer_reported",
+                    fingerprint="b" * 64,
+                    file="src/repository.py",
+                    line=20,
+                    previous_fingerprint="b" * 64,
+                ),
+            ),
+        )
+
+        rendered = render_human_review(review)
+
+        self.assertIn("1 prior finding no longer reported", rendered.splitlines()[0])
+
 if __name__ == "__main__":
     unittest.main()

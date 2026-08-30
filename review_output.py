@@ -224,7 +224,12 @@ def render_human_review(batch: ReviewBatchLike) -> str:
         lifecycle_counts[event.status] = lifecycle_counts.get(event.status, 0) + 1
     finding_count = len(batch.findings)
     if finding_count == 0:
-        if batch.stale_files or lifecycle_counts.get("stale"):
+        stale_paths = set(batch.stale_files) | {
+            event.file for event in batch.lifecycle if event.status == "stale"
+        }
+        reviewed_paths = {reviewed_file.path for reviewed_file in batch.reviewed_files}
+        wholly_stale = bool(reviewed_paths) and reviewed_paths <= stale_paths
+        if wholly_stale:
             stale_reasons = {
                 event.reason
                 for event in batch.lifecycle
@@ -249,16 +254,24 @@ def render_human_review(batch: ReviewBatchLike) -> str:
                 )
             else:
                 result = "no confident findings"
+            if stale_paths:
+                result += f"; {_count(len(stale_paths), 'stale reviewed file')} discarded"
             lines = [
                 f"{batch_label} reviewed {reviewed} in "
                 f"{timing.total_ms / 1_000:.2f}s: {result} {stages}"
             ]
     else:
-        lifecycle_summary = ", ".join(
-            f"{count} {status.replace('_', ' ')}"
-            for status, count in sorted(lifecycle_counts.items())
-            if status != "no_longer_reported"
-        )
+        lifecycle_summary_parts: list[str] = []
+        for status, count in sorted(lifecycle_counts.items()):
+            if status == "no_longer_reported":
+                lifecycle_summary_parts.append(
+                    f"{_count(count, 'prior finding')} no longer reported"
+                )
+            else:
+                lifecycle_summary_parts.append(
+                    f"{count} {status.replace('_', ' ')}"
+                )
+        lifecycle_summary = ", ".join(lifecycle_summary_parts)
         heading = (
             f"{batch_label} reviewed {reviewed} in {timing.total_ms / 1_000:.2f}s: "
             f"{_count(finding_count, 'likely defect')}"

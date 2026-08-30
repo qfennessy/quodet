@@ -29,7 +29,7 @@ from feedback import (
     validate_spooled_payload,
 )
 from redaction import RedactionNotice, RedactionSummary
-from review_lifecycle import FindingLifecycle
+from review_lifecycle import FindingLifecycle, finding_fingerprint
 
 
 def valid_output(file: str = "src/app.py") -> str:
@@ -275,6 +275,65 @@ class FeedbackTests(unittest.TestCase):
         batch = self.parse(valid_output())
         (self.root / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
         self.assertEqual(fresh_findings(batch).findings, ())
+
+    def test_watcher_freshness_replaces_lifecycle_at_limit(self) -> None:
+        import hashlib
+
+        quiet = self.root / "src" / "quiet.py"
+        quiet.write_text("old = True\n", encoding="utf-8")
+        reviewed = (
+            *self.reviewed,
+            ReviewedFile(
+                "src/quiet.py",
+                hashlib.sha256(quiet.read_bytes()).hexdigest(),
+                quiet.stat().st_size,
+            ),
+        )
+        raw = json.loads(valid_output())
+        raw["findings"].append(
+            {
+                **raw["findings"][0],
+                "file": "src/quiet.py",
+                "line": 2,
+                "title": "Quiet file defect",
+            }
+        )
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            session_id="agent-a",
+        )
+        lifecycle = tuple(
+            FindingLifecycle(
+                "new",
+                (
+                    finding_fingerprint(batch.findings[1])
+                    if index == 0
+                    else f"{index:064x}"
+                ),
+                "src/quiet.py" if index == 0 else "src/app.py",
+                2 if index == 0 else index + 1,
+            )
+            for index in range(MAX_FINDINGS * 2)
+        )
+        spool = self.base / "watcher-lifecycle-limit" / "feedback"
+        sink = SpoolSink(spool, root=self.root, session_id="agent-a")
+        self.addCleanup(sink.close)
+
+        quiet.write_text("new = True\n", encoding="utf-8")
+        self.assertTrue(sink.publish(replace(batch, lifecycle=lifecycle)))
+
+        payload = json.loads(next((spool / "pending").glob("*.json")).read_text())
+        self.assertEqual(len(payload["lifecycle"]), MAX_FINDINGS * 2)
+        quiet_events = [
+            item for item in payload["lifecycle"]
+            if item["file"] == "src/quiet.py"
+        ]
+        self.assertEqual(len(quiet_events), 1)
+        self.assertEqual(quiet_events[0]["status"], "stale")
+        self.assertNotIn("src/quiet.py", {item["file"] for item in payload["findings"]})
+        validate_spooled_payload(payload, root=self.root, session_id="agent-a")
 
     def test_freshness_reads_are_bounded_and_reject_non_regular_files(self) -> None:
         source = self.root / "src" / "app.py"
