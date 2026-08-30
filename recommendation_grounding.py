@@ -36,6 +36,10 @@ _TEST_SYMBOL = re.compile(
     r"[A-Za-z0-9_]+_(?:test|spec))(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_SPEC_SYMBOL = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z0-9_]+_spec(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _MUTATION_VERB = re.compile(
     r"\b(?:preserve|retain|extend|modify|update|keep|change|edit)\b",
     re.IGNORECASE,
@@ -104,7 +108,11 @@ def _mutates_unsupplied_test(
         for match in _TEST_PATH.finditer(clause)
         if _path_is_proposed(clause, match.start())
     ]
-    for test_match in _TEST_WORD.finditer(clause):
+    test_matches = list(_TEST_WORD.finditer(clause))
+    if any(match.group(0).lower() in {"test", "tests"} for match in test_matches):
+        test_matches.extend(_SPEC_SYMBOL.finditer(clause))
+        test_matches.sort(key=lambda match: match.start())
+    for test_match in test_matches:
         if test_match.group(0) in supplied_test_symbols:
             continue
         if (

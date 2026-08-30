@@ -214,6 +214,19 @@ class RecommendedFixEvaluationTests(unittest.TestCase):
                 )
                 self.assertEqual(result["status"], "grounded")
 
+    def test_explicit_test_word_rejects_unknown_spec_symbol(self) -> None:
+        result = scoring.evaluate_recommendation(
+            "Extend known_spec and missing_spec test cases.",
+            supplied_files=["tests/cache.py"],
+            supplied_test_symbols=["known_spec"],
+        )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertEqual(
+            result["violations"][0]["code"],
+            "unsupported-test-mutation",
+        )
+
     def test_unrelated_supplied_test_does_not_ground_generic_claim(self) -> None:
         for recommendation in (
             "Preserve the existing cache regression test.",
