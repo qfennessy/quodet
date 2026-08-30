@@ -150,12 +150,26 @@ class FeedbackTests(unittest.TestCase):
             fresh_spooled_payload(validated, root=self.root)["findings"], []
         )
 
-    def test_console_sink_preserves_json_shape(self) -> None:
+    def test_console_sink_defaults_to_human_and_supports_json(self) -> None:
         batch = self.parse(valid_output())
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
+        human_output = io.StringIO()
+        with mock.patch("sys.stdout", human_output):
             ConsoleSink().publish(batch)
-        self.assertEqual(json.loads(output.getvalue())["findings"][0]["line"], 7)
+        self.assertIn("Quodet reviewed 1 file: 1 likely defect", human_output.getvalue())
+        self.assertNotIn('"findings"', human_output.getvalue())
+
+        json_output = io.StringIO()
+        ConsoleSink(mode="json", stream=json_output).publish(batch)
+        document = json.loads(json_output.getvalue())
+        self.assertEqual(document["schema_version"], "quodet-review-output-v1")
+        self.assertEqual(document["findings"][0]["line"], 7)
+
+        buffered_output = mock.Mock()
+        ConsoleSink(mode="json", stream=buffered_output).publish(batch)
+        buffered_output.flush.assert_called_once_with()
+
+        with self.assertRaisesRegex(ValueError, "unsupported output mode"):
+            ConsoleSink(mode="xml")
 
     def test_spool_is_private_atomic_and_requires_exact_ownership(self) -> None:
         spool = self.base / "runtime" / "feedback"

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -94,6 +95,26 @@ class WatchFilesTests(unittest.TestCase):
             {"qwen-large", "qwen-local", "qwen", "qwen-large-cloud"},
         )
         self.assertNotIn("qwen-large-cl", watch_files._listed_model_ids(output))
+
+    def test_output_mode_defaults_to_human_and_cli_overrides_configuration(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(watch_files.parse_args(["."]).output, "human")
+            self.assertEqual(watch_files.parse_args([".", "--json"]).output, "json")
+
+        with mock.patch.dict(os.environ, {"QUODET_OUTPUT": "json"}, clear=True):
+            self.assertEqual(watch_files.parse_args(["."]).output, "json")
+            self.assertEqual(
+                watch_files.parse_args([".", "--output", "human"]).output,
+                "human",
+            )
+
+    def test_invalid_configured_output_mode_fails_closed(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"QUODET_OUTPUT": "yaml"}, clear=True),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            watch_files.parse_args(["."])
 
     def test_review_batches_retain_every_path_beyond_the_provider_cap(self) -> None:
         paths = [Path(f"/tmp/source-{index}.py") for index in range(205)]
@@ -506,6 +527,53 @@ class WatchFilesTests(unittest.TestCase):
             self.assertIn("[REDACTED]", event["stderr"])
             self.assertIn("[REDACTED]", event["model_run_result"]["stdout"])
 
+    def test_json_sink_keeps_stdout_machine_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "source.py"
+            source.write_text("value = 1\n")
+            result = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": '{"findings": []}',
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
+            )()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch("watch_files.run_bounded_command", return_value=result),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="test-model",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort=None,
+                    sink=watch_files.ConsoleSink(mode="json"),
+                )
+
+            document = json.loads(stdout.getvalue())
+            self.assertEqual(document["schema_version"], "quodet-review-output-v1")
+            self.assertEqual(document["findings"], [])
+            self.assertGreaterEqual(
+                document["timing"]["published_at"], document["created_at"]
+            )
+            self.assertIsNotNone(batch)
+            assert batch is not None
+            self.assertEqual(document["timing"]["published_at"], batch.published_at)
+            self.assertIn("Reviewing 1 changed file", stderr.getvalue())
+            self.assertNotIn("Reviewing", stdout.getvalue())
+
     def test_review_handles_malformed_nonzero_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
@@ -533,8 +601,16 @@ class WatchFilesTests(unittest.TestCase):
                     "output_exceeded": False,
                 },
             )()
-            with mock.patch("watch_files.run_bounded_command", return_value=malformed):
+            rejection = io.StringIO()
+            with (
+                mock.patch("watch_files.run_bounded_command", return_value=malformed),
+                contextlib.redirect_stderr(rejection),
+            ):
                 self.assertIsNone(watch_files.review_files(**common))
+            self.assertIn("Review discarded", rejection.getvalue())
+            self.assertIn(
+                "no console or agent feedback was published", rejection.getvalue()
+            )
 
             failed = type(
                 "Result",
