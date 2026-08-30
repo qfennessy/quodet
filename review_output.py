@@ -225,9 +225,20 @@ def render_human_review(batch: ReviewBatchLike) -> str:
     finding_count = len(batch.findings)
     if finding_count == 0:
         if batch.stale_files or lifecycle_counts.get("stale"):
+            stale_reasons = {
+                event.reason
+                for event in batch.lifecycle
+                if event.status == "stale" and event.reason is not None
+            }
+            if stale_reasons == {"source_changed"}:
+                stale_result = "source changed during review"
+            elif stale_reasons == {"out_of_order"}:
+                stale_result = "review completed behind a newer snapshot"
+            else:
+                stale_result = "stale review result"
             lines = [
                 f"{batch_label} discarded after {timing.total_ms / 1_000:.2f}s: "
-                f"source changed during review {stages}"
+                f"{stale_result} {stages}"
             ]
         else:
             omitted = lifecycle_counts.get("no_longer_reported", 0)
