@@ -101,6 +101,14 @@ def _hint_reviewed_files(
     return tuple(reviewed)
 
 
+AGENT_ACTION = (
+    "Next: independently reproduce each finding against the current code. "
+    "If valid, apply the smallest focused fix and add or update a regression "
+    "test; if invalid, do not edit. Do not quote the full feedback unless the "
+    "user asks."
+)
+
+
 def _record_delivery_metric(
     directory: Path,
     *,
@@ -401,6 +409,15 @@ def render_feedback_chunk(
     findings = payload.get("findings")
     if not isinstance(findings, list) or not findings:
         return None, []
+    reviewed_files = payload.get("reviewed_files")
+    reviewed_count = len(reviewed_files) if isinstance(reviewed_files, list) else 0
+    finding_count = sum(isinstance(finding, dict) for finding in findings)
+    finding_label = "defect" if finding_count == 1 else "defects"
+    file_label = "file" if reviewed_count == 1 else "files"
+    ready_line = (
+        f"Quodet review ready: {finding_count} likely {finding_label} in "
+        f"{reviewed_count} reviewed {file_label}."
+    )
     published_at = payload.get("published_at")
     debounce_ms = payload.get("debounce_ms")
     provider_ms = payload.get("provider_ms")
@@ -418,9 +435,9 @@ def render_feedback_chunk(
             f"hook delivery wait {hook_wait_ms:.1f} ms; "
             f"total edit-to-feedback {total_ms:.1f} ms."
         )
-        lines = [UNTRUSTED_NOTICE, latency_line]
+        lines = [ready_line, UNTRUSTED_NOTICE, AGENT_ACTION, latency_line]
     else:
-        lines = [UNTRUSTED_NOTICE]
+        lines = [ready_line, UNTRUSTED_NOTICE, AGENT_ACTION]
     delivered = 0
     for index, finding in enumerate(findings):
         if not isinstance(finding, dict):

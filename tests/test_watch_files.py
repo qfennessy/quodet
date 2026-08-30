@@ -280,11 +280,27 @@ class WatchFilesTests(unittest.TestCase):
             ],
         )
 
+    def test_response_schema_binds_only_exact_provider_visible_paths(self) -> None:
+        labels = ("src/app.py", "tests/test_app.py")
+        schema = json.loads(watch_files.response_schema_json(labels))
+        file_schema = schema["properties"]["findings"]["items"]["properties"][
+            "file"
+        ]
+
+        self.assertEqual(file_schema["enum"], list(labels))
+        self.assertNotIn("project/src/app.py", file_schema["enum"])
+        self.assertNotIn("tests/test_future.py", file_schema["enum"])
+
     def test_default_prompt_requests_only_confident_negative_json(self) -> None:
         prompt = watch_files.DEFAULT_PROMPT.lower()
         self.assertIn("only negative findings", prompt)
         self.assertIn("at least 0.95 confident", prompt)
         self.assertIn("concrete execution path", prompt)
+        self.assertIn("trigger is reachable", prompt)
+        self.assertIn("concrete implementations", prompt)
+        self.assertIn("do not assume a hypothetical subclass", prompt)
+        self.assertIn("discard schedules contradicted", prompt)
+        self.assertIn("self-reported threshold claim, not evidence", prompt)
         self.assertIn("each supplied file as a separate file", prompt)
         self.assertIn("mutually consistent", prompt)
         self.assertIn("calibrate severity only from demonstrated impact", prompt)
@@ -310,6 +326,11 @@ class WatchFilesTests(unittest.TestCase):
             "why it fixes the cited execution path",
             "narrow regression test or validation step",
             "identify the exact missing evidence",
+            "never claim that a test, function, contract, safeguard",
+            "unless it appears in the supplied files",
+            "when no test file was supplied",
+            "recommend adding a test",
+            "name its supplied relative path or a test symbol",
             "unrelated refactors",
             "destructive commands",
             "permission bypasses",
@@ -321,6 +342,13 @@ class WatchFilesTests(unittest.TestCase):
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, prompt)
+
+    def test_default_prompt_requires_exact_supplied_relative_path(self) -> None:
+        prompt = watch_files.DEFAULT_PROMPT.lower()
+
+        self.assertIn("original relative path:", prompt)
+        self.assertIn("exactly and verbatim", prompt)
+        self.assertIn("never add, remove, normalize, or guess", prompt)
 
     def test_suggested_fix_schema_is_required_bounded_and_documented(self) -> None:
         findings = watch_files.REVIEW_SCHEMA["properties"]["findings"]
@@ -488,6 +516,23 @@ class WatchFilesTests(unittest.TestCase):
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz1234567890", secret_sanitized)
         self.assertGreater(secret_count, 0)
 
+    def test_provider_path_mapping_is_exact_and_rejects_sensitive_paths(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+
+        def snapshot(relative: str) -> watch_files.SourceSnapshot:
+            path = Path("/tmp") / relative
+            return watch_files.SourceSnapshot(path, Path(relative), "", "0" * 64, 0)
+
+        mapping = watch_files.provider_path_mapping([snapshot("src/app.py")])
+        self.assertEqual(mapping, {"src/app.py": "src/app.py"})
+
+        with self.assertRaisesRegex(
+            watch_files.ReviewValidationError,
+            "excluded before mapping",
+        ) as raised:
+            watch_files.provider_path_mapping([snapshot(f"src/{secret}.py")])
+        self.assertNotIn(secret, str(raised.exception))
+
     def test_review_sends_only_sanitized_temporary_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
@@ -510,6 +555,11 @@ class WatchFilesTests(unittest.TestCase):
                 uploaded = observed_path.read_text()
                 self.assertNotIn(secret, uploaded)
                 self.assertIn(watch_files.REDACTED, uploaded)
+                schema = json.loads(command[command.index("--schema") + 1])
+                file_enum = schema["properties"]["findings"]["items"][
+                    "properties"
+                ]["file"]["enum"]
+                self.assertEqual(file_enum, ["source.env"])
                 self.assertFalse(
                     any(
                         secret_value in argument
@@ -684,6 +734,63 @@ class WatchFilesTests(unittest.TestCase):
             self.assertIn("app.py:1 assignment key OPEN…KEY", diagnostic)
             self.assertNotIn(secret, diagnostic)
             self.assertNotIn(secret[:10], diagnostic)
+
+    def test_review_grounds_a_visible_symbol_from_a_supplied_test(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "tests" / "cache.py"
+            source.parent.mkdir()
+            source.write_text(
+                "def test_unexpired_entry():\n    assert True\n",
+                encoding="utf-8",
+            )
+            response = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "file": "tests/cache.py",
+                            "line": 1,
+                            "severity": "medium",
+                            "confidence": 0.99,
+                            "title": "Missing expiry coverage",
+                            "explanation": "The expiry branch is not exercised.",
+                            "suggested_fix": (
+                                "Extend test_unexpired_entry with an expiry assertion."
+                            ),
+                        }
+                    ]
+                }
+            )
+            result = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": response,
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
+            )()
+
+            with mock.patch(
+                "watch_files.run_bounded_command", return_value=result
+            ):
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="gpt-5.6-luna",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort="high",
+                    sink=mock.Mock(),
+                )
+
+            self.assertIsNotNone(batch)
+            assert batch is not None
+            self.assertEqual(batch.findings[0].file, "tests/cache.py")
 
     def test_evaluation_event_preserves_provider_streams_and_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

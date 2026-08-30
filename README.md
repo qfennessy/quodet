@@ -55,13 +55,28 @@ When no confident negative findings exist, Luna returns `{"findings": []}`.
   failure path and include a narrow regression test or validation step.
 - When the supplied files are insufficient for a safe repair, the reviewer
   identifies the missing evidence instead of inventing architecture.
+- The reviewer cannot claim that a test or supporting artifact already exists
+  unless it is in the supplied snapshot. With no supplied test, it recommends
+  adding one; with a relevant supplied test, it names the visible path or test
+  symbol before recommending an extension.
+- Reachability must follow from the concrete implementations, values, ordering,
+  and scheduler behavior in the supplied files. Hypothetical subclasses,
+  contract violations, and schedules contradicted by visible delays do not
+  qualify as high-confidence findings.
+- Each batch constrains `finding.file` to an enum of the exact
+  `Original relative path:` labels visible to the provider. Quodet excludes a
+  file when its path itself requires redaction; for files that are sent, it
+  accepts only the exact local label and rejects path aliases or guessed
+  prefixes.
 - Recommendations remain untrusted review data. Coding agents and developers
   must independently verify the diagnosis and fix; Quodet never auto-applies
   the proposed change.
 
-PR #3 also added a frozen deterministic recommendation fixture and records the
-model, prompt SHA-256, fixture revision, and case IDs for separate live-model
-evaluations.
+The deterministic recommendation fixtures cover both absent and supplied test
+files. Live-run artifacts report recommendation-grounding failures separately
+from defect-detection TP/FP/FN, so a correct diagnosis with invented repair
+context does not disappear inside the detection score. The runner also records
+the model, prompt SHA-256, fixture revision, and case IDs.
 
 It uses `gpt-5.6-luna` with `reasoning_effort=high` by default. The installed
 `llm` provider calls `high` its maximum supported reasoning level.
@@ -224,6 +239,8 @@ and schema with revisions and hashes, fixture revision and manifest hash, raw
 provider response, parsed response, transcript, schema/provider/timeout state,
 and per-case latency. Malformed output and timeouts remain failed samples; the
 runner neither repairs them nor silently substitutes an unrecorded retry.
+Each case also retains per-finding recommendation-grounding results, while run
+metrics report a separate grounding count and rate alongside detection metrics.
 
 Raw findings require independent semantic adjudication. Generate a template,
 judge every finding's explanation and demonstrated failure path, then score it:
@@ -557,9 +574,12 @@ immediately. A review completed inside the grace window is delivered without a
 second user prompt; a slower result stays durable for the next matching
 boundary. `Stop` blocks completion once when it delivers a batch,
 allowing Codex to continue and independently inspect the suggestion. Every
-delivery is explicitly labelled as untrusted automated review data that must
-be verified before editing. Quodet never bypasses Codex permissions or
-approvals.
+delivery starts with the number of likely defects and reviewed files, then
+gives the agent a short default action: independently
+reproduce each finding, apply the smallest focused fix and test only when valid,
+and avoid quoting the full feedback unless asked. Every delivery is explicitly
+labelled as untrusted automated review data that must be verified before
+editing. Quodet never bypasses Codex permissions or approvals.
 
 Session routing fails closed: the producer exclusively leases a canonical
 watched root to one configured session, and the consumer claims only feedback

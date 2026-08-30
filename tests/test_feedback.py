@@ -105,6 +105,73 @@ class FeedbackTests(unittest.TestCase):
             validated["provider_started_at"], validated["provider_completed_at"]
         )
 
+    def test_parse_rejects_recommendation_that_invents_an_existing_test(self) -> None:
+        raw = json.loads(valid_output())
+        raw["findings"][0]["suggested_fix"] = (
+            "Include tenant_id while preserving the existing cache regression test."
+        )
+
+        with self.assertRaisesRegex(
+            ReviewValidationError, "unsupported-existing-test-claim"
+        ):
+            self.parse(json.dumps(raw))
+
+    def test_parse_accepts_source_change_followed_by_a_new_test(self) -> None:
+        for suggested_fix in (
+            "Modify Cache.get(), then add a regression test for tenant isolation.",
+            "Modify Cache.get(), then add tests/test_cache.py for tenant isolation.",
+        ):
+            raw = json.loads(valid_output())
+            raw["findings"][0]["suggested_fix"] = suggested_fix
+
+            with self.subTest(suggested_fix=suggested_fix):
+                batch = self.parse(json.dumps(raw))
+                self.assertEqual(batch.findings[0].suggested_fix, suggested_fix)
+
+    def test_parse_accepts_recommendation_that_names_a_supplied_test(self) -> None:
+        import hashlib
+
+        test_path = self.root / "tests" / "test_app.py"
+        test_path.parent.mkdir()
+        test_path.write_text("def test_cache(): pass\n", encoding="utf-8")
+        reviewed = (
+            *self.reviewed,
+            ReviewedFile(
+                "tests/test_app.py",
+                hashlib.sha256(test_path.read_bytes()).hexdigest(),
+                test_path.stat().st_size,
+            ),
+        )
+        raw = json.loads(valid_output())
+        raw["findings"][0]["suggested_fix"] = (
+            "Include tenant_id, then extend tests/test_app.py with a second tenant."
+        )
+
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            session_id="agent-a",
+        )
+
+        self.assertEqual(
+            batch.findings[0].suggested_fix,
+            raw["findings"][0]["suggested_fix"],
+        )
+
+        raw["findings"][0]["suggested_fix"] = (
+            "Preserve the existing cache regression test."
+        )
+        with self.assertRaisesRegex(
+            ReviewValidationError, "unsupported-existing-test-claim"
+        ):
+            parse_review_output(
+                json.dumps(raw),
+                root=self.root,
+                reviewed_files=reviewed,
+                session_id="agent-a",
+            )
+
     def test_parse_rejects_malformed_unexpected_traversal_and_oversized(self) -> None:
         cases = [
             "not json",
@@ -120,6 +187,87 @@ class FeedbackTests(unittest.TestCase):
         for output in cases:
             with self.subTest(output=output[:30]), self.assertRaises(ReviewValidationError):
                 self.parse(output)
+
+    def test_parse_rejects_wrong_prefix_and_path_aliases(self) -> None:
+        for finding_path in (
+            "project/src/app.py",
+            "./src/app.py",
+            "src//app.py",
+            "src\\app.py",
+        ):
+            with self.subTest(finding_path=finding_path), self.assertRaisesRegex(
+                ReviewValidationError,
+                "finding path",
+            ):
+                self.parse(valid_output(finding_path))
+
+    def test_parse_maps_exact_sanitized_provider_path_without_leaking_it(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        original = f"src/{secret}.py"
+        source = self.root / original
+        source.write_text("value = 2\n", encoding="utf-8")
+        import hashlib
+
+        reviewed = (
+            ReviewedFile(
+                original,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                source.stat().st_size,
+            ),
+        )
+        provider_label = "src/[REDACTED].py"
+        raw = json.loads(valid_output(provider_label))
+        raw["findings"][0]["suggested_fix"] = (
+            "Change the assignment and add tests/test_future.py."
+        )
+
+        batch = parse_review_output(
+            json.dumps(raw),
+            root=self.root,
+            reviewed_files=reviewed,
+            provider_path_map={provider_label: original},
+        )
+
+        self.assertEqual(batch.findings[0].file, original)
+        with self.assertRaisesRegex(ReviewValidationError, "provider-visible"):
+            parse_review_output(
+                valid_output(original),
+                root=self.root,
+                reviewed_files=reviewed,
+                provider_path_map={provider_label: original},
+            )
+
+    def test_parse_grounds_provider_visible_test_path_and_symbol(self) -> None:
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        original = f"{secret}/tests/cache.py"
+        source = self.root / original
+        source.parent.mkdir(parents=True)
+        source.write_text("def test_unexpired_entry(): pass\n", encoding="utf-8")
+        import hashlib
+
+        reviewed = (
+            ReviewedFile(
+                original,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                source.stat().st_size,
+            ),
+        )
+        provider_label = "[REDACTED]/tests/cache.py"
+        for suggested_fix in (
+            f"Extend {provider_label} with an expiry assertion.",
+            "Extend test_unexpired_entry with an expiry assertion.",
+        ):
+            raw = json.loads(valid_output(provider_label))
+            raw["findings"][0]["suggested_fix"] = suggested_fix
+            with self.subTest(suggested_fix=suggested_fix):
+                batch = parse_review_output(
+                    json.dumps(raw),
+                    root=self.root,
+                    reviewed_files=reviewed,
+                    provider_path_map={provider_label: original},
+                    supplied_test_symbols=("test_unexpired_entry",),
+                )
+                self.assertEqual(batch.findings[0].file, original)
 
     def test_freshness_removes_finding_after_file_changes(self) -> None:
         batch = self.parse(valid_output())
@@ -465,6 +613,38 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(messages[1].count("  Suggested fix:"), 2)
         self.assertEqual(len(list((spool / "acknowledged").glob("*.json"))), 1)
 
+    def test_feedback_presentation_covers_zero_one_and_multiple_findings(self) -> None:
+        raw = json.loads(valid_output())
+        raw["reviewed_files"] = [
+            {"path": "src/app.py", "sha256": "a" * 64, "size": 10}
+        ]
+
+        zero = {**raw, "findings": []}
+        self.assertEqual(codex_feedback_hook.render_feedback_chunk(zero), (None, []))
+
+        one = codex_feedback_hook.render_feedback(raw)
+        self.assertIsNotNone(one)
+        assert one is not None
+        self.assertTrue(
+            one.startswith("Quodet review ready: 1 likely defect in 1 reviewed file.\n")
+        )
+        self.assertIn(UNTRUSTED_NOTICE, one)
+        self.assertIn("independently reproduce each finding", one)
+        self.assertIn("apply the smallest focused fix", one)
+        self.assertIn("if invalid, do not edit", one)
+        self.assertIn("Do not quote the full feedback unless the user asks", one)
+
+        multiple = {**raw, "findings": [raw["findings"][0]] * 3}
+        message = codex_feedback_hook.render_feedback(multiple)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertTrue(
+            message.startswith(
+                "Quodet review ready: 3 likely defects in 1 reviewed file.\n"
+            )
+        )
+        self.assertEqual(message.count("  Suggested fix:"), 3)
+
     def test_delivery_character_limit_retains_whole_findings(self) -> None:
         raw = json.loads(valid_output())
         first_message = codex_feedback_hook.render_feedback(raw)
@@ -474,7 +654,13 @@ class FeedbackTests(unittest.TestCase):
             codex_feedback_hook, "MAX_DELIVERY_CHARS", len(first_message) + 1
         ):
             message, remaining = codex_feedback_hook.render_feedback_chunk(raw)
-        self.assertEqual(message, first_message)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertTrue(
+            message.startswith("Quodet review ready: 2 likely defects in 0 reviewed files.")
+        )
+        self.assertEqual(message.count("  Suggested fix:"), 1)
+        self.assertIn("Incorrect cache scope", message)
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["line"], 8)
 

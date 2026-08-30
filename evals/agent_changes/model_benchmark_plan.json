@@ -15,8 +15,8 @@
     "reserved_splits": ["temporal", "confirmation"]
   },
   "review_contract": {
-    "prompt_revision": "quodet-review-v2",
-    "prompt_sha256": "9a0be118a5d3e9cfc2a0a4c42e7549c74fbd5825f4f2b97426a1a380901e62fb",
+    "prompt_revision": "quodet-review-v3",
+    "prompt_sha256": "50ccecf60b7bd3b1984a0704e78bc9c32c33a5c6553430bb26547d337514daf7",
     "schema_revision": "quodet-findings-v3",
     "schema_sha256": "d2b3627c6547348b62f1e30c4e89e3b6c2b898c181911c1ebe74f2f1f991ec5a",
     "attempts_per_case": 1,

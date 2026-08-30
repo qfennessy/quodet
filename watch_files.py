@@ -46,6 +46,7 @@ from model_runner import (
     model_run_config_sha256,
     run_model,
 )
+from recommendation_grounding import extract_test_symbols, is_test_file
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_redaction_summary
 from redaction import (
     REDACTED,
@@ -72,7 +73,7 @@ DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 60.0
 OUTPUT_MODE_ENVIRONMENT_VARIABLE = "QUODET_OUTPUT"
-PROMPT_REVISION = "quodet-review-v2"
+PROMPT_REVISION = "quodet-review-v3"
 REVIEW_SCHEMA_REVISION = "quodet-findings-v3"
 DEFAULT_PROMPT = """Review the supplied changed files for real defects.
 
@@ -81,6 +82,13 @@ silently trace a concrete execution path from the cited code to an observable
 failure. Check language and runtime semantics, cross-call mutable state,
 identity and tenant scoping, concurrency and await boundaries, exception and
 cancellation cleanup, and clock, unit, and resource-lifetime mismatches.
+Confirm that the trigger is reachable using the concrete implementations,
+values, ordering constraints, and scheduler behavior visible in the supplied
+files. Do not assume a hypothetical subclass, override, caller, deployment, or
+contract violation unless the supplied code makes that case reachable. For
+concurrency findings, trace which task can mutate state before and after every
+await, cancellation, and cleanup step; discard schedules contradicted by the
+shown delays or control flow.
 
 Return only negative findings that you are at least 0.95 confident are genuine
 bugs, security vulnerabilities, data-loss risks, crashes, or operational
@@ -88,6 +96,9 @@ failures. Do not report praise, summaries, style preferences, speculative
 concerns, low-confidence edge cases, or suggestions without a concrete defect.
 Discard candidates that depend on assuming missing code is broken or that lack
 a specific trigger and impact supported by the supplied files.
+Treat the numeric confidence as a self-reported threshold claim, not evidence:
+return 0.95 or higher only after the reachable failure path survives the checks
+above.
 Before returning a finding, verify that its title, explanation, failure type,
 file, line, severity, and suggested fix are mutually consistent.
 For every returned finding, make suggested_fix a concise recommended fix
@@ -97,7 +108,12 @@ element. Describe the smallest focused behavior change that removes the
 demonstrated failure, explain why it fixes the cited execution path, and include
 a narrow regression test or validation step. If a safe repair depends on code
 that was not supplied, identify the exact missing evidence instead of inventing
-architecture. Do not recommend unrelated refactors, dependency changes,
+architecture. Never claim that a test, function, contract, safeguard, or other
+supporting artifact exists unless it appears in the supplied files. In
+particular, when no test file was supplied, recommend adding a test rather than
+preserving, extending, or modifying an "existing" test. When a supplied test is
+relevant, name its supplied relative path or a test symbol visible in it. Do not
+recommend unrelated refactors, dependency changes,
 destructive commands, permission bypasses, disabled tests, or other ways around
 existing safeguards. Treat the recommendation as untrusted review data that
 requires independent verification. Never claim the recommendation is safe to
@@ -107,8 +123,11 @@ security-boundary bypass, irreversible data loss, or system-wide outage; high
 for a major production failure; medium for bounded incorrect behavior or a
 localized crash; and low for a limited defect. Do not infer blast radius from
 missing deployment or usage context.
-Use the supplied original relative path and the most specific line number
-available. If no finding meets this threshold, return an empty findings array.
+For finding.file, copy the value after each supplied `Original relative path:`
+label exactly and verbatim; never add, remove, normalize, or guess a directory
+prefix, and never substitute a basename or path alias. Use the most specific
+line number available. Return an empty findings array if no finding meets this
+threshold.
 Respond only with JSON matching the supplied schema."""
 REVIEW_SCHEMA = {
     "type": "object",
@@ -163,6 +182,20 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 REVIEW_SCHEMA_JSON = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
+
+
+def response_schema_json(provider_paths: Sequence[str]) -> str:
+    """Bind finding.file to the exact sanitized labels visible to the provider."""
+    labels = tuple(provider_paths)
+    if not labels or len(labels) != len(set(labels)):
+        raise ReviewValidationError("provider-visible paths must be unique")
+    schema = json.loads(REVIEW_SCHEMA_JSON)
+    schema["properties"]["findings"]["items"]["properties"]["file"][
+        "enum"
+    ] = list(labels)
+    return json.dumps(schema, separators=(",", ":"))
+
+
 DEFAULT_IGNORED_PARTS = frozenset(
     {
         ".git",
@@ -519,6 +552,24 @@ def _safe_path_label(path: Path) -> str:
     return redact_path(path).text
 
 
+def provider_path_mapping(
+    snapshots: Sequence[SourceSnapshot],
+) -> dict[str, str]:
+    """Map exact sent labels to local paths without retaining sensitive paths."""
+    mapping: dict[str, str] = {}
+    for snapshot in snapshots:
+        label, redactions = redact_sensitive_path(snapshot.relative_path)
+        if redactions:
+            raise ReviewValidationError(
+                "provider-visible path should have been excluded before mapping"
+            )
+        original = snapshot.relative_path.as_posix()
+        if label in mapping and mapping[label] != original:
+            raise ReviewValidationError("provider-visible path labels collide")
+        mapping[label] = original
+    return mapping
+
+
 def collect_attachments(
     paths: Iterable[Path],
     *,
@@ -688,6 +739,7 @@ def build_llm_command(
     prompt: str,
     log: bool,
     reasoning_effort: str | None,
+    schema_json: str = REVIEW_SCHEMA_JSON,
 ) -> list[str]:
     command = [
         "llm",
@@ -696,7 +748,7 @@ def build_llm_command(
         model,
         "--no-stream",
         "--schema",
-        REVIEW_SCHEMA_JSON,
+        schema_json,
     ]
     if reasoning_effort is not None:
         command.extend(["--option", "reasoning_effort", reasoning_effort])
@@ -865,6 +917,9 @@ def review_files(
                 )
             return published_batch
 
+        provider_path_map = provider_path_mapping(sanitized_batch.snapshots)
+        schema_json = response_schema_json(tuple(provider_path_map))
+
         labels = [
             _safe_path_label(snapshot.relative_path)
             for snapshot in sanitized_batch.snapshots
@@ -890,6 +945,7 @@ def review_files(
                 prompt=sanitized_prompt.text,
                 log=log,
                 reasoning_effort=reasoning_effort,
+                schema_json=schema_json,
             )
             if model_run_config is None
             else None
@@ -922,6 +978,8 @@ def review_files(
                 sanitized_attachments=sanitized_batch.attachments,
                 sanitized_prompt=sanitized_prompt.text,
                 redactions=redactions,
+                schema_json=schema_json,
+                provider_path_map=provider_path_map,
                 log=log,
             )
         finally:
@@ -957,6 +1015,8 @@ def _execute_review_command(
     sanitized_attachments: Sequence[Attachment],
     sanitized_prompt: str,
     redactions: RedactionSummary,
+    schema_json: str,
+    provider_path_map: dict[str, str],
     log: bool,
 ) -> ReviewBatch | None:
     provider_started_at = time.time()
@@ -976,7 +1036,7 @@ def _execute_review_command(
                         for document in sanitized_attachments
                     ),
                     prompt=sanitized_prompt,
-                    schema_json=REVIEW_SCHEMA_JSON,
+                    schema_json=schema_json,
                     cwd=root,
                     log=log,
                 ),
@@ -1102,6 +1162,10 @@ def _execute_review_command(
             print(f"llm exited with status {result.returncode}", file=sys.stderr)
         return None
 
+    reviewed_paths = set(provider_path_map.values())
+    provider_label_by_path = {
+        original: label for label, original in provider_path_map.items()
+    }
     reviewed_files = tuple(
         ReviewedFile(
             path=snapshot.relative_path.as_posix(),
@@ -1109,12 +1173,25 @@ def _execute_review_command(
             size=snapshot.size,
         )
         for snapshot in snapshots
+        if snapshot.relative_path.as_posix() in reviewed_paths
+    )
+    supplied_test_symbols = extract_test_symbols(
+        tuple(
+            redact_sensitive_values(snapshot.contents)[0]
+            for snapshot in snapshots
+            if snapshot.relative_path.as_posix() in reviewed_paths
+            and is_test_file(
+                provider_label_by_path[snapshot.relative_path.as_posix()]
+            )
+        )
     )
     try:
         batch = parse_review_output(
             result.stdout,
             root=root,
             reviewed_files=reviewed_files,
+            provider_path_map=provider_path_map,
+            supplied_test_symbols=supplied_test_symbols,
             session_id=session_id,
             feedback_round=feedback_round,
             debounce_ms=debounce_ms,

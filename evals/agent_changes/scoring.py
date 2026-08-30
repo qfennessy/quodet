@@ -128,6 +128,18 @@ def score_run(
     """Score a raw run; semantic matches must come from explicit adjudication."""
     schema_valid = sum(case["status"] == "schema-valid" for case in run["cases"])
     total_cases = len(run["cases"])
+    grounding_evaluated = sum(
+        case.get("diagnostics", {})
+        .get("recommendation_grounding", {})
+        .get("evaluated", 0)
+        for case in run["cases"]
+    )
+    grounding_failures = sum(
+        case.get("diagnostics", {})
+        .get("recommendation_grounding", {})
+        .get("failures", 0)
+        for case in run["cases"]
+    )
     base: dict[str, Any] = {
         "adjudication_status": "pending" if adjudications is None else "complete",
         "schema_valid": schema_valid,
@@ -137,6 +149,16 @@ def score_run(
         "status_counts": {
             status: sum(case["status"] == status for case in run["cases"])
             for status in sorted({str(case["status"]) for case in run["cases"]})
+        },
+        "recommendation_grounding": {
+            "evaluated": grounding_evaluated,
+            "grounded": grounding_evaluated - grounding_failures,
+            "failures": grounding_failures,
+            "grounded_rate": (
+                (grounding_evaluated - grounding_failures) / grounding_evaluated
+                if grounding_evaluated
+                else 0.0
+            ),
         },
     }
     if adjudications is None:

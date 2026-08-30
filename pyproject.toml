@@ -26,4 +26,5 @@ py-modules = [
     "codex_feedback_hook",
     "agent_integration",
     "model_runner",
+    "recommendation_grounding",
 ]

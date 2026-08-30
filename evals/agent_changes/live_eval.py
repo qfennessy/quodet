@@ -20,6 +20,7 @@ from typing import Any, Sequence, TextIO
 
 import watch_files
 from evals.agent_changes import artifacts, benchmark, replay, scoring
+from evals.recommended_fixes import scoring as recommendation_scoring
 from model_runner import (
     ModelDocument,
     ModelRunConfig,
@@ -28,6 +29,7 @@ from model_runner import (
     model_run_config_sha256,
     preflight_model_run,
 )
+from recommendation_grounding import extract_test_symbols, is_test_file
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -94,6 +96,7 @@ def evaluation_configuration(
             "revision": watch_files.REVIEW_SCHEMA_REVISION,
             "sha256": sha256_text(schema_text),
             "value": watch_files.REVIEW_SCHEMA,
+            "finding_file_binding": "per-batch-provider-visible-enum",
         },
         "fixture": {
             "revision": fixture_revision,
@@ -165,7 +168,28 @@ def wait_for_startup(output: queue.Queue[str], timeout: float = 15.0) -> None:
             return
 
 
-def validate_response(value: Any) -> str | None:
+def case_provider_paths(case: dict[str, Any]) -> tuple[str, ...]:
+    """Return the exact sanitized paths exposed by the replay watcher."""
+    return tuple(
+        watch_files.redact_sensitive_path(Path(case["id"]) / filename)[0]
+        for filename in case["files"]
+    )
+
+
+def case_test_symbols(case: dict[str, Any]) -> tuple[str, ...]:
+    sources = tuple(
+        (replay.CASES_ROOT / case["id"] / filename).read_text(encoding="utf-8")
+        for filename, provider_path in zip(
+            case["files"], case_provider_paths(case), strict=True
+        )
+        if is_test_file(provider_path)
+    )
+    return extract_test_symbols(sources)
+
+
+def validate_response(
+    value: Any, *, allowed_files: Sequence[str] | None = None
+) -> str | None:
     schema = watch_files.REVIEW_SCHEMA
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
         return "response must contain a findings array"
@@ -180,6 +204,8 @@ def validate_response(value: Any) -> str | None:
             return f"finding {index} is missing {sorted(missing)}"
         if not isinstance(finding["file"], str):
             return f"finding {index} has an invalid file"
+        if allowed_files is not None and finding["file"] not in allowed_files:
+            return f"finding {index} has a file outside the per-case enum"
         if "line" in finding and (
             isinstance(finding["line"], bool)
             or not isinstance(finding["line"], int)
@@ -222,7 +248,12 @@ def parse_provider_response(raw_response: object) -> Any:
     return json.loads(raw_response, parse_constant=reject_constant)
 
 
-def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOutcome:
+def wait_for_outcome(
+    output: queue.Queue[str],
+    *,
+    timeout: float,
+    allowed_files: Sequence[str] | None = None,
+) -> ProviderOutcome:
     started = time.monotonic()
     deadline = started + timeout
     transcript: list[str] = []
@@ -274,7 +305,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                     raw_response if isinstance(raw_response, str) else None,
                     None, str(error), **result_fields,
                 )
-            schema_error = validate_response(parsed)
+            schema_error = validate_response(parsed, allowed_files=allowed_files)
             return ProviderOutcome(
                 "schema-error" if schema_error else "schema-valid",
                 round((time.monotonic() - started) * 1000),
@@ -311,7 +342,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                 "schema-error", round((time.monotonic() - started) * 1000),
                 "".join(transcript), raw_response, None, str(error),
             )
-        schema_error = validate_response(parsed)
+        schema_error = validate_response(parsed, allowed_files=allowed_files)
         return ProviderOutcome(
             "schema-error" if schema_error else "schema-valid",
             round((time.monotonic() - started) * 1000),
@@ -321,11 +352,31 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
 
 
 def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, Any]:
+    case_schema_error = (
+        validate_response(
+            provider.parsed_response,
+            allowed_files=case_provider_paths(case),
+        )
+        if provider.status == "schema-valid"
+        else None
+    )
+    status = "schema-error" if case_schema_error else provider.status
+    error = case_schema_error or provider.error
     expected_files = sorted(finding["file"] for finding in case["expected_findings"])
     reported_files = sorted(
         Path(finding.get("file", "")).name
         for finding in (provider.parsed_response or {}).get("findings", [])
         if isinstance(finding, dict)
+    )
+    provider_findings = [
+        finding
+        for finding in (provider.parsed_response or {}).get("findings", [])
+        if isinstance(finding, dict)
+    ]
+    recommendation_grounding = recommendation_scoring.evaluate_findings(
+        provider_findings,
+        supplied_files=case_provider_paths(case),
+        supplied_test_symbols=case_test_symbols(case),
     )
     return {
         "case_id": case["id"],
@@ -335,12 +386,12 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         "expected_evidence_depth": case["expected_evidence_depth"],
         "expected_finding_ids": [finding["id"] for finding in case["expected_findings"]],
         "expected_findings": case["expected_findings"],
-        "status": provider.status,
+        "status": status,
         "latency_ms": provider.latency_ms,
         "raw_response": provider.raw_response,
         "parsed_response": provider.parsed_response,
         "transcript": provider.transcript,
-        "error": provider.error,
+        "error": error,
         "input_tokens": provider.input_tokens,
         "output_tokens": provider.output_tokens,
         "cost_usd": provider.cost_usd,
@@ -356,6 +407,7 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
             "reported_files": reported_files,
             "filename_match": reported_files == expected_files,
             "note": "Filename equality is diagnostic only, never a true-positive decision.",
+            "recommendation_grounding": recommendation_grounding,
         },
     }
 
@@ -422,7 +474,7 @@ def benchmark_cost_preflight(
                 for filename in case["files"]
             ),
             prompt=watch_files.DEFAULT_PROMPT,
-            schema_json=watch_files.REVIEW_SCHEMA_JSON,
+            schema_json=watch_files.response_schema_json(case_provider_paths(case)),
             cwd=REPOSITORY_ROOT,
         )
         result = preflight_model_run(config, request)
@@ -669,7 +721,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     inter_file_delay=args.inter_file_delay,
                 )
                 provider = wait_for_outcome(
-                    output, timeout=args.debounce + args.review_timeout + 15
+                    output,
+                    timeout=args.debounce + args.review_timeout + 15,
+                    allowed_files=case_provider_paths(case),
                 )
             except BaseException as error:
                 if not isinstance(error, KeyboardInterrupt):
@@ -685,7 +739,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = case_outcome(case, provider)
             outcomes[outcome_index] = outcome
             print(
-                f"RAW {case['id']}: status={provider.status}; "
+                f"RAW {case['id']}: status={outcome['status']}; "
                 f"filename_match={outcome['diagnostics']['filename_match']}; "
                 "semantic adjudication=pending", flush=True,
             )
