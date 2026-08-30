@@ -180,6 +180,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             {"max_output_bytes": config.max_output_bytes - 1},
             {"max_output_tokens_option": "unbounded_output"},
             {"model_options": {"temperature": 0, "extra_option": True}},
+            {"model_options": {"temperature": False}},
             {"quantization": "different"},
             {"provider": "hosted-provider"},
             {"external_upload_consent": True},
@@ -796,6 +797,12 @@ class AgentChangeReplayTests(unittest.TestCase):
         self.assertEqual(summary["status_counts"], {"timeout": 1})
         self.assertEqual(summary["status"], "incomplete-run")
         self.assertIsNone(scorecard["decision"]["selection"])
+        boolean_temperature = json.loads(json.dumps(run))
+        boolean_temperature["configuration"]["benchmark"][
+            "model_run_config"
+        ]["model_options"]["temperature"] = False
+        with self.assertRaisesRegex(ValueError, "model options differ"):
+            benchmark.build_scorecard(plan, [boolean_temperature])
         run["metrics"] = dict(run["metrics"])
         run["metrics"]["fn"] = 0
         with self.assertRaisesRegex(ValueError, "metrics do not match"):

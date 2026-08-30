@@ -53,6 +53,20 @@ def provider_fixture_payload_sha256(
     return digest.hexdigest()
 
 
+def _matches_frozen_model_options(
+    model_options: Mapping[str, Any], expected_temperature: Any,
+) -> bool:
+    temperature = model_options.get("temperature")
+    return (
+        isinstance(expected_temperature, (int, float))
+        and not isinstance(expected_temperature, bool)
+        and set(model_options) == {"temperature"}
+        and isinstance(temperature, (int, float))
+        and not isinstance(temperature, bool)
+        and temperature == expected_temperature
+    )
+
+
 def load_plan(path: Path = DEFAULT_PLAN) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -268,7 +282,9 @@ def prepare_run_config(
         raise ValueError("candidate output-token cap differs from frozen contract")
     if max_output_bytes != execution["max_output_bytes"]:
         raise ValueError("candidate output-byte cap differs from frozen contract")
-    if dict(model_options) != {"temperature": execution["temperature"]}:
+    if not _matches_frozen_model_options(
+        model_options, execution["temperature"],
+    ):
         raise ValueError("candidate model options differ from frozen execution contract")
     if locality == "hosted" and not external_upload_consent:
         raise ValueError("hosted candidate requires explicit external-upload consent")
@@ -440,9 +456,10 @@ def validate_run_against_plan(
     ):
         if model_config.get(key) != expected:
             raise ValueError(f"run model config {key} differs from frozen contract")
-    if model_config.get("model_options") != {
-        "temperature": execution["temperature"]
-    }:
+    model_options = model_config.get("model_options")
+    if not isinstance(model_options, Mapping) or not _matches_frozen_model_options(
+        model_options, execution["temperature"],
+    ):
         raise ValueError("run model options differ from frozen contract")
     for key in ("model_artifact", "model_revision", "locality"):
         expected = candidate[
