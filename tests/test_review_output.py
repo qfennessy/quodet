@@ -6,6 +6,7 @@ import math
 import unittest
 
 from feedback import ReviewBatch, ReviewFinding, ReviewedFile
+from redaction import RedactionNotice, RedactionSummary
 from review_output import (
     OUTPUT_SCHEMA_VERSION,
     render_human_review,
@@ -149,6 +150,7 @@ class ReviewOutputTests(unittest.TestCase):
                 "session_generation",
                 "feedback_round",
                 "timing",
+                "redactions",
             },
         )
         serialized_batch_fields = (
@@ -158,9 +160,52 @@ class ReviewOutputTests(unittest.TestCase):
             serialized_batch_fields,
             {field.name for field in fields(ReviewBatch)},
         )
+        self.assertEqual(
+            document["redactions"], {"total": 0, "notices": [], "omitted": 0}
+        )
 
         with self.assertRaises(ValueError):
             render_json_review(replace(review, provider_ms=math.nan))
+
+    def test_human_and_json_outputs_expose_equivalent_safe_redaction_hints(self) -> None:
+        summary = RedactionSummary(
+            total=2,
+            notices=(
+                RedactionNotice(
+                    file="src/app.py",
+                    line=4,
+                    category="assignment-key",
+                    masked_identifier="OPEN…KEY",
+                    disposition="sent",
+                ),
+                RedactionNotice(
+                    file="[REDACTED].env",
+                    line=None,
+                    category="provider-token",
+                    masked_identifier=None,
+                    disposition="excluded",
+                ),
+            ),
+            omitted=0,
+        )
+        review = replace(batch(), redactions=summary)
+
+        human = render_human_review(review)
+        document = json.loads(render_json_review(review))
+
+        self.assertIn("src/app.py:4 assignment key OPEN…KEY (sent sanitized)", human)
+        self.assertIn("[REDACTED].env provider token (excluded)", human)
+        self.assertEqual(document["redactions"]["total"], 2)
+        self.assertEqual(
+            document["redactions"]["notices"][0],
+            {
+                "file": "src/app.py",
+                "line": 4,
+                "category": "assignment-key",
+                "masked_identifier": "OPEN…KEY",
+                "disposition": "sent",
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol, Sequence, TextIO
 
 from review_output import DEFAULT_OUTPUT_MODE, OUTPUT_MODES, render_review
+from redaction import RedactionSummary, redaction_summary_from_document, redact_text
 
 try:
     import fcntl
@@ -84,6 +85,7 @@ class ReviewBatch:
     provider_started_at: float = 0.0
     provider_completed_at: float = 0.0
     published_at: float = 0.0
+    redactions: RedactionSummary = RedactionSummary()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -153,7 +155,11 @@ def _sha256_inside_root(root: Path, relative_path: str, *, max_bytes: int) -> st
     )
     if len(raw) > max_bytes:
         raise OSError(errno.EFBIG, "source exceeds reviewed size")
-    return hashlib.sha256(raw).hexdigest()
+    try:
+        sanitized = redact_text(raw.decode("utf-8")).text.encode()
+    except UnicodeDecodeError as error:
+        raise OSError(errno.EILSEQ, "source is not UTF-8 text") from error
+    return hashlib.sha256(sanitized).hexdigest()
 
 
 def _bounded_string(value: object, field: str, maximum: int) -> str:
@@ -191,6 +197,7 @@ def parse_review_output(
     batch_flushed_at: float | None = None,
     provider_started_at: float | None = None,
     provider_completed_at: float | None = None,
+    redactions: RedactionSummary = RedactionSummary(),
 ) -> ReviewBatch:
     """Parse and strictly validate one provider response."""
     if len(output.encode("utf-8")) > MAX_PROVIDER_OUTPUT_BYTES:
@@ -264,6 +271,7 @@ def parse_review_output(
         batch_flushed_at=flushed_at,
         provider_started_at=started_at,
         provider_completed_at=completed_at,
+        redactions=redactions,
     )
 
 
@@ -516,12 +524,12 @@ def _reviewed_files_are_current(root: Path, reviewed_files: Sequence[ReviewedFil
         return False
     for item in reviewed_files:
         try:
-            raw = read_bounded_beneath_root(
-                root.resolve(), Path(item.path), max_bytes=item.size
+            digest = _sha256_inside_root(
+                root.resolve(), item.path, max_bytes=item.size
             )
         except OSError:
             return False
-        if len(raw) != item.size or hashlib.sha256(raw).hexdigest() != item.sha256:
+        if digest != item.sha256:
             return False
     return True
 
@@ -843,7 +851,9 @@ def retire_reviewed_flush_hints(
     reviewed_files: Sequence[ReviewedFile],
 ) -> None:
     """Remove late hints whose post-edit digests were included in a review."""
-    reviewed = {(item.path, item.sha256, item.size) for item in reviewed_files}
+    # The byte limit is a read bound, not source metadata. A direct hook and
+    # watcher can use different safe bounds for the same sanitized content.
+    reviewed = {(item.path, item.sha256) for item in reviewed_files}
     hints = directory.expanduser().resolve() / "flush-hints"
     for path in hints.glob("*.json"):
         value = _load_bounded_object(path)
@@ -854,12 +864,12 @@ def retire_reviewed_flush_hints(
         raw_files = value.get("reviewed_files")
         if not isinstance(raw_files, list) or not raw_files:
             continue
-        hinted: set[tuple[object, object, object]] = set()
+        hinted: set[tuple[object, object]] = set()
         for item in raw_files:
             if not isinstance(item, dict):
                 hinted.clear()
                 break
-            hinted.add((item.get("path"), item.get("sha256"), item.get("size")))
+            hinted.add((item.get("path"), item.get("sha256")))
         if hinted and hinted.issubset(reviewed):
             path.unlink(missing_ok=True)
 
@@ -1174,11 +1184,14 @@ def validate_spooled_payload(
         "provider_completed_at",
         "published_at",
     }
-    accepted_fields = (
+    accepted_fields_without_redactions = (
         base_fields,
         base_fields | generation_fields,
         base_fields | lifecycle_fields,
         base_fields | generation_fields | lifecycle_fields,
+    )
+    accepted_fields = accepted_fields_without_redactions + tuple(
+        fields | {"redactions"} for fields in accepted_fields_without_redactions
     )
     if set(payload) not in accepted_fields:
         raise ReviewValidationError("spooled batch has unexpected or missing fields")
@@ -1293,11 +1306,22 @@ def validate_spooled_payload(
         batch_flushed_at=float(payload["batch_flushed_at"]),
         provider_started_at=float(payload["provider_started_at"]),
         provider_completed_at=float(payload["provider_completed_at"]),
+        redactions=_validated_redactions(payload.get("redactions")),
     )
     result = payload.copy()
     result["findings"] = [asdict(item) for item in normalized.findings]
     result["reviewed_files"] = [asdict(item) for item in reviewed]
+    result["redactions"] = asdict(normalized.redactions)
     return result
+
+
+def _validated_redactions(value: object) -> RedactionSummary:
+    if value is None:
+        return RedactionSummary()
+    try:
+        return redaction_summary_from_document(value)
+    except ValueError as error:
+        raise ReviewValidationError("invalid redaction metadata") from error
 
 
 def fresh_spooled_payload(payload: dict[str, object], *, root: Path) -> dict[str, object]:

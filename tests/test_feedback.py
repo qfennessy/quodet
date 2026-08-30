@@ -27,6 +27,7 @@ from feedback import (
     parse_review_output,
     validate_spooled_payload,
 )
+from redaction import RedactionNotice, RedactionSummary
 
 
 def valid_output(file: str = "src/app.py") -> str:
@@ -242,6 +243,39 @@ class FeedbackTests(unittest.TestCase):
             spool, root=self.root, session_id="agent-a"
         )
         self.assertIsNotNone(claim)
+
+    def test_spool_retains_only_validated_value_free_redaction_metadata(self) -> None:
+        spool = self.base / "redactions" / "feedback"
+        synthetic_secret = "ghp_" + "a1B2" * 8
+        redactions = RedactionSummary(
+            total=1,
+            notices=(
+                RedactionNotice(
+                    file="src/app.py",
+                    line=7,
+                    category="assignment-key",
+                    masked_identifier="OPEN…KEY",
+                    disposition="sent",
+                ),
+            ),
+            omitted=0,
+        )
+        SpoolSink(spool, root=self.root, session_id="agent-a").publish(
+            self.parse(valid_output(), redactions=redactions)
+        )
+        payload = json.loads(next((spool / "pending").glob("*.json")).read_text())
+
+        encoded = json.dumps(payload)
+        self.assertNotIn(synthetic_secret, encoded)
+        self.assertNotIn(synthetic_secret[:10], encoded)
+        validated = validate_spooled_payload(
+            payload, root=self.root, session_id="agent-a"
+        )
+        self.assertEqual(validated["redactions"]["total"], 1)
+
+        payload["redactions"]["notices"][0]["masked_identifier"] = synthetic_secret
+        with self.assertRaisesRegex(ReviewValidationError, "redaction metadata"):
+            validate_spooled_payload(payload, root=self.root, session_id="agent-a")
 
     def test_duplicate_review_is_published_once_and_edit_rounds_are_bounded(self) -> None:
         spool = self.base / "runtime" / "feedback"

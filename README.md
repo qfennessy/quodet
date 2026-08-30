@@ -123,6 +123,8 @@ Quodet reviewed 3 files: 1 likely defect
 service.py:10 [medium, 0.99] Failed cleanup can race with a pending insert
   The delayed task can write after rollback completes.
   Suggested action: Cancel and await both tasks before deleting records.
+Redacted 1 potential secret before provider upload:
+  settings.py:12 assignment key OPEN…KEY (sent sanitized)
 ```
 
 Use the versioned JSON contract for hooks, CI, archival, evaluation tooling,
@@ -135,13 +137,14 @@ uv run quodet . --json
 ```
 
 In JSON mode, stdout is JSON Lines: every completed review is one validated JSON
-document on one line. Startup, progress, provider errors, redaction notices,
-and shutdown diagnostics go to stderr, so a consumer can parse stdout without
-stripping terminal prose or guessing where adjacent reviews end. Each document
-includes `schema_version: "quodet-review-output-v1"`, batch and snapshot
-metadata, complete findings, feedback-round ownership, and available timing
-fields. Agent spool payloads and the hidden evaluation-event stream keep their
-existing validated contracts; they do not parse the human formatter.
+document on one line. Startup, progress, provider errors, redaction notices for
+failed reviews, and shutdown diagnostics go to stderr, so a consumer can parse
+stdout without stripping terminal prose or guessing where adjacent reviews
+end. Each completed document includes the schema version
+`quodet-review-output-v1`, batch and snapshot metadata, complete findings,
+feedback-round ownership, available timing fields, and an equivalent bounded
+`redactions` summary. Agent spool payloads and the hidden evaluation-event stream
+keep their existing validated contracts; they do not parse the human formatter.
 
 Set `QUODET_OUTPUT=json` in a shell or service environment to persist the mode.
 An explicit `--output human` or `--output json` takes precedence over that
@@ -720,6 +723,23 @@ Temporary sanitized files use owner-only permissions and are deleted after the
 request. Attachment filenames are generic, and both relative-path metadata and
 custom prompt text are sanitized. Binary files are not uploaded because they
 cannot be safely screened.
+
+When redaction occurs, the human summary and versioned JSON output identify the
+repository-relative file and line when safe, the detector category, whether the
+sanitized attachment was sent or excluded, and a masked identifier derived only
+from a nearby key name. For example, `OPENAI_API_KEY` becomes `OPEN…KEY`. A
+value-only token has no invented identifier. Notices never contain a value,
+value hash, value prefix or suffix, or exact value length, and only the first 20
+notices are shown with a bounded remainder count. A filename that itself looks
+sensitive is excluded because retaining its original path for later freshness
+checks would preserve the detected value. Freshness digests are computed from
+sanitized text and use the configured read cap rather than retaining an exact
+secret-bearing file size.
+
+To investigate a likely false positive, open the reported file and line locally;
+do not paste the value into an issue, log, or chat. If the file should never be
+reviewed, add a narrow `--exclude` rule. A useful detector report contains only
+the category, masked key name, Quodet version, and a synthetic reproducer.
 
 Secret detection is defense in depth, not a proof that arbitrary sensitive data
 cannot pass. Do not watch a sensitive directory. Exclude secrets and private
