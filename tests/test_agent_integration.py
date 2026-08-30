@@ -394,12 +394,32 @@ class AgentIntegrationTests(unittest.TestCase):
         )
         changes: queue.Queue[Path] = queue.Queue()
         changes.put(self.source)
+        suppression = watch_files.MaterializedPathSuppression(
+            self.root, ttl_seconds=1.0
+        )
 
         triggered = watch_files.next_triggered_batch(
-            changes, 1.0, hint_source=sink
+            changes, 1.0, hint_source=sink, suppression=suppression
         )
 
         self.assertEqual(triggered.paths, {self.source, second})
+        marker = sink.begin_review(
+            agent_session_id="live-agent-session",
+            review_timeout=1,
+            flush_hint=triggered.flush_hint,
+        )
+        sink.finish_review(marker)
+        third = self.root / "src" / "third.py"
+        third.write_text("value = 3\n")
+        changes.put(second)
+        changes.put(third)
+
+        follow_up = watch_files.next_triggered_batch(
+            changes, 0.01, hint_source=sink, suppression=suppression
+        )
+
+        self.assertEqual(follow_up.paths, {third})
+        self.assertEqual(follow_up.suppressed_paths, {second})
 
     def test_direct_edit_hook_records_only_path_digest_metadata(self) -> None:
         reviewed = codex_feedback_hook._hint_reviewed_files(

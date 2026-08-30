@@ -967,6 +967,45 @@ def next_batch(changes: queue.Queue[Path], debounce: float) -> set[Path]:
 class TriggeredBatch:
     paths: set[Path]
     flush_hint: FlushHint | None
+    suppressed_paths: set[Path]
+
+
+class MaterializedPathSuppression:
+    """Suppress delayed watchdog events only while their reviewed bytes match."""
+
+    def __init__(self, root: Path, *, ttl_seconds: float) -> None:
+        self.root = root.resolve()
+        self.ttl_seconds = ttl_seconds
+        self.entries: dict[Path, tuple[str, int, float]] = {}
+
+    def record(self, hint: FlushHint) -> None:
+        expires_at = time.monotonic() + self.ttl_seconds
+        for item in hint.reviewed_files:
+            self.entries[self.root / item.path] = (
+                item.sha256,
+                item.size,
+                expires_at,
+            )
+
+    def matches(self, path: Path) -> bool:
+        canonical = path.resolve(strict=False)
+        entry = self.entries.get(canonical)
+        if entry is None:
+            return False
+        digest, size, expires_at = entry
+        if time.monotonic() >= expires_at:
+            self.entries.pop(canonical, None)
+            return False
+        try:
+            relative = canonical.relative_to(self.root)
+            raw = read_bounded_beneath_root(self.root, relative, max_bytes=size)
+        except (OSError, ValueError):
+            self.entries.pop(canonical, None)
+            return False
+        if len(raw) == size and hashlib.sha256(raw).hexdigest() == digest:
+            return True
+        self.entries.pop(canonical, None)
+        return False
 
 
 def next_triggered_batch(
@@ -974,9 +1013,17 @@ def next_triggered_batch(
     debounce: float,
     *,
     hint_source: SpoolSink | None = None,
+    suppression: MaterializedPathSuppression | None = None,
 ) -> TriggeredBatch:
     """Collect a quiet-window batch, or flush it at an authenticated edit hint."""
-    batch = {changes.get()}
+    suppressed_paths: set[Path] = set()
+    while True:
+        first = changes.get()
+        if suppression is not None and suppression.matches(first):
+            suppressed_paths.add(first)
+            continue
+        batch = {first}
+        break
     deadline = time.monotonic() + debounce
 
     while True:
@@ -986,25 +1033,35 @@ def next_triggered_batch(
             else None
         )
         if hint is not None:
+            if suppression is not None:
+                suppression.record(hint)
             batch.update(
                 hint_source.root / Path(item.path)
                 for item in hint.reviewed_files
             )
             while True:
                 try:
-                    batch.add(changes.get_nowait())
+                    path = changes.get_nowait()
+                    if suppression is not None and suppression.matches(path):
+                        suppressed_paths.add(path)
+                    else:
+                        batch.add(path)
                 except queue.Empty:
-                    return TriggeredBatch(batch, hint)
+                    return TriggeredBatch(batch, hint, suppressed_paths)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return TriggeredBatch(batch, None)
+            return TriggeredBatch(batch, None, suppressed_paths)
         try:
             wait = min(remaining, 0.025) if hint_source is not None else remaining
-            batch.add(changes.get(timeout=wait))
-            deadline = time.monotonic() + debounce
+            path = changes.get(timeout=wait)
+            if suppression is not None and suppression.matches(path):
+                suppressed_paths.add(path)
+            else:
+                batch.add(path)
+                deadline = time.monotonic() + debounce
         except queue.Empty:
             if hint_source is None:
-                return TriggeredBatch(batch, None)
+                return TriggeredBatch(batch, None, suppressed_paths)
 
 
 def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
@@ -1099,16 +1156,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"Watching {root}")
     print(f"Model: {args.model}; debounce: {args.debounce:g}s")
+    suppression = MaterializedPathSuppression(
+        root, ttl_seconds=min(5.0, max(1.0, args.debounce))
+    )
     try:
         while True:
             triggered = next_triggered_batch(
                 changes,
                 args.debounce,
                 hint_source=spool_sink,
+                suppression=suppression,
             )
             event_batch = triggered.paths
             batch_flushed_at = time.time()
             with observed_at_lock:
+                for path in triggered.suppressed_paths:
+                    observed_at.pop(path, None)
                 first_observed_at = min(
                     (observed_at.pop(path, time.time()) for path in event_batch),
                     default=time.time(),
