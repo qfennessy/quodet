@@ -320,9 +320,17 @@ quodet status \
 
 Status reports the exact route, bound real-agent session, producer state,
 contract revision, spool counts, and median/p95 latency for each measured
-segment. `SessionEnd` removes an idle lease only
-when no feedback remains. Manual cleanup is equally scoped and refuses an
-active watcher, the wrong real-agent session, or pending/claimed feedback:
+segment. `SessionEnd` non-destructively closes only the exact real-agent
+session generation; it does not stop the watcher or delete queued feedback.
+The next real agent can then bind a new generation while the watcher stays
+active. Feedback queued or still being reviewed for the ended generation is
+never delivered to that next agent, and late provider results are rejected at
+publication. `status` exposes the route's `session_state` and
+`session_generation` so this handoff is observable.
+
+Manual cleanup is a separate destructive lifecycle operation. It is equally
+scoped and refuses an active watcher, the wrong currently bound real-agent
+session, or pending/claimed feedback:
 
 ```sh
 quodet cleanup \
@@ -403,7 +411,10 @@ agent to expose a documented hook or steering interface.
 Checked-in contract replays are derived from the official hook references as
 retrieved on 2026-08-30. They cover normal delivery, multiple queued chunks,
 stale findings, root/session mismatch, abandoned claims, and recursive `Stop`
-guards for both agents. Their metadata records `provenance: "official-docs"`
+guards for both agents. They also replay `SessionEnd` with an active watcher,
+then bind a second real-agent session and verify that the new generation cannot
+consume or publish the ended generation's feedback. Their metadata records
+`provenance: "official-docs"`
 and a null agent version, keeping documentation replay distinct from live
 evidence.
 

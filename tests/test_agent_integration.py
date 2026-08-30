@@ -114,6 +114,22 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         return json.loads(output.getvalue()) if output.getvalue() else None
 
+    def _release_from_fixture(
+        self,
+        route: agent_integration.RouteConfig,
+        input_value: dict[str, object],
+    ) -> dict[str, object]:
+        output = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(input_value))), mock.patch(
+            "sys.stdout", output
+        ):
+            result = agent_integration.main(
+                ["cleanup", "--config", os.fspath(agent_integration.route_path(self.spool)),
+                 "--from-hook"]
+            )
+        self.assertEqual(result, 0)
+        return json.loads(output.getvalue())
+
     def test_init_creates_private_route_and_agent_settings_without_overwrite(self) -> None:
         for agent, settings_name in (
             ("codex", ".codex/hooks.json"),
@@ -287,6 +303,78 @@ class AgentIntegrationTests(unittest.TestCase):
             )
         self.assertIn("additionalContext", output.getvalue())
         sink.close()
+
+    def test_session_end_releases_active_watcher_and_isolates_next_session(self) -> None:
+        for agent in ("codex", "claude"):
+            with self.subTest(agent=agent):
+                self.spool = self.base / f"session-handoff-{agent}" / "feedback"
+                self.source.write_text("value = 1\nother = 2\n", encoding="utf-8")
+                route, _ = self._route(agent)
+                sink = self._publish(route)
+                self.assertTrue(
+                    codex_feedback_hook.verify_session_lease(
+                        self.spool,
+                        root=self.root,
+                        configured_session_id=route.session_id,
+                        codex_session_id="live-agent-session",
+                    )
+                )
+                self.assertEqual(sink.capture_session_generation(), 0)
+                raw = self.source.read_bytes()
+                late_batch = parse_review_output(
+                    finding_output(2),
+                    root=self.root,
+                    reviewed_files=(
+                        ReviewedFile(
+                            "src/app.py", hashlib.sha256(raw).hexdigest(), len(raw)
+                        ),
+                    ),
+                    session_id=route.session_id,
+                    session_generation=0,
+                )
+
+                released = self._release_from_fixture(
+                    route, self._fixture(agent, "session_end.input.json")
+                )
+                self.assertEqual(released, {"session_released": True})
+                status = agent_integration.route_status(route)
+                self.assertTrue(status["producer_active"])
+                self.assertEqual(status["session_state"], "closed")
+                self.assertEqual(status["session_generation"], 1)
+                self.assertIsNone(status["bound_agent_session"])
+
+                self.assertTrue(
+                    codex_feedback_hook.verify_session_lease(
+                        self.spool,
+                        root=self.root,
+                        configured_session_id=route.session_id,
+                        codex_session_id="next-agent-session",
+                    )
+                )
+                self.assertEqual(sink.capture_session_generation(), 1)
+                self.assertFalse(sink.publish(late_batch))
+                next_batch = parse_review_output(
+                    finding_output(),
+                    root=self.root,
+                    reviewed_files=(
+                        ReviewedFile(
+                            "src/app.py", hashlib.sha256(raw).hexdigest(), len(raw)
+                        ),
+                    ),
+                    session_id=route.session_id,
+                    session_generation=1,
+                )
+                self.assertTrue(sink.publish(next_batch))
+
+                next_input = self._fixture(agent, "post_tool_use.input.json")
+                next_input["session_id"] = "next-agent-session"
+                delivered = self._invoke(route, "PostToolUse", next_input)
+                self.assertIn("Finding 1", json.dumps(delivered))
+                pending = list((self.spool / "pending").glob("*.json"))
+                self.assertEqual(len(pending), 1)
+                old_payload = json.loads(pending[0].read_text(encoding="utf-8"))
+                self.assertEqual(old_payload["session_generation"], 0)
+                sink.close()
 
     def test_status_and_cleanup_are_session_scoped_and_preserve_pending_by_default(self) -> None:
         route, _ = self._route()

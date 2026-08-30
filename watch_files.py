@@ -710,6 +710,7 @@ def review_files(
     feedback_round: int = 1,
     debounce_ms: float = 0.0,
     first_observed_at: float | None = None,
+    session_generation: int | None = None,
 ) -> ReviewBatch | None:
     attachments = collect_attachments(
         paths,
@@ -834,6 +835,7 @@ def review_files(
             debounce_ms=debounce_ms,
             provider_ms=provider_ms,
             first_observed_at=first_observed_at,
+            session_generation=session_generation,
         )
     except ReviewValidationError as error:
         print(f"Rejected invalid llm response: {error}", file=sys.stderr)
@@ -1017,6 +1019,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             measured_debounce_ms = max(0.0, (time.time() - first_observed_at) * 1_000)
             for review_batch in bounded_review_batches(event_batch):
+                session_generation = (
+                    spool_sink.capture_session_generation()
+                    if spool_sink is not None
+                    else None
+                )
                 review_files(
                     review_batch,
                     root=root,
@@ -1034,6 +1041,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     session_id=args.session_id,
                     debounce_ms=measured_debounce_ms,
                     first_observed_at=first_observed_at,
+                    session_generation=session_generation,
                 )
     except KeyboardInterrupt:
         print("\nStopping watcher.")

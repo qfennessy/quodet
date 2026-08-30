@@ -18,6 +18,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+from codex_feedback_hook import release_session_lease
+from feedback import (
+    _state_generation,
+    read_session_state,
+    session_route_lock,
+    session_state_path,
+)
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows lacks flock.
@@ -361,8 +369,11 @@ def initialize(
 
 
 def _session_lease_path(route: RouteConfig) -> Path:
-    identity = f"{route.root}\0{route.session_id}".encode()
-    return route.spool_path / "sessions" / f"{hashlib.sha256(identity).hexdigest()}.json"
+    return session_state_path(
+        route.spool_path,
+        root=route.root_path,
+        configured_session_id=route.session_id,
+    )
 
 
 def _producer_lease_path(route: RouteConfig) -> Path:
@@ -436,9 +447,29 @@ def route_status(route: RouteConfig) -> dict[str, object]:
         counts[name] = sum(_payload_owned(path, route) for path in directory.glob("*.json"))
     lease = _session_lease_path(route)
     bound_agent_session: str | None = None
-    if lease.exists() and _payload_owned_lease(lease, route):
-        value = json.loads(lease.read_text(encoding="utf-8"))
-        bound_agent_session = value["codex_session_id"]
+    session_state = "unbound"
+    session_generation = 0
+    with session_route_lock(
+        route.spool_path,
+        root=route.root_path,
+        configured_session_id=route.session_id,
+        exclusive=False,
+    ):
+        if lease.exists():
+            if not _payload_owned_lease(lease, route):
+                raise PermissionError("session lease ownership does not match route")
+            value = read_session_state(
+                route.spool_path,
+                root=route.root_path,
+                configured_session_id=route.session_id,
+            )
+            session_state, session_generation = _state_generation(
+                value,
+                root=route.root_path,
+                configured_session_id=route.session_id,
+            )
+            if session_state == "bound" and value is not None:
+                bound_agent_session = value["codex_session_id"]  # type: ignore[assignment]
     latency = _latency_summary(route)
     return {
         "agent": route.agent,
@@ -448,6 +479,8 @@ def route_status(route: RouteConfig) -> dict[str, object]:
         "contract": route.contract,
         "platform_secure": True,
         "producer_active": _producer_active(route),
+        "session_state": session_state,
+        "session_generation": session_generation,
         "bound_agent_session": bound_agent_session,
         "feedback": counts,
         "latency_ms": latency,
@@ -495,12 +528,15 @@ def _payload_owned_lease(path: Path, route: RouteConfig) -> bool:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, PermissionError):
         return False
-    return (
-        isinstance(value, dict)
-        and value.get("root") == route.root
-        and value.get("configured_session_id") == route.session_id
-        and isinstance(value.get("codex_session_id"), str)
-    )
+    if not isinstance(value, dict):
+        return False
+    try:
+        state, _ = _state_generation(
+            value, root=route.root_path, configured_session_id=route.session_id
+        )
+    except ValueError:
+        return False
+    return state == "closed" or isinstance(value.get("codex_session_id"), str)
 
 
 def cleanup_route(
@@ -511,40 +547,61 @@ def cleanup_route(
 ) -> dict[str, int]:
     """Clean one exact inactive route without touching any other session."""
     with _exclusive_cleanup_lease(route):
-        lease = _session_lease_path(route)
-        if lease.exists():
-            if not _payload_owned_lease(lease, route):
-                raise PermissionError("session lease ownership does not match route")
-            lease_value = json.loads(lease.read_text(encoding="utf-8"))
-            if agent_session_id != lease_value["codex_session_id"]:
-                raise PermissionError("agent session identity does not match route lease")
-        active = sum(
-            _payload_owned(path, route)
-            for state in ("pending", "claimed")
-            for path in (route.spool_path / state).glob("*.json")
-        )
-        if active and not discard_feedback:
-            raise RuntimeError(
-                "route still has pending or claimed feedback; rerun with "
-                "--discard-feedback only after the agent session ends"
+        with session_route_lock(
+            route.spool_path,
+            root=route.root_path,
+            configured_session_id=route.session_id,
+            exclusive=True,
+        ):
+            lease = _session_lease_path(route)
+            if lease.exists():
+                if not _payload_owned_lease(lease, route):
+                    raise PermissionError("session lease ownership does not match route")
+                lease_value = read_session_state(
+                    route.spool_path,
+                    root=route.root_path,
+                    configured_session_id=route.session_id,
+                )
+                lease_state, _ = _state_generation(
+                    lease_value,
+                    root=route.root_path,
+                    configured_session_id=route.session_id,
+                )
+                if (
+                    lease_state == "bound"
+                    and lease_value is not None
+                    and agent_session_id != lease_value["codex_session_id"]
+                ):
+                    raise PermissionError(
+                        "agent session identity does not match route lease"
+                    )
+            active = sum(
+                _payload_owned(path, route)
+                for state in ("pending", "claimed")
+                for path in (route.spool_path / state).glob("*.json")
             )
-        removed: dict[str, int] = {}
-        # Latency/protocol metrics intentionally survive route cleanup so operators
-        # can inspect completed-session medians and tails. They contain no source or
-        # finding text and remain protected by the private route spool.
-        states = ("pending", "claimed", "acknowledged", "rejected", "dedupe")
-        for name in states:
-            removed[name] = 0
-            for path in (route.spool_path / name).glob("*.json"):
-                if _payload_owned(path, route):
-                    path.unlink()
-                    removed[name] += 1
-        if lease.exists():
-            lease.unlink()
-            removed["session_lease"] = 1
-        else:
-            removed["session_lease"] = 0
-        return removed
+            if active and not discard_feedback:
+                raise RuntimeError(
+                    "route still has pending or claimed feedback; rerun with "
+                    "--discard-feedback only after the agent session ends"
+                )
+            removed: dict[str, int] = {}
+            # Latency/protocol metrics intentionally survive route cleanup so operators
+            # can inspect completed-session medians and tails. They contain no source or
+            # finding text and remain protected by the private route spool.
+            states = ("pending", "claimed", "acknowledged", "rejected", "dedupe")
+            for name in states:
+                removed[name] = 0
+                for path in (route.spool_path / name).glob("*.json"):
+                    if _payload_owned(path, route):
+                        path.unlink()
+                        removed[name] += 1
+            if lease.exists():
+                lease.unlink()
+                removed["session_lease"] = 1
+            else:
+                removed["session_lease"] = 0
+            return removed
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -592,12 +649,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     hook_input = json.load(sys.stdin)
                 except json.JSONDecodeError:
                     hook_input = {}
-                agent_session_id = hook_input.get("session_id")
-            value = cleanup_route(
-                route,
-                agent_session_id=agent_session_id,
-                discard_feedback=args.discard_feedback,
-            )
+                if not isinstance(hook_input, dict):
+                    hook_input = {}
+                hook_cwd = hook_input.get("cwd")
+                valid_hook_route = (
+                    hook_input.get("hook_event_name") == "SessionEnd"
+                    and isinstance(hook_cwd, str)
+                    and Path(hook_cwd).resolve() == route.root_path
+                )
+                agent_session_id = (
+                    hook_input.get("session_id") if valid_hook_route else None
+                )
+                value = {
+                    "session_released": release_session_lease(
+                        route.spool_path,
+                        root=route.root_path,
+                        configured_session_id=route.session_id,
+                        agent_session_id=agent_session_id,
+                    )
+                }
+            else:
+                value = cleanup_route(
+                    route,
+                    agent_session_id=agent_session_id,
+                    discard_feedback=args.discard_feedback,
+                )
         print(json.dumps(value, indent=None if args.json else 2, sort_keys=True))
         return 0
     except (FileExistsError, OSError, RuntimeError, ValueError) as error:

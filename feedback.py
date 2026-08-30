@@ -14,6 +14,7 @@ import stat
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol, Sequence
@@ -74,6 +75,7 @@ class ReviewBatch:
     debounce_ms: float = 0.0
     provider_ms: float = 0.0
     first_observed_at: float = 0.0
+    session_generation: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -167,6 +169,7 @@ def parse_review_output(
     debounce_ms: float = 0.0,
     provider_ms: float = 0.0,
     first_observed_at: float | None = None,
+    session_generation: int | None = None,
 ) -> ReviewBatch:
     """Parse and strictly validate one provider response."""
     if len(output.encode("utf-8")) > MAX_PROVIDER_OUTPUT_BYTES:
@@ -230,6 +233,10 @@ def parse_review_output(
         debounce_ms=debounce_ms,
         provider_ms=provider_ms,
         first_observed_at=observed_at,
+        session_generation=(
+            0 if session_id is not None and session_generation is None
+            else session_generation
+        ),
     )
 
 
@@ -264,6 +271,104 @@ def _ensure_private_directory(path: Path) -> Path:
     if metadata.st_uid != os.getuid() or mode != 0o700:
         raise PermissionError(f"spool directory must be owner-only: {path}")
     return path
+
+
+def _session_route_key(root: Path, configured_session_id: str) -> str:
+    identity = f"{root.resolve()}\0{configured_session_id}".encode()
+    return hashlib.sha256(identity).hexdigest()
+
+
+def session_state_path(
+    directory: Path, *, root: Path, configured_session_id: str
+) -> Path:
+    sessions = _ensure_private_directory(directory.expanduser().resolve() / "sessions")
+    return sessions / f"{_session_route_key(root, configured_session_id)}.json"
+
+
+@contextmanager
+def session_route_lock(
+    directory: Path,
+    *,
+    root: Path,
+    configured_session_id: str,
+    exclusive: bool,
+):
+    """Serialize route binding changes against generation-aware publication."""
+    if fcntl is None:
+        raise RuntimeError("session routing requires process-exclusive file locks")
+    sessions = _ensure_private_directory(directory.expanduser().resolve() / "sessions")
+    lock_path = sessions / f"{_session_route_key(root, configured_session_id)}.lock"
+    stream = lock_path.open("a+", encoding="utf-8")
+    lock_path.chmod(0o600)
+    try:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(stream.fileno(), operation)
+        yield
+    finally:
+        stream.close()
+
+
+def read_session_state(
+    directory: Path, *, root: Path, configured_session_id: str
+) -> dict[str, object] | None:
+    """Read one state while the caller holds its session route lock."""
+    path = session_state_path(
+        directory, root=root, configured_session_id=configured_session_id
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid agent session state") from error
+    if not isinstance(value, dict):
+        raise ValueError("invalid agent session state")
+    return value
+
+
+def write_session_state(
+    directory: Path,
+    *,
+    root: Path,
+    configured_session_id: str,
+    value: dict[str, object],
+) -> None:
+    """Replace one state while the caller holds its exclusive route lock."""
+    _atomic_private_json(
+        session_state_path(
+            directory, root=root, configured_session_id=configured_session_id
+        ),
+        value,
+    )
+
+
+def _state_generation(
+    state: dict[str, object] | None,
+    *,
+    root: Path,
+    configured_session_id: str,
+) -> tuple[str, int]:
+    if state is None:
+        return "unbound", 0
+    expected_root = os.fspath(root.resolve())
+    if (
+        state.get("root") != expected_root
+        or state.get("configured_session_id") != configured_session_id
+    ):
+        raise ValueError("agent session state ownership does not match route")
+    # PR #7 state files did not carry an explicit state or generation.
+    if "state" not in state and isinstance(state.get("codex_session_id"), str):
+        return "bound", 0
+    route_state = state.get("state")
+    generation = state.get("generation")
+    if (
+        route_state not in {"bound", "closed"}
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        raise ValueError("invalid agent session generation")
+    return str(route_state), generation
 
 
 def _global_root_lease_directory() -> Path:
@@ -322,6 +427,7 @@ class SpoolSink:
         _ensure_private_directory(self.directory / "claimed")
         _ensure_private_directory(self.directory / "acknowledged")
         _ensure_private_directory(self.directory / "dedupe")
+        _ensure_private_directory(self.directory / "sessions")
         if fcntl is None:
             raise RuntimeError("spool delivery requires process-exclusive file locks")
         active_roots = _global_root_lease_directory()
@@ -351,6 +457,24 @@ class SpoolSink:
         stream = getattr(self, "_root_lease_stream", None)
         if stream is not None and not stream.closed:
             stream.close()
+
+    def capture_session_generation(self) -> int | None:
+        """Capture the route generation before provider work begins."""
+        with session_route_lock(
+            self.directory,
+            root=self.root,
+            configured_session_id=self.session_id,
+            exclusive=False,
+        ):
+            state = read_session_state(
+                self.directory,
+                root=self.root,
+                configured_session_id=self.session_id,
+            )
+            route_state, generation = _state_generation(
+                state, root=self.root, configured_session_id=self.session_id
+            )
+            return None if route_state == "closed" else generation
 
     def __del__(self) -> None:
         self.close()
@@ -387,6 +511,7 @@ class SpoolSink:
             previous = state.get(finding_file)
             if (
                 isinstance(previous, dict)
+                and previous.get("session_generation") == batch.session_generation
                 and isinstance(previous.get("updated_at"), (int, float))
                 and now - float(previous["updated_at"]) <= self.round_reset_seconds
             ):
@@ -409,6 +534,7 @@ class SpoolSink:
                 "finding_signature": signature,
                 "round": round_number,
                 "updated_at": now,
+                "session_generation": batch.session_generation,
             }
             if round_number <= self.max_feedback_rounds:
                 allowed.extend(file_findings)
@@ -425,6 +551,7 @@ class SpoolSink:
         stable = {
             "root": batch.root,
             "session_id": batch.session_id,
+            "session_generation": batch.session_generation,
             "reviewed_files": [
                 asdict(item) for item in batch.reviewed_files if item.path in cited_paths
             ],
@@ -438,34 +565,50 @@ class SpoolSink:
     def publish(self, batch: ReviewBatch) -> bool:
         if batch.session_id != self.session_id or Path(batch.root).resolve() != self.root:
             raise ValueError("batch ownership does not match this spool")
-        batch = fresh_findings(batch)
-        if not batch.findings:
-            return False
-        batch = self._apply_round_policy(batch)
-        if not batch.findings:
-            return False
-        payload = batch.to_dict()
-        payload["notice"] = UNTRUSTED_NOTICE
-        encoded_payload = json.dumps(payload, separators=(",", ":")).encode()
-        if len(encoded_payload) > MAX_SPOOL_PAYLOAD_BYTES:
-            raise ReviewValidationError("spooled batch exceeds envelope size limit")
-        fingerprint = self._fingerprint(batch)
-        filename = f"{fingerprint}.json"
-        states = ("pending", "claimed", "acknowledged")
-        if any((self.directory / state / filename).exists() for state in states):
-            return False
+        with session_route_lock(
+            self.directory,
+            root=self.root,
+            configured_session_id=self.session_id,
+            exclusive=False,
+        ):
+            state = read_session_state(
+                self.directory,
+                root=self.root,
+                configured_session_id=self.session_id,
+            )
+            route_state, generation = _state_generation(
+                state, root=self.root, configured_session_id=self.session_id
+            )
+            if route_state == "closed" or batch.session_generation != generation:
+                return False
+            batch = fresh_findings(batch)
+            if not batch.findings:
+                return False
+            batch = self._apply_round_policy(batch)
+            if not batch.findings:
+                return False
+            payload = batch.to_dict()
+            payload["notice"] = UNTRUSTED_NOTICE
+            encoded_payload = json.dumps(payload, separators=(",", ":")).encode()
+            if len(encoded_payload) > MAX_SPOOL_PAYLOAD_BYTES:
+                raise ReviewValidationError("spooled batch exceeds envelope size limit")
+            fingerprint = self._fingerprint(batch)
+            filename = f"{fingerprint}.json"
+            states = ("pending", "claimed", "acknowledged")
+            if any((self.directory / state / filename).exists() for state in states):
+                return False
 
-        # The durable full-payload dedupe record also repairs a crash between
-        # recording the fingerprint and publishing it to pending/.
-        record = self.directory / "dedupe" / filename
-        if not record.exists():
-            _atomic_private_json(record, payload)
-        destination = self.directory / "pending" / filename
-        try:
-            os.link(record, destination)
-        except FileExistsError:
-            return False
-        return True
+            # The durable full-payload dedupe record also repairs a crash between
+            # recording the fingerprint and publishing it to pending/.
+            record = self.directory / "dedupe" / filename
+            if not record.exists():
+                _atomic_private_json(record, payload)
+            destination = self.directory / "pending" / filename
+            try:
+                os.link(record, destination)
+            except FileExistsError:
+                return False
+            return True
 
 
 class CompositeSink:
@@ -494,9 +637,14 @@ def validate_spooled_payload(
         "debounce_ms",
         "provider_ms",
         "first_observed_at",
+        "session_generation",
         "notice",
     }
-    if set(payload) != expected_fields:
+    legacy_fields = expected_fields - {"session_generation"}
+    if set(payload) == legacy_fields:
+        payload = payload.copy()
+        payload["session_generation"] = 0
+    elif set(payload) != expected_fields:
         raise ReviewValidationError("spooled batch has unexpected or missing fields")
     if payload["root"] != os.fspath(root.resolve()) or payload["session_id"] != session_id:
         raise ReviewValidationError("spooled batch ownership does not match")
@@ -525,6 +673,13 @@ def validate_spooled_payload(
             or not 0 <= float(latency) <= 86_400_000
         ):
             raise ReviewValidationError(f"invalid {field}")
+    session_generation = payload["session_generation"]
+    if (
+        isinstance(session_generation, bool)
+        or not isinstance(session_generation, int)
+        or session_generation < 0
+    ):
+        raise ReviewValidationError("invalid session generation")
     raw_reviewed = payload["reviewed_files"]
     if not isinstance(raw_reviewed, list) or len(raw_reviewed) > MAX_REVIEWED_FILES:
         raise ReviewValidationError("invalid reviewed file collection")
@@ -559,6 +714,7 @@ def validate_spooled_payload(
         debounce_ms=float(payload["debounce_ms"]),
         provider_ms=float(payload["provider_ms"]),
         first_observed_at=float(payload["first_observed_at"]),
+        session_generation=session_generation,
     )
     result = payload.copy()
     result["findings"] = [asdict(item) for item in normalized.findings]

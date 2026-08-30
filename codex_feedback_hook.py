@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence
 
@@ -19,8 +20,12 @@ from feedback import (
     MAX_SPOOL_PAYLOAD_BYTES,
     UNTRUSTED_NOTICE,
     ReviewValidationError,
+    _state_generation,
     fresh_spooled_payload,
+    read_session_state,
+    session_route_lock,
     validate_spooled_payload,
+    write_session_state,
 )
 
 
@@ -113,35 +118,83 @@ def verify_session_lease(
     configured_session_id: str,
     codex_session_id: object,
 ) -> bool:
-    """Atomically bind one configured route to one real Codex session."""
+    """Atomically bind one configured route generation to one real session."""
     if not isinstance(codex_session_id, str) or not codex_session_id:
         return False
-    leases = _private_directory(directory.expanduser().resolve(), "sessions")
-    identity = f"{root.resolve()}\0{configured_session_id}".encode()
-    lease = leases / f"{hashlib.sha256(identity).hexdigest()}.json"
-    expected = {
-        "root": os.fspath(root.resolve()),
-        "configured_session_id": configured_session_id,
-        "codex_session_id": codex_session_id,
-    }
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".lease-", dir=leases)
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(expected, stream, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, lease)
-            return True
-        except FileExistsError:
-            return _load_payload(lease) == expected
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    directory = directory.expanduser().resolve()
+    root = root.expanduser().resolve()
+    with session_route_lock(
+        directory,
+        root=root,
+        configured_session_id=configured_session_id,
+        exclusive=True,
+    ):
+        state = read_session_state(
+            directory, root=root, configured_session_id=configured_session_id
+        )
+        route_state, generation = _state_generation(
+            state, root=root, configured_session_id=configured_session_id
+        )
+        if route_state == "bound":
+            return state is not None and state.get("codex_session_id") == codex_session_id
+        write_session_state(
+            directory,
+            root=root,
+            configured_session_id=configured_session_id,
+            value={
+                "version": 1,
+                "state": "bound",
+                "generation": generation,
+                "root": os.fspath(root),
+                "configured_session_id": configured_session_id,
+                "codex_session_id": codex_session_id,
+            },
+        )
+        return True
+
+
+def release_session_lease(
+    directory: Path,
+    *,
+    root: Path,
+    configured_session_id: str,
+    agent_session_id: object,
+) -> bool:
+    """Close one exact session generation without stopping its active watcher."""
+    if not isinstance(agent_session_id, str) or not agent_session_id:
+        return False
+    directory = directory.expanduser().resolve()
+    root = root.expanduser().resolve()
+    with session_route_lock(
+        directory,
+        root=root,
+        configured_session_id=configured_session_id,
+        exclusive=True,
+    ):
+        state = read_session_state(
+            directory, root=root, configured_session_id=configured_session_id
+        )
+        route_state, generation = _state_generation(
+            state, root=root, configured_session_id=configured_session_id
+        )
+        if route_state != "bound" or state is None:
+            return False
+        if state.get("codex_session_id") != agent_session_id:
+            return False
+        expected_root = os.fspath(root)
+        write_session_state(
+            directory,
+            root=root,
+            configured_session_id=configured_session_id,
+            value={
+                "version": 1,
+                "state": "closed",
+                "generation": generation + 1,
+                "root": expected_root,
+                "configured_session_id": configured_session_id,
+            },
+        )
+        return True
 
 
 def recover_abandoned_claims(directory: Path, *, claim_timeout: float) -> None:
@@ -158,37 +211,73 @@ def recover_abandoned_claims(directory: Path, *, claim_timeout: float) -> None:
 
 
 def claim_feedback(
-    directory: Path, *, root: Path, session_id: str, claim_timeout: float = 300
+    directory: Path,
+    *,
+    root: Path,
+    session_id: str,
+    claim_timeout: float = 300,
+    agent_session_id: str | None = None,
 ) -> Path | None:
-    """Atomically claim the oldest batch belonging to this exact root/session."""
+    """Atomically claim feedback for one route and, when supplied, generation."""
     directory = directory.expanduser().resolve()
-    recover_abandoned_claims(directory, claim_timeout=claim_timeout)
-    pending = _private_directory(directory, "pending")
-    claimed = _private_directory(directory, "claimed")
-    expected_root = os.fspath(root.expanduser().resolve())
-    candidates: list[tuple[float, Path]] = []
-    for path in pending.glob("*.json"):
-        try:
-            candidates.append((path.stat().st_mtime, path))
-        except FileNotFoundError:
-            continue
-    for _, candidate in sorted(candidates):
-        payload = _load_payload(candidate)
-        if payload is None:
-            continue
-        if payload.get("root") != expected_root or payload.get("session_id") != session_id:
-            continue
-        destination = claimed / candidate.name
-        try:
-            # A claim timeout measures time since the claim, not time since the
-            # batch was originally published. Touch before the atomic rename so
-            # another consumer can never observe an old newly-claimed file.
-            os.utime(candidate, None)
-            os.replace(candidate, destination)
-        except FileNotFoundError:
-            continue
-        return destination
-    return None
+    root = root.expanduser().resolve()
+    lock = (
+        session_route_lock(
+            directory,
+            root=root,
+            configured_session_id=session_id,
+            exclusive=False,
+        )
+        if agent_session_id is not None
+        else nullcontext()
+    )
+    with lock:
+        expected_generation: int | None = None
+        if agent_session_id is not None:
+            state = read_session_state(
+                directory, root=root, configured_session_id=session_id
+            )
+            route_state, expected_generation = _state_generation(
+                state, root=root, configured_session_id=session_id
+            )
+            if (
+                route_state != "bound"
+                or state is None
+                or state.get("codex_session_id") != agent_session_id
+            ):
+                return None
+        recover_abandoned_claims(directory, claim_timeout=claim_timeout)
+        pending = _private_directory(directory, "pending")
+        claimed = _private_directory(directory, "claimed")
+        expected_root = os.fspath(root)
+        candidates: list[tuple[float, Path]] = []
+        for path in pending.glob("*.json"):
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except FileNotFoundError:
+                continue
+        for _, candidate in sorted(candidates):
+            payload = _load_payload(candidate)
+            if payload is None:
+                continue
+            if payload.get("root") != expected_root or payload.get("session_id") != session_id:
+                continue
+            if (
+                expected_generation is not None
+                and payload.get("session_generation", 0) != expected_generation
+            ):
+                continue
+            destination = claimed / candidate.name
+            try:
+                # A claim timeout measures time since the claim, not time since the
+                # batch was originally published. Touch before the atomic rename so
+                # another consumer can never observe an old newly-claimed file.
+                os.utime(candidate, None)
+                os.replace(candidate, destination)
+            except FileNotFoundError:
+                continue
+            return destination
+        return None
 
 
 def acknowledge(directory: Path, claim: Path) -> None:
@@ -327,6 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         root=args.root,
         session_id=args.session_id,
         claim_timeout=args.claim_timeout,
+        agent_session_id=event_input["session_id"],
     )
     if claim is None:
         if event == "Stop":

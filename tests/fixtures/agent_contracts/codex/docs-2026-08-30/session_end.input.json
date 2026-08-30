@@ -1,0 +1,10 @@
+{
+  "session_id": "live-agent-session",
+  "transcript_path": null,
+  "cwd": "${ROOT}",
+  "hook_event_name": "SessionEnd",
+  "model": "gpt-test",
+  "permission_mode": "default",
+  "turn_id": "turn-1",
+  "reason": "complete"
+}
