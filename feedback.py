@@ -300,7 +300,7 @@ class ConsoleSink:
         import sys
 
         stream = self.stream if self.stream is not None else sys.stdout
-        print(render_review(batch, self.mode), file=stream)
+        print(render_review(batch, self.mode), file=stream, flush=True)
         return True
 
 

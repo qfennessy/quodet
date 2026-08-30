@@ -37,6 +37,7 @@ class ReviewBatchLike(Protocol):
     reviewed_files: Sequence[ReviewedFileLike]
     findings: Sequence[ReviewFindingLike]
     session_id: str | None
+    session_generation: int | None
     feedback_round: int
     debounce_ms: float
     provider_ms: float
@@ -84,6 +85,7 @@ def review_output_document(batch: ReviewBatchLike) -> dict[str, object]:
         ],
         "findings": [_finding_document(finding) for finding in batch.findings],
         "session_id": batch.session_id,
+        "session_generation": batch.session_generation,
         "feedback_round": batch.feedback_round,
         "timing": {
             "first_observed_at": batch.first_observed_at,
@@ -102,7 +104,7 @@ def render_json_review(batch: ReviewBatchLike) -> str:
     return json.dumps(
         review_output_document(batch),
         allow_nan=False,
-        ensure_ascii=False,
+        ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     )

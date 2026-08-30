@@ -42,6 +42,7 @@ def batch(*findings: ReviewFinding) -> ReviewBatch:
         ),
         findings=findings,
         session_id="agent-a",
+        session_generation=3,
         feedback_round=2,
         debounce_ms=3_000.0,
         provider_ms=425.5,
@@ -101,6 +102,13 @@ class ReviewOutputTests(unittest.TestCase):
         self.assertNotIn("\nxxxx", rendered)
         self.assertIn("…", rendered)
 
+    def test_json_escapes_lone_surrogates_for_utf8_stdout(self) -> None:
+        rendered = render_json_review(batch(finding(title="broken \ud800 value")))
+
+        self.assertIn(r"\ud800", rendered)
+        self.assertNotIn("\ud800", rendered)
+        rendered.encode("utf-8")
+
     def test_json_is_versioned_complete_and_deterministic(self) -> None:
         review = batch(finding())
         first = render_json_review(review)
@@ -138,6 +146,7 @@ class ReviewOutputTests(unittest.TestCase):
                 "reviewed_files",
                 "findings",
                 "session_id",
+                "session_generation",
                 "feedback_round",
                 "timing",
             },

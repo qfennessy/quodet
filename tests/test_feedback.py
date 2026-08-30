@@ -164,6 +164,10 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(document["schema_version"], "quodet-review-output-v1")
         self.assertEqual(document["findings"][0]["line"], 7)
 
+        buffered_output = mock.Mock()
+        ConsoleSink(mode="json", stream=buffered_output).publish(batch)
+        buffered_output.flush.assert_called_once_with()
+
         with self.assertRaisesRegex(ValueError, "unsupported output mode"):
             ConsoleSink(mode="xml")
 
