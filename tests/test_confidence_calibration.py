@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -95,7 +96,9 @@ def scored_run(
             "schema": {"revision": "schema-v1", "sha256": schema_sha256},
             "fixture": {
                 "revision": fixture_revision,
-                "manifest_sha256": "d" * 64,
+                "manifest_sha256": hashlib.sha256(
+                    replay.MANIFEST_PATH.read_bytes()
+                ).hexdigest(),
                 "fixture_tree_sha256": "e" * 64,
                 "provider_payload_sha256": "f" * 64,
             },
@@ -306,6 +309,22 @@ class ConfidenceCalibrationTests(unittest.TestCase):
                     fit(run)
                 self.assertIn(expected_kind, str(raised.exception))
                 self.assertIn(expected_case_id, str(raised.exception))
+
+    def test_fit_rejects_stale_manifest_identity(self) -> None:
+        run = scored_run(calibration_cases(
+            [(0.99, "true-positive")],
+            [(0.98, "true-positive")],
+        ))
+
+        stale_hash = copy.deepcopy(run)
+        stale_hash["configuration"]["fixture"]["manifest_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "fixture manifest hash"):
+            fit(stale_hash)
+
+        stale_revision = copy.deepcopy(run)
+        stale_revision["configuration"]["fixture"]["revision"] = 2
+        with self.assertRaisesRegex(ValueError, "fixture revision"):
+            fit(stale_revision)
 
     def test_threshold_is_lowest_value_meeting_frozen_target(self) -> None:
         run = scored_run(calibration_cases(

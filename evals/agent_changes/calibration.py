@@ -243,6 +243,17 @@ def _validate_scored_run(run: Mapping[str, Any]) -> Mapping[str, Any]:
 def _complete_fit_case_ids(run: Mapping[str, Any]) -> list[str]:
     """Require the exact frozen calibration split before using any labels."""
     manifest = _require_mapping(replay.load_manifest(), "fixture manifest")
+    configuration = _require_mapping(run.get("configuration"), "run.configuration")
+    fixture = _require_mapping(configuration.get("fixture"), "configuration.fixture")
+    manifest_sha256 = hashlib.sha256(replay.MANIFEST_PATH.read_bytes()).hexdigest()
+    if fixture.get("manifest_sha256") != manifest_sha256:
+        raise ValueError(
+            "calibration run fixture manifest hash does not match the frozen manifest"
+        )
+    if fixture.get("revision") != manifest.get("version"):
+        raise ValueError(
+            "calibration run fixture revision does not match the frozen manifest"
+        )
     manifest_cases = manifest.get("cases")
     if not isinstance(manifest_cases, list):
         raise ValueError("fixture manifest cases must be an array")
