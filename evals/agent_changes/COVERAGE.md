@@ -1,17 +1,17 @@
 # Evaluation coverage map
 
-This map was derived from the frozen public corpus at
-`sagacious-heritage/cocos-story@6b98bae67bae4056c4567187454e24cca78b9467`.
-The source corpus reports 56 verified positives across state/lifecycle (13),
-external API contract (9), privacy/authorization (9), retry/concurrency (8),
-UI/cache (6), CI/tooling (6), persistence/atomicity (3), and performance/cost
-(2), plus 16 matched clean controls.
+This map was derived from an independently verified, non-public review corpus.
+The source location and answer-bearing records are intentionally not published
+in this repository. The source corpus reports 56 verified positives across
+state/lifecycle (13), external API contract (9), privacy/authorization (9),
+retry/concurrency (8), UI/cache (6), CI/tooling (6), persistence/atomicity (3),
+and performance/cost (2), plus 16 matched clean controls.
 
 Only the 12 primary calibration answers were read as answer-bearing design
 material. Holdout, temporal, clean-control, and confirmation answers were not
 read or copied. Their aggregate taxonomy and non-answer metadata establish
 priorities and split boundaries only. Every fixture here is repository-neutral
-synthetic code; none is Cocos Story application code.
+synthetic code; none is source application code.
 
 ## Case mapping
 

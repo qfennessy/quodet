@@ -126,12 +126,12 @@ contract, authorization, concurrency, cache, tooling, atomicity, and cost
 failures. [The coverage map](evals/agent_changes/COVERAGE.md) records how every
 case maps to those families, its scope, evidence depth, and evaluation split.
 
-The taxonomy comes from the independently verified public review corpus at
-`sagacious-heritage/cocos-story@6b98bae67bae4056c4567187454e24cca78b9467`.
-Only its 12 primary calibration answers influenced answer-bearing fixture
-design. Holdout, temporal, clean-control, and confirmation answers remain
-sealed. Quodet contains repository-neutral synthetic scenarios, not Cocos Story
-application code, identifiers, secrets, or sealed answer text.
+The taxonomy comes from an independently verified, non-public review corpus.
+Its source location and answer-bearing records are intentionally not published
+here. Only its 12 designated calibration answers influenced answer-bearing
+fixture design. Holdout, temporal, clean-control, and confirmation answers
+remain sealed. Quodet contains repository-neutral synthetic scenarios, not
+source application code, identifiers, secrets, or sealed answer text.
 
 Related source and test files are replayed within the three-second quiet window:
 

@@ -2,7 +2,8 @@
   "version": 2,
   "description": "Frozen, repository-neutral coding-agent change evaluation corpus",
   "source_boundary": {
-    "corpus": "sagacious-heritage/cocos-story@6b98bae67bae4056c4567187454e24cca78b9467",
+    "corpus": "independently verified non-public review corpus",
+    "disclosure": "source location and answer-bearing records intentionally omitted",
     "answer_bearing_source": "primary calibration entries only",
     "forbidden_answer_sources": ["primary holdout", "temporal", "clean-control", "confirmation"]
   },
