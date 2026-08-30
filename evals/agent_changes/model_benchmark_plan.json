@@ -1,0 +1,119 @@
+{
+  "format_version": 1,
+  "experiment_id": "quodet-open-model-comparison-v1",
+  "issue": "https://github.com/qfennessy/quodet/issues/5",
+  "frozen_at": "2026-08-30",
+  "status": "frozen-awaiting-authorized-runs",
+  "current_default": "gpt-5.6-luna",
+  "fixture": {
+    "revision": 2,
+    "manifest_sha256": "fceed79e9c9a23b54cbb6dfd84e2cee3cf39b70049ca3bc802b5e0b1eb4fecab",
+    "fixture_tree_sha256": "e5ff11177b49893cf692d5b625cac52bb5c513f834375522d4b54921429b5984",
+    "provider_payload_sha256": "65822daeb51c1c24629b834269f08a8c09be491e95938ae2b49c4749989b41b7",
+    "required_splits": ["calibration", "holdout", "clean-control"],
+    "reserved_splits": ["temporal", "confirmation"]
+  },
+  "review_contract": {
+    "prompt_revision": "quodet-review-v2",
+    "prompt_sha256": "9a0be118a5d3e9cfc2a0a4c42e7549c74fbd5825f4f2b97426a1a380901e62fb",
+    "schema_revision": "quodet-findings-v2",
+    "schema_sha256": "3502a80a1e358619634f2ab421b3fb8f28aae1de4edfe24d0de647479d508847",
+    "attempts_per_case": 1,
+    "repair_or_fallback": false
+  },
+  "execution_contract": {
+    "timeout_seconds": 60,
+    "max_output_tokens": 4096,
+    "max_output_bytes": 262144,
+    "temperature": 0
+  },
+  "privacy": {
+    "fixture_source": "repository-neutral synthetic fixtures derived within the documented non-public-corpus boundary",
+    "raw_artifact_policy": "retain sanitized fixture prompts, responses, failures, usage and adjudications only; never add proprietary source, credentials, or model weights",
+    "hosted_requires_external_upload_consent": true,
+    "local_requires_immutable_runtime_artifact_attestation": true
+  },
+  "decision_rule": {
+    "frozen_before_holdout": true,
+    "decision_evidence": {
+      "calibration": "report only; never contributes to candidate selection",
+      "holdout": "finding precision, recall, recommended-fix quality, schema validity, and latency",
+      "clean-control": "false-positive restraint, schema validity, and latency"
+    },
+    "required_complete_splits": ["calibration", "holdout", "clean-control"],
+    "eligibility_gates": {
+      "minimum_schema_valid_rate": 0.98,
+      "minimum_finding_precision": 0.85,
+      "maximum_clean_control_false_positive_rate": 0.10,
+      "minimum_fix_quality_score": 0.75,
+      "maximum_p95_latency_ms": 15000
+    },
+    "ranking": [
+      "higher finding precision",
+      "lower clean-control false-positive rate",
+      "higher actionable fix-quality score",
+      "higher finding recall",
+      "lower p95 latency",
+      "lower normalized operating cost"
+    ],
+    "tie_policy": "retain the current default unless one candidate strictly wins at the first differing ranking measure",
+    "no_eligible_candidate": "retain the current default and record that no candidate established the required operating point"
+  },
+  "candidate_order": ["qwen35-a3b-local", "deepseek-v4-flash-hosted", "devstral-small-2-local"],
+  "candidates": {
+    "qwen35-a3b-local": {
+      "hypothesis": "best local economics for an always-on first pass",
+      "model_artifact": "Qwen/Qwen3.5-35B-A3B",
+      "model_revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "license": "apache-2.0",
+      "published_quantization": "bfloat16",
+      "published_context_limit": 262144,
+      "metadata_source": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B/tree/59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "required_locality": "local",
+      "runtime_artifact": {
+        "status": "unregistered",
+        "runtime": "llm-ollama",
+        "runtime_model_id": null,
+        "runtime_artifact_sha256": null,
+        "source_binding": "requires a reviewed, reproducible conversion from the pinned model_artifact/model_revision before any run"
+      }
+    },
+    "deepseek-v4-flash-hosted": {
+      "hypothesis": "best overall quality per hosted dollar when upload is explicitly allowed",
+      "model_artifact": "deepseek-ai/DeepSeek-V4-Flash",
+      "model_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
+      "license": "mit",
+      "published_quantization": "fp8-e4m3-block-128x128",
+      "published_context_limit": 1048576,
+      "metadata_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/60d8d70770c6776ff598c94bb586a859a38244f1",
+      "required_locality": "hosted",
+      "runtime_artifact": {
+        "status": "unregistered",
+        "provider": null,
+        "runtime": null,
+        "runtime_version": null,
+        "model": null,
+        "provider_model_revision": null,
+        "quantization": null,
+        "source_binding": "requires reviewed provider evidence binding a version-pinned endpoint to the frozen model_artifact/model_revision before any run"
+      }
+    },
+    "devstral-small-2-local": {
+      "hypothesis": "coding specialization may beat broader models on focused defect review",
+      "model_artifact": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+      "model_revision": "55c5b41e98c2dbd21b0c8afffc540dcfc9eb5128",
+      "license": "apache-2.0",
+      "published_quantization": "fp8-static",
+      "published_context_limit": 393216,
+      "metadata_source": "https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512/tree/55c5b41e98c2dbd21b0c8afffc540dcfc9eb5128",
+      "required_locality": "local",
+      "runtime_artifact": {
+        "status": "unregistered",
+        "runtime": "llm-ollama",
+        "runtime_model_id": null,
+        "runtime_artifact_sha256": null,
+        "source_binding": "requires a reviewed, reproducible conversion from the pinned model_artifact/model_revision before any run"
+      }
+    }
+  }
+}

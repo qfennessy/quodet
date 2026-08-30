@@ -11,7 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 import watch_files
-from evals.agent_changes import live_eval, replay, scoring
+from evals.agent_changes import artifacts, benchmark, live_eval, replay, scoring
+from model_runner import ModelRunConfig, Pricing
 
 
 CORPUS_FAMILIES = {
@@ -50,7 +51,64 @@ def raw_run(cases: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def plan_with_approved_qwen_artifact() -> dict[str, object]:
+    plan = benchmark.load_plan()
+    candidate = plan["candidates"]["qwen35-a3b-local"]
+    candidate["runtime_artifact"] = {
+        "status": "approved",
+        "runtime": "llm-ollama",
+        "runtime_model_id": "qwen3.5:35b-a3b",
+        "runtime_artifact_sha256": "a" * 64,
+        "source_binding": {
+            "model_artifact": candidate["model_artifact"],
+            "model_revision": candidate["model_revision"],
+            "conversion_tool": "fixture-converter",
+            "conversion_tool_version": "1.0",
+            "recipe_sha256": "b" * 64,
+        },
+    }
+    return plan
+
+
+def plan_with_approved_hosted_artifact(
+    *,
+    model: str,
+    provider: str,
+    runtime: str,
+    runtime_version: str,
+    quantization: str,
+    provider_model_revision: str,
+) -> dict[str, object]:
+    plan = benchmark.load_plan()
+    candidate = plan["candidates"]["deepseek-v4-flash-hosted"]
+    candidate["runtime_artifact"] = {
+        "status": "approved",
+        "provider": provider,
+        "runtime": runtime,
+        "runtime_version": runtime_version,
+        "model": model,
+        "provider_model_revision": provider_model_revision,
+        "quantization": quantization,
+        "source_binding": {
+            "model_artifact": candidate["model_artifact"],
+            "model_revision": candidate["model_revision"],
+            "evidence_url": "https://provider.example/model-version",
+            "evidence_as_of": "2026-08-30",
+        },
+    }
+    return plan
+
+
 class AgentChangeReplayTests(unittest.TestCase):
+    def test_private_artifact_write_does_not_repermission_existing_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            parent.chmod(0o755)
+            destination = parent / "artifact.json"
+            artifacts.write_private_json(destination, {"safe": True})
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
     def test_manifest_has_complete_taxonomy_metadata_and_fixture_files(self) -> None:
         manifest = replay.load_manifest()
         self.assertEqual(manifest["version"], 2)
@@ -100,7 +158,7 @@ class AgentChangeReplayTests(unittest.TestCase):
             self.assertTrue(all(path.parent == destination.resolve() / case["id"] for path in written))
             first_contents = [path.read_bytes() for path in written]
             replayed = replay.replay_case(case, destination=destination, inter_file_delay=0)
-            self.assertNotEqual(first_contents, [path.read_bytes() for path in replayed])
+            self.assertEqual(first_contents, [path.read_bytes() for path in replayed])
 
     def test_sealed_empty_splits_are_selectable_without_exposing_fixtures(self) -> None:
         manifest = replay.load_manifest()
@@ -205,8 +263,11 @@ class AgentChangeReplayTests(unittest.TestCase):
             artifacts = list((root / "results").glob("*.raw.json"))
             self.assertEqual(len(artifacts), 1)
             artifact = json.loads(artifacts[0].read_text())
-            self.assertEqual(len(artifact["cases"]), 1)
+            self.assertEqual(artifacts[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual((root / "results").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(len(artifact["cases"]), 2)
             self.assertEqual(artifact["cases"][0]["case_id"], manifest["cases"][0]["id"])
+            self.assertEqual(artifact["cases"][1]["status"], "harness-error")
 
     def test_filename_match_is_diagnostic_not_true_positive(self) -> None:
         case = replay.case_by_id(replay.load_manifest(), "12_semantically_invalid_external_value")
@@ -248,7 +309,8 @@ class AgentChangeReplayTests(unittest.TestCase):
             "cases": {
                 "defect": {"findings": [{
                     "finding_index": 0, "verdict": "true-positive",
-                    "expected_finding_id": "expected-1", "rationale": "Matches behavior",
+                    "expected_finding_id": "expected-1", "fix_quality": "actionable",
+                    "rationale": "Matches behavior",
                 }]},
                 "clean": {"findings": [{
                     "finding_index": 0, "verdict": "false-positive",
@@ -265,6 +327,8 @@ class AgentChangeReplayTests(unittest.TestCase):
             metrics["clean_control_false_positive_rate_by_family"]["external API contract"],
             1.0,
         )
+        self.assertEqual(metrics["clean_control_false_positive_rate"], 1.0)
+        self.assertEqual(metrics["fix_quality_score"], 1.0)
 
     def test_schema_failure_counts_expected_findings_as_misses(self) -> None:
         failed = {
@@ -290,6 +354,333 @@ class AgentChangeReplayTests(unittest.TestCase):
         entry = template["cases"]["case"]["findings"][0]
         self.assertEqual(entry["verdict"], "REPLACE_ME")
         self.assertIsNone(entry["expected_finding_id"])
+
+    def test_frozen_benchmark_plan_pins_candidates_contract_and_decision_rule(self) -> None:
+        plan = benchmark.load_plan()
+        self.assertEqual(
+            set(plan["candidate_order"]),
+            {
+                "qwen35-a3b-local",
+                "deepseek-v4-flash-hosted",
+                "devstral-small-2-local",
+            },
+        )
+        self.assertTrue(plan["decision_rule"]["frozen_before_holdout"])
+        for candidate in plan["candidates"].values():
+            self.assertEqual(len(candidate["model_revision"]), 40)
+            self.assertIn(candidate["required_locality"], {"local", "hosted"})
+            if candidate["required_locality"] == "local":
+                self.assertIsNone(candidate["runtime_artifact"]["runtime_model_id"])
+                self.assertIsNone(
+                    candidate["runtime_artifact"]["runtime_artifact_sha256"]
+                )
+            self.assertEqual(candidate["runtime_artifact"]["status"], "unregistered")
+
+    def test_hosted_benchmark_config_requires_consent_and_cost_cap(self) -> None:
+        plan = plan_with_approved_hosted_artifact(
+            model="deepseek-v4-flash",
+            provider="example-provider",
+            runtime="llm-openai-compatible",
+            runtime_version="1.2.3",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-2026-08-01",
+        )
+        common = dict(
+            plan=plan,
+            candidate_id="deepseek-v4-flash-hosted",
+            model="deepseek-v4-flash",
+            provider="example-provider",
+            runtime="llm-openai-compatible",
+            runtime_version="1.2.3",
+            quantization="fp8",
+            model_options={"temperature": 0},
+            timeout_seconds=60,
+            max_output_tokens=4096,
+            max_output_tokens_option="max_tokens",
+            max_output_bytes=262144,
+            pricing=Pricing(0.10, 0.20, "https://provider.example/pricing", "2026-08-30"),
+            hardware={
+                "region": "us-east",
+                "provider_model_revision": "deepseek-v4-flash-2026-08-01",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "external-upload consent"):
+            benchmark.prepare_run_config(
+                **common, max_cost_usd=1.0, external_upload_consent=False
+            )
+        with self.assertRaisesRegex(ValueError, "max-cost-usd"):
+            benchmark.prepare_run_config(
+                **common, max_cost_usd=None, external_upload_consent=True
+            )
+        invalid_provenance = dict(common)
+        invalid_provenance["pricing"] = Pricing(
+            0.10, 0.20, "not-applicable", "not-applicable"
+        )
+        with self.assertRaisesRegex(ValueError, "HTTPS pricing source"):
+            benchmark.prepare_run_config(
+                **invalid_provenance,
+                max_cost_usd=1.0,
+                external_upload_consent=True,
+            )
+        wrong_model = dict(common)
+        wrong_model["model"] = "gemini-3.7-flash"
+        with self.assertRaisesRegex(ValueError, "hosted execution identity"):
+            benchmark.prepare_run_config(
+                **wrong_model,
+                max_cost_usd=1.0,
+                external_upload_consent=True,
+            )
+
+    def test_local_runtime_attestation_rejects_hosted_plugin_and_alias(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        common = dict(
+            plan=plan, candidate_id="qwen35-a3b-local", model="qwen-eval",
+            provider="local", runtime_version="1.0", quantization="bfloat16",
+            model_options={"temperature": 0}, timeout_seconds=60,
+            max_output_tokens=4096, max_output_tokens_option="max_tokens",
+            max_output_bytes=262144,
+            pricing=Pricing(None, None, "not-applicable", "not-applicable"),
+            max_cost_usd=None, external_upload_consent=False,
+            hardware={
+                "device": "test", "amortized_hourly_cost_usd": 1.0,
+                "model_load_ms": 1, "peak_memory_bytes": 1024,
+                "runtime_model_id": "qwen3.5:35b-a3b",
+                "runtime_artifact_sha256": "a" * 64,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "require runtime llm-ollama"):
+            benchmark.prepare_run_config(**common, runtime="llm-gemini")
+
+        config = benchmark.prepare_run_config(**common, runtime="llm-ollama")
+        command_results = [
+            mock.Mock(returncode=0, stdout="llm, version 0.33\n"),
+            mock.Mock(returncode=0, stdout=json.dumps([
+                {"name": "llm-ollama", "version": "1.0"}
+            ])),
+            mock.Mock(
+                returncode=0,
+                stdout=(
+                    "Ollama: devstral-small-2:24b "
+                    "(aliases: qwen-eval)\n"
+                ),
+            ),
+        ]
+        with (
+            mock.patch("evals.agent_changes.live_eval.subprocess.run", side_effect=command_results),
+            self.assertRaisesRegex(ValueError, "does not resolve"),
+        ):
+            live_eval.attest_runtime(config)
+
+    def test_local_runtime_attestation_binds_exact_ollama_blob(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        expected_digest = "a" * 64
+        config = benchmark.prepare_run_config(
+            plan, candidate_id="qwen35-a3b-local", model="qwen-eval",
+            provider="local", runtime="llm-ollama", runtime_version="1.0",
+            quantization="bfloat16", model_options={"temperature": 0},
+            timeout_seconds=60, max_output_tokens=4096,
+            max_output_tokens_option="max_tokens", max_output_bytes=262144,
+            pricing=Pricing(None, None, "not-applicable", "not-applicable"),
+            max_cost_usd=None, external_upload_consent=False,
+            hardware={
+                "device": "test", "amortized_hourly_cost_usd": 1.0,
+                "model_load_ms": 1, "peak_memory_bytes": 1024,
+                "runtime_model_id": "qwen3.5:35b-a3b",
+                "runtime_artifact_sha256": expected_digest,
+            },
+        )
+        command_results = [
+            mock.Mock(returncode=0, stdout="llm, version 0.33\n"),
+            mock.Mock(returncode=0, stdout=json.dumps([
+                {"name": "llm-ollama", "version": "1.0"}
+            ])),
+            mock.Mock(
+                returncode=0,
+                stdout="Ollama: qwen3.5:35b-a3b (aliases: qwen-eval)\n",
+            ),
+            mock.Mock(
+                returncode=0,
+                stdout=f"FROM /models/blobs/sha256-{expected_digest}\n",
+            ),
+        ]
+        with mock.patch(
+            "evals.agent_changes.live_eval.subprocess.run",
+            side_effect=command_results,
+        ):
+            attestation = live_eval.attest_runtime(config)
+        self.assertEqual(attestation["local_model"], {
+            "runtime_model_id": "qwen3.5:35b-a3b",
+            "runtime_artifact_sha256": expected_digest,
+        })
+
+        command_results[-1] = mock.Mock(
+            returncode=0,
+            stdout=f"FROM /models/blobs/sha256-{'b' * 64}\n",
+        )
+        with (
+            mock.patch(
+                "evals.agent_changes.live_eval.subprocess.run",
+                side_effect=command_results,
+            ),
+            self.assertRaisesRegex(ValueError, "blob differs"),
+        ):
+            live_eval.attest_runtime(config)
+
+    def test_benchmark_scorecard_retains_failed_attempts_and_no_auto_selection(self) -> None:
+        plan = plan_with_approved_qwen_artifact()
+        config = benchmark.prepare_run_config(
+            plan,
+            candidate_id="qwen35-a3b-local",
+            model="local-qwen",
+            provider="local",
+            runtime="llm-ollama",
+            runtime_version="1.0.0",
+            quantization="bfloat16",
+            model_options={"temperature": 0},
+            timeout_seconds=60,
+            max_output_tokens=4096,
+            max_output_tokens_option="max_tokens",
+            max_output_bytes=262144,
+            pricing=Pricing(None, None, "not-applicable", "not-applicable"),
+            max_cost_usd=None,
+            external_upload_consent=False,
+            hardware={
+                "device": "test", "amortized_hourly_cost_usd": 1.0,
+                "model_load_ms": 1, "peak_memory_bytes": 1024,
+                "runtime_model_id": "qwen3.5:35b-a3b",
+                "runtime_artifact_sha256": "a" * 64,
+            },
+        )
+        fixture_case = replay.load_manifest()["cases"][0]
+        cases = [
+            {
+                "case_id": fixture_case["id"],
+                "evaluation_split": fixture_case["evaluation_split"],
+                "failure_families": fixture_case["failure_families"],
+                "expected_finding_ids": [
+                    finding["id"] for finding in fixture_case["expected_findings"]
+                ],
+                "expected_findings": fixture_case["expected_findings"],
+                "status": "timeout",
+                "latency_ms": 30000, "parsed_response": None,
+                "input_tokens": None, "output_tokens": None, "cost_usd": None,
+            }
+        ]
+        run = raw_run(cases)
+        run["configuration"] = live_eval.evaluation_configuration(
+            model=config.model,
+            reasoning_effort=None,
+            prompt=watch_files.DEFAULT_PROMPT,
+            fixture_revision=2,
+            cases=[],
+            model_run_config=config,
+            benchmark_plan=plan,
+            runtime_attestation={
+                "llm_cli_version": "fixture",
+                "runtime": {"name": "llm-ollama", "version": "1.0.0"},
+                "model_registry_entry": "Ollama: qwen3.5:35b-a3b (aliases: local-qwen)",
+                "local_model": {
+                    "runtime_model_id": "qwen3.5:35b-a3b",
+                    "runtime_artifact_sha256": "a" * 64,
+                },
+            },
+        )
+        adjudication = {"run_id": "run-1", "fixture_revision": 2, "cases": {}}
+        run["metrics"] = scoring.score_run(run, adjudication)
+        run["adjudication"] = adjudication
+        run["adjudication_sha256"] = scoring.adjudication_sha256(adjudication)
+        scorecard = benchmark.build_scorecard(plan, [run])
+        summary = scorecard["candidates"]["qwen35-a3b-local"]
+        self.assertEqual(summary["attempted_cases"], 1)
+        self.assertEqual(summary["status_counts"], {"timeout": 1})
+        self.assertEqual(summary["status"], "incomplete-run")
+        self.assertIsNone(scorecard["decision"]["selection"])
+        run["metrics"] = dict(run["metrics"])
+        run["metrics"]["fn"] = 0
+        with self.assertRaisesRegex(ValueError, "metrics do not match"):
+            benchmark.build_scorecard(plan, [run])
+
+    def test_hosted_suite_preflight_enforces_experiment_wide_cap(self) -> None:
+        plan = plan_with_approved_hosted_artifact(
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            provider_model_revision="deepseek-v4-flash-test-revision",
+        )
+        config = benchmark.prepare_run_config(
+            plan,
+            candidate_id="deepseek-v4-flash-hosted",
+            model="hosted-deepseek",
+            provider="test-provider",
+            runtime="test-runtime",
+            runtime_version="1.0.0",
+            quantization="fp8",
+            model_options={"temperature": 0},
+            timeout_seconds=60,
+            max_output_tokens=4096,
+            max_output_tokens_option="max_tokens",
+            max_output_bytes=262144,
+            pricing=Pricing(1.0, 1.0, "https://provider.example/pricing", "2026-08-30"),
+            max_cost_usd=2.0,
+            external_upload_consent=True,
+            hardware={
+                "endpoint": "fixture",
+                "provider_model_revision": "deepseek-v4-flash-test-revision",
+            },
+        )
+        cases = replay.load_manifest()["cases"]
+        with self.assertRaisesRegex(ValueError, "experiment cap"):
+            live_eval.benchmark_cost_preflight(config, cases)
+
+    def test_candidate_decision_metrics_exclude_calibration(self) -> None:
+        run = {
+            "configuration": {"benchmark": {"model_run_config": {
+                "hardware": {"device": "fixture"}, "max_cost_usd": None,
+            }}},
+            "cases": [
+                {
+                    "case_id": "cal", "evaluation_split": "calibration",
+                    "status": "schema-valid", "latency_ms": 1,
+                    "input_tokens": None, "output_tokens": None, "cost_usd": None,
+                },
+                {
+                    "case_id": "hold", "evaluation_split": "holdout",
+                    "status": "schema-valid", "latency_ms": 100,
+                    "input_tokens": None, "output_tokens": None, "cost_usd": None,
+                },
+                {
+                    "case_id": "clean", "evaluation_split": "clean-control",
+                    "status": "schema-valid", "latency_ms": 200,
+                    "input_tokens": None, "output_tokens": None, "cost_usd": None,
+                },
+            ],
+            "metrics": {
+                "adjudication_status": "complete",
+                "tp": 100, "fp": 0, "fn": 0,
+                "schema_valid_rate": 1.0,
+                "fix_quality_score": 1.0,
+                "clean_control_false_positive_rate": 0.25,
+                "by_split": {}, "by_family": {},
+                "split_metrics": {"holdout": {
+                    "finding_precision": 0.6,
+                    "finding_recall": 0.4,
+                    "fix_quality_score": 0.5,
+                }},
+            },
+        }
+        summary = benchmark.summarize_run(
+            run, required_case_ids={"cal", "hold", "clean"}
+        )
+        self.assertEqual(summary["finding_precision"], 0.6)
+        self.assertEqual(summary["finding_recall"], 0.4)
+        self.assertEqual(summary["fix_quality_score"], 0.5)
+        self.assertEqual(summary["clean_control_false_positive_rate"], 0.25)
+        self.assertEqual(summary["latency_ms"], {"p50": 150.0, "p95": 200.0})
+        self.assertEqual(
+            summary["aggregate_report_only"]["finding_precision"], 1.0
+        )
 
 
 if __name__ == "__main__":

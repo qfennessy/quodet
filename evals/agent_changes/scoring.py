@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
+
+from evals.agent_changes import artifacts
 
 
 EVALUATION_SPLITS = (
@@ -17,6 +20,18 @@ EVALUATION_SPLITS = (
     "confirmation",
 )
 VERDICTS = frozenset({"true-positive", "false-positive"})
+FIX_QUALITY = {
+    "not-actionable": 0.0,
+    "partially-actionable": 0.5,
+    "actionable": 1.0,
+}
+
+
+def adjudication_sha256(value: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _empty_counts() -> dict[str, int]:
@@ -71,6 +86,10 @@ def validate_adjudications(
                         f"{case_id} expected finding {expected_id!r} matched twice"
                     )
                 matched.add(expected_id)
+                if entry.get("fix_quality") not in FIX_QUALITY:
+                    raise ValueError(
+                        f"{case_id} true positive requires a valid fix_quality"
+                    )
             elif expected_id is not None:
                 raise ValueError(
                     f"{case_id} false positive cannot name an expected finding"
@@ -114,6 +133,11 @@ def score_run(
         "schema_valid": schema_valid,
         "schema_total": total_cases,
         "schema_valid_rate": schema_valid / total_cases if total_cases else 0.0,
+        "attempted_cases": total_cases,
+        "status_counts": {
+            status: sum(case["status"] == status for case in run["cases"])
+            for status in sorted({str(case["status"]) for case in run["cases"]})
+        },
     }
     if adjudications is None:
         base.update(
@@ -124,6 +148,10 @@ def score_run(
                 "by_split": {},
                 "by_family": {},
                 "clean_control_false_positive_rate_by_family": {},
+                "clean_control_false_positive_rate": None,
+                "fix_quality_score": None,
+                "fix_quality_adjudications": 0,
+                "split_metrics": {},
             }
         )
         return base
@@ -134,18 +162,28 @@ def score_run(
     by_family: dict[str, dict[str, int]] = defaultdict(_empty_counts)
     control_cases: dict[str, int] = defaultdict(int)
     control_cases_with_fp: dict[str, int] = defaultdict(int)
+    total_control_cases = 0
+    total_control_cases_with_fp = 0
+    fix_quality_scores: list[float] = []
 
     adjudicated_cases = adjudications["cases"]
     for outcome in run["cases"]:
         counts = _case_counts(outcome, adjudicated_cases.get(outcome["case_id"]))
         _add_counts(totals, counts)
         _add_counts(by_split[outcome["evaluation_split"]], counts)
+        if outcome["evaluation_split"] == "clean-control":
+            total_control_cases += 1
+            if counts["fp"]:
+                total_control_cases_with_fp += 1
         for family in outcome["failure_families"]:
             _add_counts(by_family[family], counts)
             if outcome["evaluation_split"] == "clean-control":
                 control_cases[family] += 1
                 if counts["fp"]:
                     control_cases_with_fp[family] += 1
+        for entry in adjudicated_cases.get(outcome["case_id"], {}).get("findings", []):
+            if entry.get("verdict") == "true-positive":
+                fix_quality_scores.append(FIX_QUALITY[entry["fix_quality"]])
 
     base.update(totals)
     base["by_split"] = by_split
@@ -154,6 +192,54 @@ def score_run(
         family: control_cases_with_fp[family] / count
         for family, count in sorted(control_cases.items())
     }
+    base["clean_control_false_positive_rate"] = (
+        total_control_cases_with_fp / total_control_cases
+        if total_control_cases else 0.0
+    )
+    base["fix_quality_score"] = (
+        sum(fix_quality_scores) / len(fix_quality_scores)
+        if fix_quality_scores else None
+    )
+    base["fix_quality_adjudications"] = len(fix_quality_scores)
+    split_metrics: dict[str, dict[str, Any]] = {}
+    for split in EVALUATION_SPLITS:
+        split_outcomes = [
+            outcome for outcome in run["cases"]
+            if outcome["evaluation_split"] == split
+        ]
+        counts = by_split[split]
+        split_tp = counts["tp"]
+        split_fp = counts["fp"]
+        split_fn = counts["fn"]
+        split_fix_scores = [
+            FIX_QUALITY[entry["fix_quality"]]
+            for outcome in split_outcomes
+            for entry in adjudicated_cases.get(outcome["case_id"], {}).get(
+                "findings", []
+            )
+            if entry.get("verdict") == "true-positive"
+        ]
+        split_schema_valid = sum(
+            outcome["status"] == "schema-valid" for outcome in split_outcomes
+        )
+        split_metrics[split] = {
+            **counts,
+            "attempted_cases": len(split_outcomes),
+            "schema_valid_rate": (
+                split_schema_valid / len(split_outcomes) if split_outcomes else None
+            ),
+            "finding_precision": (
+                split_tp / (split_tp + split_fp) if split_tp + split_fp else 1.0
+            ),
+            "finding_recall": (
+                split_tp / (split_tp + split_fn) if split_tp + split_fn else 1.0
+            ),
+            "fix_quality_score": (
+                sum(split_fix_scores) / len(split_fix_scores)
+                if split_fix_scores else None
+            ),
+        }
+    base["split_metrics"] = split_metrics
     return base
 
 
@@ -174,6 +260,7 @@ def adjudication_template(run: dict[str, Any]) -> dict[str, Any]:
                         "finding_index": index,
                         "verdict": "REPLACE_ME",
                         "expected_finding_id": None,
+                        "fix_quality": "REPLACE_ME",
                         "rationale": "",
                     }
                     for index, _ in enumerate(
@@ -203,16 +290,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     run = json.loads(args.run.read_text(encoding="utf-8"))
     if args.write_template:
-        args.write_template.write_text(
-            json.dumps(adjudication_template(run), indent=2) + "\n",
-            encoding="utf-8",
-        )
+        artifacts.write_private_json(args.write_template, adjudication_template(run))
     if args.adjudication:
         adjudications = load_adjudications(args.adjudication)
         report = dict(run)
         report["metrics"] = score_run(run, adjudications)
+        report["adjudication"] = adjudications
+        report["adjudication_sha256"] = adjudication_sha256(adjudications)
         output = args.output or args.run.with_name(f"{args.run.stem}.scored.json")
-        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        artifacts.write_private_json(output, report)
         print(output)
     return 0
 

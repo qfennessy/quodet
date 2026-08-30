@@ -13,9 +13,21 @@ from pathlib import Path
 from unittest import mock
 
 import watch_files
+from model_runner import ModelRunResult
 
 
 class WatchFilesTests(unittest.TestCase):
+    def test_model_listing_parser_matches_only_exact_ids_and_aliases(self) -> None:
+        output = (
+            "Local Runtime: qwen-large (aliases: qwen-local, qwen)\n"
+            "Hosted Runtime: qwen-large-cloud\n"
+        )
+        self.assertEqual(
+            watch_files._listed_model_ids(output),
+            {"qwen-large", "qwen-local", "qwen", "qwen-large-cloud"},
+        )
+        self.assertNotIn("qwen-large-cl", watch_files._listed_model_ids(output))
+
     def test_review_batches_retain_every_path_beyond_the_provider_cap(self) -> None:
         paths = [Path(f"/tmp/source-{index}.py") for index in range(205)]
         batches = list(watch_files.bounded_review_batches(paths))
@@ -386,6 +398,46 @@ class WatchFilesTests(unittest.TestCase):
             self.assertEqual(event["returncode"], 2)
             self.assertEqual(event["raw_response"], '{"findings": []}\n')
             self.assertEqual(event["stderr"], "provider rejected request\n")
+
+    def test_failed_model_run_redacts_provider_streams_before_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "source.py"
+            source.write_text("value = 1\n")
+            secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+            failed = ModelRunResult(
+                status="provider-error",
+                returncode=2,
+                stdout=f"request={secret}",
+                stderr=f"rejected token {secret}",
+                latency_ms=1,
+                input_tokens=None,
+                output_tokens=None,
+                cost_usd=None,
+                maximum_cost_usd=None,
+                resource_usage={},
+                effective_config={},
+            )
+            output = io.StringIO()
+            with (
+                mock.patch("watch_files.run_model", return_value=failed),
+                contextlib.redirect_stdout(output),
+            ):
+                watch_files.review_files(
+                    [source], root=root, exclude_patterns=[], max_bytes=2_000_000,
+                    model="test-model", prompt="review", log=False,
+                    review_timeout=60, reasoning_effort=None,
+                    evaluation_events=True,
+                    model_run_config=mock.sentinel.config,
+                )
+
+            event = json.loads(output.getvalue().splitlines()[-1])[
+                "quodet_evaluation_event"
+            ]
+            self.assertNotIn(secret, json.dumps(event))
+            self.assertIn("[REDACTED]", event["raw_response"])
+            self.assertIn("[REDACTED]", event["stderr"])
+            self.assertIn("[REDACTED]", event["model_run_result"]["stdout"])
 
     def test_review_handles_malformed_nonzero_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
