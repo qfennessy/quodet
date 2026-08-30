@@ -931,8 +931,12 @@ def _execute_review_command(
     provider_started_at = time.time()
     provider_started = time.monotonic()
     model_result = None
+    runtime_attestation = None
     try:
         if model_run_config is not None:
+            from evals.agent_changes.live_eval import attest_runtime
+
+            runtime_attestation = attest_runtime(model_run_config)
             model_result = run_model(
                 model_run_config,
                 ModelRunRequest(
@@ -984,7 +988,7 @@ def _execute_review_command(
                 file=sys.stderr,
             )
         return None
-    except OSError as error:
+    except (OSError, ValueError) as error:
         if evaluation_events:
             safe_error, _ = redact_sensitive_values(str(error))
             print(json.dumps({"quodet_evaluation_event": {
@@ -992,6 +996,7 @@ def _execute_review_command(
                 "returncode": None,
                 "raw_response": None,
                 "stderr": safe_error,
+                "model_attempted": False,
             }}), flush=True)
         else:
             print(f"Could not run llm: {error}", file=sys.stderr)
@@ -1019,6 +1024,7 @@ def _execute_review_command(
                     "raw_response": safe_stdout,
                     "stderr": safe_stderr,
                     "model_run_result": model_result_payload,
+                    "runtime_attestation": runtime_attestation,
                 }}), flush=True)
             else:
                 print(safe_stderr, file=sys.stderr)
@@ -1048,6 +1054,7 @@ def _execute_review_command(
             "model_run_result": (
                 model_result_payload
             ),
+            "runtime_attestation": runtime_attestation,
         }}), flush=True)
     if result.returncode != 0:
         if not evaluation_events:
