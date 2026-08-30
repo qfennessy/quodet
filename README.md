@@ -3,6 +3,12 @@
 Quodet was created at [Sundai Hack 138](https://sundai.club). Sundai Club is a
 community for building and launching AI prototypes every Sunday.
 
+Quodet's goal is to integrate directly with coding-agent workflows and provide
+extremely low-latency code-quality feedback while an agent is still working.
+The independent watcher batches related file changes, reviews the current code,
+and is designed to return high-confidence defects quickly enough for the coding
+agent to verify and address them in the same development loop.
+
 `quodet` recursively watches a directory. After file writes settle for three
 seconds, it sends all changed files in that batch to Codex Luna through Simon
 Willison's [`llm`](https://llm.datasette.io/) CLI. The default review requests
