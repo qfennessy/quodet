@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -18,10 +19,21 @@ from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 import watch_files
-from evals.agent_changes import replay, scoring
+from evals.agent_changes import artifacts, benchmark, replay, scoring
+from model_runner import (
+    ModelDocument,
+    ModelRunConfig,
+    ModelRunRequest,
+    load_model_run_config,
+    preflight_model_run,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+OLLAMA_REGISTRY_PREFIX = "Ollama:"
+OLLAMA_LOCAL_BLOB = re.compile(
+    r"^FROM\s+(?:.*/)?sha256-([0-9a-f]{64})\s*$", re.MULTILINE,
+)
 WATCHER_PATH = REPOSITORY_ROOT / "watch_files.py"
 DEFAULT_RESULTS_DIRECTORY = REPOSITORY_ROOT / "eval-results"
 
@@ -34,6 +46,14 @@ class ProviderOutcome:
     raw_response: str | None
     parsed_response: dict[str, Any] | None
     error: str | None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
+    maximum_cost_usd: float | None = None
+    resource_usage: dict[str, Any] | None = None
+    effective_config: dict[str, Any] | None = None
+    model_latency_ms: int | None = None
+    model_attempt_count: int | None = None
 
 
 def sha256_text(value: str) -> str:
@@ -47,9 +67,13 @@ def manifest_sha256() -> str:
 def evaluation_configuration(
     *, model: str, reasoning_effort: str | None, prompt: str,
     fixture_revision: int, cases: Sequence[dict[str, Any]],
+    model_run_config: ModelRunConfig | None = None,
+    benchmark_plan: dict[str, Any] | None = None,
+    maximum_authorized_cost_usd: float | None = None,
+    runtime_attestation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     schema_text = watch_files.REVIEW_SCHEMA_JSON
-    return {
+    configuration = {
         "model": model,
         "model_options": {"reasoning_effort": reasoning_effort},
         "prompt": {
@@ -65,8 +89,41 @@ def evaluation_configuration(
         "fixture": {
             "revision": fixture_revision,
             "manifest_sha256": manifest_sha256(),
+            "fixture_tree_sha256": replay.fixture_tree_sha256(),
+            "provider_payload_sha256": benchmark.provider_fixture_payload_sha256(),
             "case_ids": [case["id"] for case in cases],
         },
+    }
+    if model_run_config is not None:
+        configuration["benchmark"] = {
+            "experiment_id": (
+                benchmark_plan or {}
+            ).get("experiment_id"),
+            "plan_sha256": (
+                benchmark.plan_sha256(benchmark_plan)
+                if benchmark_plan is not None else None
+            ),
+            "candidate_id": model_run_config.candidate_id,
+            "model_run_config": model_run_config.to_dict(),
+            "maximum_authorized_cost_usd": maximum_authorized_cost_usd,
+            "runtime_attestation": runtime_attestation,
+        }
+    return configuration
+
+
+def _model_result_fields(event: dict[str, Any]) -> dict[str, Any]:
+    result = event.get("model_run_result")
+    if not isinstance(result, dict):
+        return {}
+    return {
+        "input_tokens": result.get("input_tokens"),
+        "output_tokens": result.get("output_tokens"),
+        "cost_usd": result.get("cost_usd"),
+        "maximum_cost_usd": result.get("maximum_cost_usd"),
+        "resource_usage": result.get("resource_usage"),
+        "effective_config": result.get("effective_config"),
+        "model_latency_ms": result.get("latency_ms"),
+        "model_attempt_count": result.get("attempt_count"),
     }
 
 
@@ -182,6 +239,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
         ):
             event = event_wrapper["quodet_evaluation_event"]
             raw_response = event.get("raw_response")
+            result_fields = _model_result_fields(event)
             if event.get("status") != "success":
                 return ProviderOutcome(
                     str(event.get("status", "provider-error")),
@@ -190,6 +248,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                     raw_response if isinstance(raw_response, str) else None,
                     None,
                     str(event.get("stderr") or "provider invocation failed"),
+                    **result_fields,
                 )
             try:
                 parsed = parse_provider_response(raw_response)
@@ -198,7 +257,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                     "schema-error", round((time.monotonic() - started) * 1000),
                     "".join(transcript),
                     raw_response if isinstance(raw_response, str) else None,
-                    None, str(error),
+                    None, str(error), **result_fields,
                 )
             schema_error = validate_response(parsed)
             return ProviderOutcome(
@@ -206,6 +265,7 @@ def wait_for_outcome(output: queue.Queue[str], *, timeout: float) -> ProviderOut
                 round((time.monotonic() - started) * 1000),
                 "".join(transcript), raw_response,
                 parsed if isinstance(parsed, dict) else None, schema_error,
+                **result_fields,
             )
         if "llm review timed out" in line:
             return ProviderOutcome(
@@ -266,6 +326,14 @@ def case_outcome(case: dict[str, Any], provider: ProviderOutcome) -> dict[str, A
         "parsed_response": provider.parsed_response,
         "transcript": provider.transcript,
         "error": provider.error,
+        "input_tokens": provider.input_tokens,
+        "output_tokens": provider.output_tokens,
+        "cost_usd": provider.cost_usd,
+        "maximum_cost_usd": provider.maximum_cost_usd,
+        "resource_usage": provider.resource_usage,
+        "effective_model_config": provider.effective_config,
+        "model_latency_ms": provider.model_latency_ms,
+        "model_attempt_count": provider.model_attempt_count,
         "diagnostics": {
             "expected_files": expected_files,
             "reported_files": reported_files,
@@ -285,6 +353,8 @@ def watcher_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.log:
         command.append("--log")
+    if getattr(args, "model_run_config", None) is not None:
+        command.extend(["--model-run-config", str(args.model_run_config)])
     return command
 
 
@@ -305,6 +375,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inter-file-delay", type=float, default=0.25)
     parser.add_argument("--settle", type=float, default=1.5)
     parser.add_argument("--log", action="store_true")
+    parser.add_argument("--model-run-config", type=Path)
+    parser.add_argument(
+        "--benchmark-plan", type=Path, default=benchmark.DEFAULT_PLAN,
+    )
     args = parser.parse_args(argv)
     for name in ("debounce", "review_timeout", "settle"):
         if getattr(args, name) <= 0:
@@ -312,6 +386,135 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.inter_file_delay < 0:
         parser.error("--inter-file-delay cannot be negative")
     return args
+
+
+def benchmark_cost_preflight(
+    config: ModelRunConfig,
+    cases: Sequence[dict[str, Any]],
+) -> float | None:
+    maximum_costs: list[float] = []
+    for case in cases:
+        request = ModelRunRequest(
+            documents=tuple(
+                ModelDocument(replay.CASES_ROOT / case["id"] / filename)
+                for filename in case["files"]
+            ),
+            prompt=watch_files.DEFAULT_PROMPT,
+            schema_json=watch_files.REVIEW_SCHEMA_JSON,
+            cwd=REPOSITORY_ROOT,
+        )
+        result = preflight_model_run(config, request)
+        if not result.allowed:
+            raise ValueError(f"{case['id']} preflight failed: {result.reason}")
+        if result.maximum_cost_usd is not None:
+            maximum_costs.append(result.maximum_cost_usd)
+    if not maximum_costs:
+        return None
+    total = sum(maximum_costs)
+    assert config.max_cost_usd is not None
+    if total > config.max_cost_usd:
+        raise ValueError(
+            f"benchmark maximum cost ${total:.6f} exceeds the configured "
+            f"experiment cap ${config.max_cost_usd:.6f}"
+        )
+    return total
+
+
+def attest_runtime(config: ModelRunConfig) -> dict[str, Any]:
+    version_result = subprocess.run(
+        ["llm", "--version"], check=False, capture_output=True, text=True,
+    )
+    plugins_result = subprocess.run(
+        ["llm", "plugins"], check=False, capture_output=True, text=True,
+    )
+    models_result = subprocess.run(
+        ["llm", "models", "list"], check=False, capture_output=True, text=True,
+    )
+    if any(
+        result.returncode != 0
+        for result in (version_result, plugins_result, models_result)
+    ):
+        raise ValueError("could not attest installed llm runtime and model registry")
+    cli_version = version_result.stdout.strip().rsplit(" ", 1)[-1]
+    try:
+        plugins = json.loads(plugins_result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("llm plugins did not return valid JSON") from error
+    if config.runtime == "llm":
+        runtime_version = cli_version
+        runtime_entry: dict[str, Any] = {"name": "llm", "version": cli_version}
+    else:
+        matching = [
+            plugin for plugin in plugins
+            if isinstance(plugin, dict) and plugin.get("name") == config.runtime
+        ]
+        if len(matching) != 1:
+            raise ValueError(
+                f"configured runtime {config.runtime!r} is not installed exactly once"
+            )
+        runtime_entry = matching[0]
+        runtime_version = str(runtime_entry.get("version"))
+    if runtime_version != config.runtime_version:
+        raise ValueError(
+            f"configured runtime version {config.runtime_version!r} differs from "
+            f"installed {runtime_version!r}"
+        )
+    model_entry = watch_files._listed_model_entries(models_result.stdout).get(
+        config.model
+    )
+    if model_entry is None:
+        raise ValueError(f"configured model alias {config.model!r} is not installed")
+    local_model_attestation = None
+    if config.locality == "local":
+        if config.runtime != "llm-ollama" or not model_entry.startswith(
+            OLLAMA_REGISTRY_PREFIX
+        ):
+            raise ValueError(
+                "local execution requires llm-ollama and an Ollama registry entry"
+            )
+        runtime_model_id = str(config.hardware.get("runtime_model_id", ""))
+        registered_model_id = model_entry[len(OLLAMA_REGISTRY_PREFIX):].strip()
+        registered_model_id = registered_model_id.split(" (aliases:", 1)[0].strip()
+        if (
+            not runtime_model_id
+            or runtime_model_id.endswith(":cloud")
+            or registered_model_id != runtime_model_id
+        ):
+            raise ValueError(
+                "local llm alias does not resolve to the configured non-cloud "
+                "runtime_model_id"
+            )
+        model_result = subprocess.run(
+            ["ollama", "show", "--modelfile", runtime_model_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if model_result.returncode != 0:
+            raise ValueError("could not attest the configured Ollama model")
+        digest_match = OLLAMA_LOCAL_BLOB.search(model_result.stdout)
+        if digest_match is None:
+            raise ValueError(
+                "configured Ollama model does not resolve to an immutable local blob"
+            )
+        actual_digest = digest_match.group(1)
+        expected_digest = config.hardware.get("runtime_artifact_sha256")
+        if actual_digest != expected_digest:
+            raise ValueError(
+                "configured Ollama model blob differs from runtime_artifact_sha256"
+            )
+        local_model_attestation = {
+            "runtime_model_id": runtime_model_id,
+            "runtime_artifact_sha256": actual_digest,
+        }
+    attestation = {
+        "llm_cli_version": cli_version,
+        "runtime": runtime_entry,
+        "model_registry_entry": model_entry,
+    }
+    if local_model_attestation is not None:
+        attestation["local_model"] = local_model_attestation
+    return attestation
 
 
 def select_cases(manifest: dict[str, Any], selector: str) -> list[dict[str, Any]]:
@@ -337,9 +540,8 @@ def write_raw_run(
         "cases": cases,
     }
     run["metrics"] = scoring.score_run(run, None)
-    results_directory.mkdir(parents=True, exist_ok=True)
     destination = results_directory / f"{run_id}.raw.json"
-    destination.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    artifacts.write_private_json(destination, run)
     return destination
 
 
@@ -349,6 +551,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     cases = select_cases(manifest, args.case)
     args.destination = args.destination.expanduser().resolve()
     args.results_directory = args.results_directory.expanduser().resolve()
+    run_config_path = getattr(args, "model_run_config", None)
+    model_run_config = (
+        load_model_run_config(run_config_path.expanduser().resolve())
+        if run_config_path is not None else None
+    )
+    benchmark_plan = None
+    maximum_authorized_cost = None
+    runtime_attestation = None
+    if model_run_config is not None:
+        watch_files.validate_model_run_config_privacy(model_run_config)
+        args.model_run_config = run_config_path.expanduser().resolve()
+        benchmark_plan = benchmark.load_plan(
+            getattr(args, "benchmark_plan", benchmark.DEFAULT_PLAN)
+        )
+        candidate = benchmark_plan["candidates"].get(model_run_config.candidate_id)
+        if candidate is None:
+            raise ValueError("model run config candidate is absent from benchmark plan")
+        for name, expected in (
+            ("model_artifact", candidate["model_artifact"]),
+            ("model_revision", candidate["model_revision"]),
+            ("locality", candidate["required_locality"]),
+        ):
+            if getattr(model_run_config, name) != expected:
+                raise ValueError(f"model run config {name} differs from benchmark plan")
+        maximum_authorized_cost = benchmark_cost_preflight(model_run_config, cases)
+        runtime_attestation = attest_runtime(model_run_config)
+        args.model = model_run_config.model
+        args.review_timeout = model_run_config.timeout_seconds
+        args.reasoning_effort = "auto"
     configuration = evaluation_configuration(
         model=args.model,
         reasoning_effort=watch_files.resolve_reasoning_effort(
@@ -357,6 +588,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         prompt=watch_files.DEFAULT_PROMPT,
         fixture_revision=manifest["version"],
         cases=cases,
+        model_run_config=model_run_config,
+        benchmark_plan=benchmark_plan,
+        maximum_authorized_cost_usd=maximum_authorized_cost,
+        runtime_attestation=runtime_attestation,
     )
     print(f"Evaluation configuration: {json.dumps(configuration, sort_keys=True)}")
     started_at = datetime.now(UTC).isoformat()
@@ -390,15 +625,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         time.sleep(args.settle)
         for case in cases:
             print(f"\nReplaying {case['id']} ({case['difficulty']})", flush=True)
-            replay.replay_case(
-                case, destination=args.destination,
-                inter_file_delay=args.inter_file_delay,
-            )
-            provider = wait_for_outcome(
-                output, timeout=args.debounce + args.review_timeout + 15
-            )
+            outcome_index = len(outcomes)
+            outcomes.append(case_outcome(
+                case,
+                ProviderOutcome(
+                    status="interrupted", latency_ms=0, transcript="",
+                    raw_response=None, parsed_response=None,
+                    error="attempt started but did not produce a complete outcome",
+                ),
+            ))
+            try:
+                replay.replay_case(
+                    case, destination=args.destination,
+                    inter_file_delay=args.inter_file_delay,
+                )
+                provider = wait_for_outcome(
+                    output, timeout=args.debounce + args.review_timeout + 15
+                )
+            except BaseException as error:
+                if not isinstance(error, KeyboardInterrupt):
+                    outcomes[outcome_index] = case_outcome(
+                        case,
+                        ProviderOutcome(
+                            status="harness-error", latency_ms=0, transcript="",
+                            raw_response=None, parsed_response=None,
+                            error=f"{type(error).__name__}: {error}",
+                        ),
+                    )
+                raise
             outcome = case_outcome(case, provider)
-            outcomes.append(outcome)
+            outcomes[outcome_index] = outcome
             print(
                 f"RAW {case['id']}: status={provider.status}; "
                 f"filename_match={outcome['diagnostics']['filename_match']}; "

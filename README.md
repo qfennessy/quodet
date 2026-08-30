@@ -190,9 +190,151 @@ uv run python -m evals.agent_changes.scoring \
 ```
 
 The scored report includes TP, FP, FN, schema-valid rate, split and family
-breakdowns, and clean-control false-positive rate by family. Filename equality
-is diagnostic only: a finding on the expected file with the wrong explanation
-is an FP and leaves the expected defect as an FN.
+breakdowns, clean-control false-positive rate overall and by family, and an
+adjudicated recommended-fix quality score. For each true positive, set
+`fix_quality` to `actionable`, `partially-actionable`, or `not-actionable`.
+Filename equality is diagnostic only: a finding on the expected file with the
+wrong explanation is an FP and leaves the expected defect as an FN.
+
+## Frozen open-model benchmark
+
+Issue [#5](https://github.com/qfennessy/quodet/issues/5) defines a controlled
+comparison of
+[Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B),
+[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash), and
+[Devstral Small 2](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512).
+The hypotheses in that issue are not results. No candidate inference was run
+while adding this framework, and Quodet's default remains `gpt-5.6-luna`.
+
+The machine-readable
+[benchmark plan](evals/agent_changes/model_benchmark_plan.json) pins each model
+repository and exact revision, the fixture/prompt/schema hashes, one-attempt
+policy, privacy boundary, and a decision rule frozen before holdout results.
+Precision and clean-control restraint are the first ranking measures because a
+high-frequency watcher becomes unusable when it raises frequent false alarms.
+The checked-in [scorecard](evals/agent_changes/model_benchmark_scorecard.json)
+is deliberately `not-run` and records no selection.
+
+Model weights do not define a reproducible deployment. Before any run, prepare
+an exact local or hosted execution config with the actual `llm` model alias,
+provider, runtime and version, quantization, model options, hardware, timeout,
+and output limit. The checked-in local candidates are deliberately
+`unregistered`: no conversion artifact was installed or verified while adding
+the framework. Before preparing either local run, update its `runtime_artifact`
+entry in the benchmark plan to `approved` in a reviewed commit, binding the
+pinned source artifact/revision to the exact Ollama model ID and local blob
+SHA-256 produced by a documented reproducible conversion. Arbitrary values in
+a run config cannot satisfy this binding. After that registration, prepare the
+matching local runtime:
+
+```sh
+uv run python -m evals.agent_changes.benchmark prepare qwen35-a3b-local \
+  --model YOUR_LOCAL_LLM_ALIAS \
+  --provider local \
+  --runtime llm-ollama \
+  --runtime-version YOUR_EXACT_RUNTIME_VERSION \
+  --quantization YOUR_EXACT_QUANTIZATION \
+  --model-options '{"temperature": 0}' \
+  --max-output-tokens-option YOUR_RUNTIME_OUTPUT_TOKEN_OPTION \
+  --hardware '{"accelerator":"YOUR_DEVICE","memory_bytes":0,"amortized_hourly_cost_usd":0,"model_load_ms":0,"peak_memory_bytes":0,"runtime_model_id":"YOUR_EXACT_OLLAMA_MODEL","runtime_artifact_sha256":"YOUR_64_CHARACTER_LOCAL_BLOB_SHA256"}' \
+  --output /tmp/qwen35.run-config.json
+```
+
+For a local candidate, `--provider` must be exactly `local`, external-upload
+consent must be absent, and the configured model alias must appear exactly in
+`llm models list`; Quodet fails instead of substituting another model. Local
+benchmark runs currently fail closed to `llm-ollama`: the registry's primary
+model ID must equal `runtime_model_id`, cloud model IDs are rejected, and
+`ollama show --modelfile` must resolve to the configured immutable local blob
+SHA-256. This prevents a hosted plugin, cloud model, or alias for different
+local weights from satisfying the config. Treat the selected `llm`
+runtime/plugin as part of the trusted computing base: verify that the alias
+resolves to the pinned local weights and that the plugin has no
+hosted fallback before recording its exact runtime version. Quodet performs one
+invocation only and never implements its own fallback. At run time it also
+requires the declared plugin name/version to match `llm plugins`, requires an
+exact model ID or alias match from `llm models list`, and retains that registry
+entry plus the installed `llm` version in the raw artifact. This attests the
+installed adapter, not the adapter's internal network behavior; use a
+no-egress runtime sandbox when that behavior is not independently trusted.
+
+Do not describe a hosted endpoint as local merely because its weights have a
+permissive license. The checked-in hosted candidate is also `unregistered`.
+Before preparing it, a reviewed plan revision must bind the provider, plugin
+and version, exact alias, provider backend revision, quantization, and dated
+evidence that the endpoint serves the pinned source artifact/revision. If the
+provider cannot make that binding, the candidate remains ineligible. Hosted
+preparation also fails closed unless both external source upload and a positive
+experiment-wide cost cap are explicit, and both input and output prices have a
+dated source:
+
+```sh
+uv run python -m evals.agent_changes.benchmark prepare deepseek-v4-flash-hosted \
+  --model YOUR_HOSTED_LLM_ALIAS \
+  --provider YOUR_PROVIDER \
+  --runtime YOUR_LLM_PLUGIN \
+  --runtime-version YOUR_EXACT_PLUGIN_VERSION \
+  --quantization YOUR_PROVIDER_QUANTIZATION \
+  --model-options '{"temperature": 0}' \
+  --max-output-tokens-option YOUR_RUNTIME_OUTPUT_TOKEN_OPTION \
+  --hardware '{"region":"YOUR_REGION","endpoint":"YOUR_ENDPOINT_VERSION","provider_model_revision":"YOUR_PINNED_PROVIDER_BACKEND_REVISION"}' \
+  --input-usd-per-million YOUR_INPUT_PRICE \
+  --output-usd-per-million YOUR_OUTPUT_PRICE \
+  --pricing-source YOUR_DATED_PRICE_URL \
+  --pricing-as-of YYYY-MM-DD \
+  --max-cost-usd YOUR_EXPERIMENT_CAP \
+  --allow-external-upload \
+  --output /tmp/deepseek.run-config.json
+```
+
+Run the frozen exposed suite through the same Quodet watcher and single-attempt
+model runner. Preflight uses a conservative tokenizer-independent upper bound
+for context fit. Hosted cost authorization uses the entire configured context
+window for every case—not only visible fixture bytes—so plugin framing and
+hidden system text cannot evade the ceiling. The runner refuses to start a
+hosted suite whose summed worst-case cost exceeds the cap:
+
+```sh
+uv run python -m evals.agent_changes.live_eval all \
+  --model-run-config /tmp/qwen35.run-config.json
+```
+
+The raw artifact preserves every attempted case, including timeout,
+provider-error, output-limit, budget-blocked, malformed-schema, and harness
+failures. It records bounded, secret-redacted provider stdout/stderr, exact
+effective configuration, latency, provider-reported token usage, derived cost,
+and local resource fields. The
+runner creates raw, adjudication, config, and scorecard JSON files with `0600`
+permissions (and newly created artifact directories with `0700` permissions).
+Quodet asks `llm` to report token usage. If a plugin omits it, values remain
+`null` and the candidate is ineligible rather than receiving guessed usage or
+cost. Local configs must record measured model-load time, peak memory, and an
+explicit amortized hourly-cost assumption; Quodet reports those alongside wall
+time and computes a normalized elapsed-time cost. There is no
+silent retry, JSON repair, or hosted fallback.
+
+After independent adjudication, generate the comparison scorecard from one
+complete `all` artifact per candidate:
+
+```sh
+uv run python -m evals.agent_changes.benchmark scorecard \
+  eval-results/QWEN.scored.json \
+  eval-results/DEEPSEEK.scored.json \
+  eval-results/DEVSTRAL.scored.json \
+  --output eval-results/model-benchmark.scorecard.json
+```
+
+Calibration, holdout, and clean-control counts stay separate in every scored
+artifact. Calibration metrics are report-only and never influence eligibility
+or ranking: defect precision, recall, and fix quality come from holdout, while
+false-positive restraint comes from matched clean controls. Schema validity and
+latency are computed across holdout plus clean controls. Temporal and
+confirmation remain reserved until appropriately
+consented, leakage-controlled fixtures exist. Raw artifacts belong under the
+ignored `eval-results/` directory; inspect them for proprietary source or
+secrets before sharing. The scorecard never auto-switches the production
+default: apply the pre-registered lexicographic rule explicitly, or record that
+no candidate established eligibility.
 
 The watcher sees changes made by every process, not only a coding agent. Add
 generated output paths with `--exclude` to prevent noisy reviews or feedback
