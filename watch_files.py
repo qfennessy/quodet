@@ -23,6 +23,8 @@ from typing import Iterable, Sequence
 from feedback import (
     CompositeSink,
     ConsoleSink,
+    DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+    DEFAULT_AGENT_EDIT_QUIET_SECONDS,
     FeedbackSink,
     FlushHint,
     MAX_PROVIDER_OUTPUT_BYTES,
@@ -261,6 +263,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_DEBOUNCE_SECONDS,
         metavar="SECONDS",
         help="wait this long after the last change before reviewing (default: 3)",
+    )
+    parser.add_argument(
+        "--agent-edit-quiet",
+        type=positive_float,
+        default=DEFAULT_AGENT_EDIT_QUIET_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "coalesce rapid direct agent edits before review (default: 0.25)"
+        ),
+    )
+    parser.add_argument(
+        "--agent-edit-max-age",
+        type=positive_float,
+        default=DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "flush continuous direct agent edits by this age (default: 1)"
+        ),
     )
     parser.add_argument(
         "--max-bytes",
@@ -1253,11 +1273,48 @@ def next_triggered_batch(
     *,
     hint_source: SpoolSink | None = None,
     suppression: MaterializedPathSuppression | None = None,
+    agent_edit_quiet: float = DEFAULT_AGENT_EDIT_QUIET_SECONDS,
+    agent_edit_max_age: float = DEFAULT_AGENT_EDIT_MAX_AGE_SECONDS,
 ) -> TriggeredBatch:
-    """Collect a quiet-window batch, or flush it at an authenticated edit hint."""
+    """Collect a filesystem batch or a bounded group of direct agent edits."""
     suppressed_paths: set[Path] = set()
+
+    def materialize_hint(hint: FlushHint, batch: set[Path]) -> TriggeredBatch:
+        if suppression is not None:
+            suppression.record(hint)
+            hinted_paths = {
+                hint_source.root / Path(item.path)  # type: ignore[union-attr]
+                for item in hint.reviewed_files
+            }
+            suppressed_paths.update(batch & hinted_paths)
+        batch.update(
+            hint_source.root / Path(item.path)  # type: ignore[union-attr]
+            for item in hint.reviewed_files
+        )
+        while True:
+            try:
+                path = changes.get_nowait()
+                if suppression is not None and suppression.matches(path):
+                    suppressed_paths.add(path)
+                else:
+                    batch.add(path)
+            except queue.Empty:
+                return TriggeredBatch(batch, hint, suppressed_paths)
+
     while True:
-        first = changes.get()
+        if hint_source is not None:
+            hint = hint_source.consume_flush_hint(
+                quiet_seconds=agent_edit_quiet,
+                max_age_seconds=agent_edit_max_age,
+            )
+            if hint is not None:
+                return materialize_hint(hint, set())
+            try:
+                first = changes.get(timeout=0.025)
+            except queue.Empty:
+                continue
+        else:
+            first = changes.get()
         if suppression is not None and suppression.matches(first):
             suppressed_paths.add(first)
             continue
@@ -1267,28 +1324,27 @@ def next_triggered_batch(
 
     while True:
         hint = (
-            hint_source.consume_flush_hint(tuple(batch))
+            hint_source.consume_flush_hint(
+                tuple(batch),
+                quiet_seconds=agent_edit_quiet,
+                max_age_seconds=agent_edit_max_age,
+            )
             if hint_source is not None
             else None
         )
         if hint is not None:
-            if suppression is not None:
-                suppression.record(hint)
-            batch.update(
-                hint_source.root / Path(item.path)
-                for item in hint.reviewed_files
-            )
-            while True:
-                try:
-                    path = changes.get_nowait()
-                    if suppression is not None and suppression.matches(path):
-                        suppressed_paths.add(path)
-                    else:
-                        batch.add(path)
-                except queue.Empty:
-                    return TriggeredBatch(batch, hint, suppressed_paths)
+            return materialize_hint(hint, batch)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if hint_source is not None:
+                hint = hint_source.consume_flush_hint(
+                    tuple(batch),
+                    quiet_seconds=agent_edit_quiet,
+                    max_age_seconds=agent_edit_max_age,
+                    force_ready=True,
+                )
+                if hint is not None:
+                    return materialize_hint(hint, batch)
             return TriggeredBatch(batch, None, suppressed_paths)
         try:
             wait = min(remaining, 0.025) if hint_source is not None else remaining
@@ -1371,6 +1427,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return agent_main(raw_argv)
     args = parse_args(raw_argv)
+    if args.agent_edit_quiet > 10 or args.agent_edit_max_age > 30:
+        raise SystemExit(
+            "--agent-edit-quiet must be at most 10 seconds and "
+            "--agent-edit-max-age at most 30 seconds"
+        )
     benchmark_arguments = (
         args.model_run_config,
         args.model_run_config_sha256,
@@ -1385,6 +1446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--model-run-config-sha256, --benchmark-plan, and "
             "--benchmark-plan-sha256 together"
         )
+    if args.agent_edit_quiet > args.agent_edit_max_age:
+        raise SystemExit("--agent-edit-quiet must not exceed --agent-edit-max-age")
     model_run_config = (
         load_model_run_config(args.model_run_config)
         if args.model_run_config is not None
@@ -1477,6 +1540,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.debounce,
                 hint_source=spool_sink,
                 suppression=suppression,
+                agent_edit_quiet=args.agent_edit_quiet,
+                agent_edit_max_age=args.agent_edit_max_age,
             )
             event_batch = triggered.paths
             batch_flushed_at = time.time()
