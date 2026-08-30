@@ -129,15 +129,37 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
     scope = plan.get("evaluation_scope")
     challenge_fixture = plan.get("challenge_fixture")
     attempts = contract.get("attempts_per_case")
+    execution = plan.get("execution_contract")
+    if not isinstance(execution, Mapping):
+        raise ValueError("benchmark plan requires an execution_contract object")
+    common_execution_keys = {
+        "timeout_seconds", "max_output_tokens", "max_output_bytes", "temperature",
+    }
     if scope == ORDINARY_PLAN_SCOPE:
         if challenge_fixture is not None:
             raise ValueError("ordinary benchmark plan cannot bind challenge fixtures")
         if attempts != 1:
             raise ValueError("ordinary benchmark must freeze exactly one attempt")
+        if set(execution) != common_execution_keys or (
+            not isinstance(execution.get("temperature"), (int, float))
+            or isinstance(execution.get("temperature"), bool)
+        ):
+            raise ValueError(
+                "ordinary benchmark must freeze only a numeric temperature"
+            )
     elif scope == CHALLENGE_PLAN_SCOPE:
         if attempts != CHALLENGE_QUALIFICATION_ATTEMPTS:
             raise ValueError(
                 "challenge qualification plan must freeze exactly three attempts"
+            )
+        if (
+            set(execution) != common_execution_keys | {"reasoning_effort"}
+            or execution.get("temperature") is not None
+            or execution.get("reasoning_effort") not in {"low", "medium", "high"}
+        ):
+            raise ValueError(
+                "challenge qualification must freeze reasoning effort without "
+                "a temperature option"
             )
         if not isinstance(challenge_fixture, Mapping) or set(challenge_fixture) != {
             "revision", "manifest_sha256", "content_sha256",

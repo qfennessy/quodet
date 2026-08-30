@@ -84,6 +84,12 @@ def plan_with_approved_qwen_artifact() -> dict[str, object]:
 
 
 def approved_qwen_config(plan: dict[str, object]) -> ModelRunConfig:
+    execution = plan["execution_contract"]
+    model_options = (
+        {"reasoning_effort": execution["reasoning_effort"]}
+        if "reasoning_effort" in execution
+        else {"temperature": execution["temperature"]}
+    )
     return benchmark.prepare_run_config(
         plan,
         candidate_id="qwen35-a3b-local",
@@ -92,7 +98,7 @@ def approved_qwen_config(plan: dict[str, object]) -> ModelRunConfig:
         runtime="llm-ollama",
         runtime_version="1.0",
         quantization="bfloat16",
-        model_options={"temperature": 0},
+        model_options=model_options,
         timeout_seconds=60,
         max_output_tokens=4096,
         max_output_tokens_option="max_tokens",
@@ -117,6 +123,10 @@ def bind_challenge_plan(
     plan["evaluation_scope"] = benchmark.CHALLENGE_PLAN_SCOPE
     plan["challenge_fixture"] = live_eval.challenge_plan_binding(cases)
     plan["review_contract"]["attempts_per_case"] = attempts
+    plan["execution_contract"].update({
+        "temperature": None,
+        "reasoning_effort": "high",
+    })
     return plan
 
 
@@ -151,6 +161,12 @@ def plan_with_approved_hosted_artifact(
 
 
 def approved_hosted_config(plan: dict[str, object]) -> ModelRunConfig:
+    execution = plan["execution_contract"]
+    model_options = (
+        {"reasoning_effort": execution["reasoning_effort"]}
+        if "reasoning_effort" in execution
+        else {"temperature": execution["temperature"]}
+    )
     return benchmark.prepare_run_config(
         plan,
         candidate_id="deepseek-v4-flash-hosted",
@@ -159,7 +175,7 @@ def approved_hosted_config(plan: dict[str, object]) -> ModelRunConfig:
         runtime="test-runtime",
         runtime_version="1.0.0",
         quantization="fp8",
-        model_options={"temperature": 0},
+        model_options=model_options,
         timeout_seconds=60,
         max_output_tokens=4096,
         max_output_tokens_option="max_tokens",
@@ -335,6 +351,16 @@ class AgentChangeReplayTests(unittest.TestCase):
                     "provider_model_revision": "deepseek-v4-flash-test-revision",
                 },
             )
+
+        ordinary_with_reasoning = json.loads(json.dumps(ordinary))
+        ordinary_with_reasoning["execution_contract"]["reasoning_effort"] = "high"
+        with self.assertRaisesRegex(ValueError, "ordinary benchmark"):
+            benchmark.validate_plan(ordinary_with_reasoning)
+
+        challenge_with_temperature = json.loads(json.dumps(plan))
+        challenge_with_temperature["execution_contract"]["temperature"] = 0
+        with self.assertRaisesRegex(ValueError, "without a temperature"):
+            benchmark.validate_plan(challenge_with_temperature)
 
     def test_live_eval_rejects_unregistered_config_before_any_runtime_work(self) -> None:
         hosted_plan = plan_with_approved_hosted_artifact(
