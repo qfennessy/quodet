@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 from feedback import (
+    ReviewBatch,
+    ReviewFinding,
     ReviewValidationError,
     ReviewedFile,
     SpoolSink,
@@ -17,6 +19,7 @@ from feedback import (
 )
 from review_lifecycle import (
     FindingLifecycleTracker,
+    MAX_TRACKED_FINDINGS,
     batch_timing,
     short_batch_id,
 )
@@ -116,6 +119,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(out_of_order.lifecycle[0].status, "stale")
         self.assertEqual(out_of_order.lifecycle[0].reason, "out_of_order")
+        self.assertEqual(out_of_order.findings, ())
 
         empty_out_of_order = tracker.classify(self.batch(title=None, sequence=2))
         self.assertEqual(empty_out_of_order.findings, ())
@@ -137,6 +141,57 @@ class ReviewLifecycleTests(unittest.TestCase):
         # Neither stale result replaced the last current lifecycle state.
         retained = tracker.classify(self.batch(line=20, sequence=5))
         self.assertEqual(retained.lifecycle[0].status, "retained")
+
+    def test_tracker_bounds_history_before_emitting_lifecycle(self) -> None:
+        tracker = FindingLifecycleTracker()
+        reviewed: list[ReviewedFile] = []
+        for file_index in range(3):
+            relative_path = f"src/file_{file_index}.py"
+            source = self.root / relative_path
+            source.write_text(f"value = {file_index}\n", encoding="utf-8")
+            raw = source.read_bytes()
+            snapshot = ReviewedFile(
+                relative_path, hashlib.sha256(raw).hexdigest(), len(raw)
+            )
+            reviewed.append(snapshot)
+            findings = tuple(
+                ReviewFinding(
+                    file=relative_path,
+                    line=line,
+                    severity="medium",
+                    confidence=0.99,
+                    title=f"Defect {line}",
+                    explanation="A concrete failure remains observable.",
+                    suggested_fix="Change the branch and add a focused test.",
+                )
+                for line in range(1, MAX_TRACKED_FINDINGS + 1)
+            )
+            tracker.classify(
+                ReviewBatch(
+                    batch_id=f"00000000-0000-4000-8000-{file_index:012d}",
+                    root=str(self.root),
+                    created_at=self.base_time + file_index,
+                    reviewed_files=(snapshot,),
+                    findings=findings,
+                    batch_flushed_at=self.base_time + file_index,
+                )
+            )
+
+        empty = ReviewBatch(
+            batch_id="00000000-0000-4000-8000-999999999999",
+            root=str(self.root),
+            created_at=self.base_time + 4,
+            reviewed_files=tuple(reviewed),
+            findings=(),
+            batch_flushed_at=self.base_time + 4,
+        )
+        classified = tracker.classify(empty)
+
+        self.assertEqual(len(classified.lifecycle), MAX_TRACKED_FINDINGS)
+        self.assertEqual(
+            {event.status for event in classified.lifecycle},
+            {"no_longer_reported"},
+        )
 
     def test_progress_is_one_line_and_never_claims_omission_is_resolved(self) -> None:
         tracker = FindingLifecycleTracker()

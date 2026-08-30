@@ -16,6 +16,8 @@ LIFECYCLE_STATUSES = frozenset(
     {"new", "retained", "replaced", "no_longer_reported", "stale"}
 )
 STALE_REASONS = frozenset({"source_changed", "out_of_order"})
+MAX_TRACKED_FILES = 100
+MAX_TRACKED_FINDINGS = 50
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,20 @@ class FindingLifecycleTracker:
     def __init__(self) -> None:
         self._files: dict[str, _FileState] = {}
 
+    def _bound_state(self) -> None:
+        """Retain recent snapshot order while bounding comparable identities."""
+        remaining_findings = MAX_TRACKED_FINDINGS
+        bounded: dict[str, _FileState] = {}
+        ordered = sorted(
+            self._files.items(),
+            key=lambda item: (-item[1].snapshot_at, item[0]),
+        )
+        for path, state in ordered[:MAX_TRACKED_FILES]:
+            findings = state.findings[:remaining_findings]
+            bounded[path] = _FileState(state.snapshot_at, findings)
+            remaining_findings -= len(findings)
+        self._files = bounded
+
     def classify(self, batch: ReviewBatch) -> ReviewBatch:
         events = list(batch.lifecycle)
         stale_files = set(batch.stale_files)
@@ -204,8 +220,14 @@ class FindingLifecycleTracker:
                 for item in unmatched_current[replacement_count:]
             )
             self._files[path] = _FileState(snapshot_at, tuple(current))
+        self._bound_state()
         return replace(
             batch,
+            findings=tuple(
+                finding
+                for finding in batch.findings
+                if finding.file not in stale_files
+            ),
             lifecycle=tuple(events),
             stale_files=tuple(sorted(stale_files)),
         )

@@ -381,10 +381,12 @@ def fresh_findings(batch: ReviewBatch) -> ReviewBatch:
         if key not in stale_keys:
             lifecycle.append(stale_event)
             stale_keys.add(key)
+    if len(lifecycle) > MAX_FINDINGS * 2:
+        raise ReviewValidationError("finding lifecycle exceeds bounded tracker state")
     return replace(
         batch,
         findings=tuple(f for f in batch.findings if f.file in fresh_paths),
-        lifecycle=tuple(lifecycle[: MAX_FINDINGS * 2]),
+        lifecycle=tuple(lifecycle),
         stale_files=tuple(sorted(set(batch.stale_files) | set(stale_paths))),
     )
 

@@ -768,6 +768,12 @@ is no longer current, or which completes behind a newer snapshot, is `stale`
 and cannot clear or replace current state. Restarting the watcher starts a new
 comparison history.
 
+To keep lifecycle metadata bounded before it is generated, the in-memory
+comparison history retains snapshot ordering for the 100 most recent files and
+finding identities for the 50 most recent findings. Older identities age out
+of comparison history; completed lifecycle conclusions are never silently
+truncated to fit the spool envelope.
+
 Validated spool JSON retains the full UUID, lifecycle events, stale relative
 paths, source-free fingerprints, and stage timestamps for integrations. The
 terminal uses only the short identifier and aggregate lifecycle counts; it
