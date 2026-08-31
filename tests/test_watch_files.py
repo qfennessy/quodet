@@ -1881,6 +1881,66 @@ class WatchFilesTests(unittest.TestCase):
         self.assertTrue(scheduler.wait_idle(1))
         spool.finish_review.assert_called_once_with(marker)
 
+    def test_same_digest_hint_schedules_follow_up_for_new_route(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        spool = mock.Mock()
+        spool.capture_session_generation.side_effect = [1, 2]
+        marker_old = Path("/private/spool/in-flight/old.json")
+        marker_new = Path("/private/spool/in-flight/new.json")
+        spool.begin_review.side_effect = [marker_old, marker_new]
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            started.set()
+            release.wait(1)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/app.py")
+
+        def hint(name: str, agent_session_id: str) -> watch_files.FlushHint:
+            path = Path(f"/private/spool/flush-hints/{name}.json")
+            return watch_files.FlushHint(
+                agent_session_id,
+                1,
+                path,
+                (watch_files.ReviewedFile("app.py", "0" * 64, 100),),
+            )
+
+        scheduler.submit(
+            watch_files.TriggeredBatch(
+                {source}, hint("old", "old-session"), set(), 1
+            ),
+            path_digests={source: "same"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch(
+                {source}, hint("new", "new-session"), set(), 1
+            ),
+            path_digests={source: "same"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        self.assertEqual(scheduler.state(), (1, 1, True))
+        release.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0].cancel_event.is_set())
+        self.assertEqual(calls[1].agent_session_id, "new-session")
+        self.assertEqual(calls[1].session_generation, 2)
+        self.assertCountEqual(
+            [call.args[0] for call in spool.finish_review.call_args_list],
+            [marker_old, marker_new],
+        )
+
     def test_hint_during_marker_teardown_cannot_attach_to_finished_work(self) -> None:
         finish_started = threading.Event()
         release_finish = threading.Event()

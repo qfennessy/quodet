@@ -1707,12 +1707,21 @@ class CoalescingReviewScheduler:
                 if self._active is not None and not self._active.finishing
                 else None
             )
+            active_route_changed = active is not None and (
+                active.session_generation != session_generation
+                or (
+                    agent_session_id is not None
+                    and active.agent_session_id is not None
+                    and active.agent_session_id != agent_session_id
+                )
+            )
             if active is not None:
                 priority_paths.update(set(incoming) - set(active.path_digests))
                 unchanged_overlap = {
                     path
                     for path, digest in incoming.items()
                     if path in active.path_digests
+                    and not active_route_changed
                     and digest is not None
                     and digest == active.path_digests[path]
                 }
@@ -1721,7 +1730,8 @@ class CoalescingReviewScheduler:
                     for path, digest in incoming.items()
                     if path in active.path_digests
                     and (
-                        digest is None
+                        active_route_changed
+                        or digest is None
                         or active.path_digests[path] is None
                         or digest != active.path_digests[path]
                     )
@@ -1739,7 +1749,7 @@ class CoalescingReviewScheduler:
                     priority_paths.update(
                         set(active.path_digests) - changed_overlap
                     )
-                    if agent_session_id is None:
+                    if agent_session_id is None and not active_route_changed:
                         agent_session_id = active.agent_session_id
 
             if not incoming:
