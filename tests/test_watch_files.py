@@ -1704,6 +1704,76 @@ class WatchFilesTests(unittest.TestCase):
             [marker_one, marker_two],
         )
 
+    def test_pending_follow_up_adopts_new_route_generation(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        spool = mock.Mock()
+        spool.capture_session_generation.side_effect = [1, 1, 2]
+        marker_active = Path("/private/spool/in-flight/active.json")
+        marker_old = Path("/private/spool/in-flight/old-pending.json")
+        marker_new = Path("/private/spool/in-flight/new-pending.json")
+        spool.begin_review.side_effect = [marker_active, marker_old, marker_new]
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/hot.py")
+
+        def hint(name: str, agent_session_id: str) -> watch_files.FlushHint:
+            path = Path(f"/private/spool/flush-hints/{name}.json")
+            return watch_files.FlushHint(
+                agent_session_id,
+                1,
+                path,
+                (watch_files.ReviewedFile("hot.py", "0" * 64, 100),),
+                (path,),
+            )
+
+        scheduler.submit(
+            watch_files.TriggeredBatch(
+                {source}, hint("active", "old-session"), set(), 1
+            ),
+            path_digests={source: "one"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch(
+                {source}, hint("old-pending", "old-session"), set(), 1
+            ),
+            path_digests={source: "two"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+        scheduler.submit(
+            watch_files.TriggeredBatch(
+                {source}, hint("new-pending", "new-session"), set(), 1
+            ),
+            path_digests={source: "three"},
+            first_observed_at=3,
+            batch_flushed_at=4,
+        )
+
+        release_first.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].path_digests[source], "three")
+        self.assertEqual(calls[1].agent_session_id, "new-session")
+        self.assertEqual(calls[1].session_generation, 2)
+        self.assertCountEqual(
+            [call.args[0] for call in spool.finish_review.call_args_list],
+            [marker_active, marker_old, marker_new],
+        )
+
     def test_fairness_split_marker_failure_does_not_kill_worker(self) -> None:
         first_started = threading.Event()
         release_first = threading.Event()

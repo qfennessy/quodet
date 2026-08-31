@@ -1687,6 +1687,7 @@ class CoalescingReviewScheduler:
         superseded_now = False
         priority_paths: set[Path] = set()
         marker: Path | None = None
+        stale_markers: list[Path] = []
         agent_session_id = (
             triggered.flush_hint.agent_session_id
             if triggered.flush_hint is not None
@@ -1779,10 +1780,25 @@ class CoalescingReviewScheduler:
             )
             pending.coalesced_events += duplicate_events
             pending.priority_paths.update(priority_paths & set(incoming))
-            if pending.agent_session_id is None and agent_session_id is not None:
+            route_changed = (
+                pending.session_generation != session_generation
+                or (
+                    agent_session_id is not None
+                    and pending.agent_session_id is not None
+                    and pending.agent_session_id != agent_session_id
+                )
+            )
+            if route_changed:
+                if pending.marker is not None:
+                    stale_markers.append(pending.marker)
+                    pending.marker = None
                 pending.agent_session_id = agent_session_id
-            if pending.session_generation is None:
                 pending.session_generation = session_generation
+            else:
+                if agent_session_id is not None:
+                    pending.agent_session_id = agent_session_id
+                if session_generation is not None:
+                    pending.session_generation = session_generation
 
             if self._spool_sink is not None and agent_session_id is not None:
                 marker = self._spool_sink.begin_review(
@@ -1798,6 +1814,9 @@ class CoalescingReviewScheduler:
 
         if marker is not None and self._spool_sink is not None:
             self._spool_sink.finish_review(marker)
+        if self._spool_sink is not None:
+            for stale_marker in stale_markers:
+                self._spool_sink.finish_review(stale_marker)
         if superseded_now:
             if self._output_mode == "json":
                 _print_operational_event(
