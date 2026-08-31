@@ -17,9 +17,9 @@ import tempfile
 import time
 import threading
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from feedback import (
     CompositeSink,
@@ -74,10 +74,11 @@ except ImportError:
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_DEBOUNCE_SECONDS = 3.0
-DEFAULT_REVIEW_TIMEOUT_SECONDS = 60.0
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 180.0
 OUTPUT_MODE_ENVIRONMENT_VARIABLE = "QUODET_OUTPUT"
 PROMPT_REVISION = "quodet-review-v3"
 REVIEW_SCHEMA_REVISION = "quodet-findings-v3"
+OPERATIONAL_EVENT_SCHEMA_REVISION = "quodet-operational-event-v1"
 DEFAULT_PROMPT = """Review the supplied changed files for real defects.
 
 Analyze each supplied file as a separate file. For every candidate finding,
@@ -272,6 +273,10 @@ class BoundedProcessResult:
     output_exceeded: bool = False
 
 
+class ReviewSuperseded(RuntimeError):
+    """An obsolete provider process was stopped before it could publish."""
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -339,7 +344,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_float,
         default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
         metavar="SECONDS",
-        help="stop a stalled provider review after this long (default: 60)",
+        help="stop a stalled provider review after this long (default: 180)",
     )
     parser.add_argument(
         "--exclude",
@@ -863,6 +868,7 @@ def run_bounded_command(
     cwd: Path,
     timeout: float,
     output_limit: int,
+    cancel_event: threading.Event | None = None,
 ) -> BoundedProcessResult:
     """Run a command without buffering unbounded provider output in memory."""
     with (
@@ -878,6 +884,10 @@ def run_bounded_command(
         deadline = time.monotonic() + timeout
         output_exceeded = False
         while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                process.kill()
+                process.wait()
+                raise ReviewSuperseded
             if (
                 os.fstat(stdout_file.fileno()).st_size > output_limit
                 or os.fstat(stderr_file.fileno()).st_size > output_limit
@@ -949,7 +959,15 @@ def review_files(
     agent_session_id: str | None = None,
     model_run_config: ModelRunConfig | None = None,
     lifecycle_tracker: FindingLifecycleTracker | None = None,
+    cancel_event: threading.Event | None = None,
+    publication_guard: Callable[[Callable[[], None]], bool] | None = None,
+    review_marker_managed_externally: bool = False,
+    coalesced_events: int = 0,
+    snapshot_observer: Callable[[Sequence[SourceSnapshot]], None] | None = None,
+    output_mode: str = DEFAULT_OUTPUT_MODE,
 ) -> ReviewBatch | None:
+    if cancel_event is not None and cancel_event.is_set():
+        return None
     attachments = collect_attachments(
         paths,
         root=root,
@@ -962,6 +980,8 @@ def review_files(
     snapshots = snapshot_attachments(attachments, root=root, max_bytes=max_bytes)
     if not snapshots:
         return None
+    if snapshot_observer is not None:
+        snapshot_observer(snapshots)
 
     batch_id = str(uuid.uuid4())
     with tempfile.TemporaryDirectory(prefix="quodet-sanitized-") as temporary_directory:
@@ -991,8 +1011,17 @@ def review_files(
                 redactions=redactions,
                 batch_id=batch_id,
             )
-            published_batch = replace(batch, published_at=time.time())
-            (sink or ConsoleSink()).publish(published_batch)
+            published: list[ReviewBatch] = []
+
+            def publish_excluded_summary() -> None:
+                published_batch = replace(batch, published_at=time.time())
+                (sink or ConsoleSink()).publish(published_batch)
+                published.append(published_batch)
+
+            if publication_guard is not None:
+                publication_guard(publish_excluded_summary)
+            elif cancel_event is None or not cancel_event.is_set():
+                publish_excluded_summary()
             if review_coordinator is not None:
                 review_coordinator.retire_reviewed_flush_hints(
                     tuple(
@@ -1004,7 +1033,7 @@ def review_files(
                         for snapshot in snapshots
                     )
                 )
-            return published_batch
+            return published[0] if published else None
 
         provider_path_map = provider_path_mapping(sanitized_batch.snapshots)
         schema_json = response_schema_json(tuple(provider_path_map))
@@ -1015,7 +1044,12 @@ def review_files(
         ]
         print(
             f"\n{short_batch_id(batch_id)} reviewing {len(labels)} changed "
-            f"file(s): {', '.join(labels)}",
+            f"file(s): {', '.join(labels)}"
+            + (
+                f" ({coalesced_events} rewrite events coalesced)"
+                if coalesced_events
+                else ""
+            ),
             file=sys.stderr,
             flush=True,
         )
@@ -1047,7 +1081,7 @@ def review_files(
                 agent_session_id=agent_session_id,
                 review_timeout=review_timeout,
             )
-            if review_coordinator is not None
+            if review_coordinator is not None and not review_marker_managed_externally
             else None
         )
         try:
@@ -1073,6 +1107,9 @@ def review_files(
                 log=log,
                 batch_id=batch_id,
                 lifecycle_tracker=lifecycle_tracker,
+                cancel_event=cancel_event,
+                publication_guard=publication_guard,
+                output_mode=output_mode,
             )
         finally:
             if review_coordinator is not None:
@@ -1086,7 +1123,8 @@ def review_files(
                         for snapshot in snapshots
                     )
                 )
-                review_coordinator.finish_review(marker)
+                if not review_marker_managed_externally:
+                    review_coordinator.finish_review(marker)
 
 
 def _execute_review_command(
@@ -1112,12 +1150,17 @@ def _execute_review_command(
     log: bool,
     batch_id: str,
     lifecycle_tracker: FindingLifecycleTracker | None,
+    cancel_event: threading.Event | None,
+    publication_guard: Callable[[Callable[[], None]], bool] | None,
+    output_mode: str,
 ) -> ReviewBatch | None:
     provider_started_at = time.time()
     provider_started = time.monotonic()
     model_result = None
     runtime_attestation = None
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ReviewSuperseded
         if model_run_config is not None:
             from evals.agent_changes.live_eval import attest_runtime
 
@@ -1145,6 +1188,8 @@ def _execute_review_command(
                 stderr=model_result.stderr,
                 output_exceeded=model_result.status == "output-limit",
             )
+            if cancel_event is not None and cancel_event.is_set():
+                raise ReviewSuperseded
         else:
             assert command is not None
             result = run_bounded_command(
@@ -1152,7 +1197,34 @@ def _execute_review_command(
                 cwd=root,
                 timeout=review_timeout,
                 output_limit=MAX_PROVIDER_OUTPUT_BYTES,
+                cancel_event=cancel_event,
             )
+    except ReviewSuperseded:
+        _report_failed_review_redactions(redactions)
+        if evaluation_events:
+            print(json.dumps({"quodet_evaluation_event": {
+                "status": "superseded",
+                "returncode": None,
+                "raw_response": None,
+                "stderr": None,
+            }}), flush=True)
+        elif output_mode == "json":
+            _print_operational_event(
+                "superseded",
+                batch_id=batch_id,
+                elapsed_ms=max(
+                    0.0,
+                    (time.time() - (first_observed_at or time.time())) * 1_000,
+                ),
+            )
+        else:
+            elapsed = max(0.0, time.time() - (first_observed_at or time.time()))
+            print(
+                f"{short_batch_id(batch_id)} superseded after {elapsed:.2f}s; "
+                "obsolete provider result discarded",
+                file=sys.stderr,
+            )
+        return None
     except subprocess.TimeoutExpired as error:
         _report_failed_review_redactions(redactions)
         if evaluation_events:
@@ -1168,12 +1240,39 @@ def _execute_review_command(
                 "raw_response": safe_stdout or None,
                 "stderr": safe_stderr or None,
             }}), flush=True)
+        elif output_mode == "json":
+            _print_operational_event(
+                "timeout",
+                batch_id=batch_id,
+                queue_ms=max(
+                    0.0,
+                    (
+                        provider_started_at
+                        - (batch_flushed_at or provider_started_at)
+                    )
+                    * 1_000,
+                ),
+                provider_ms=(time.monotonic() - provider_started) * 1_000,
+            )
         else:
             print(
                 f"llm review timed out after {review_timeout:g} seconds",
                 file=sys.stderr,
             )
-            _print_failed_review(batch_id, first_observed_at, "provider timed out")
+            _print_failed_review(
+                batch_id,
+                first_observed_at,
+                "provider timed out",
+                queue_ms=max(
+                    0.0,
+                    (
+                        provider_started_at
+                        - (batch_flushed_at or provider_started_at)
+                    )
+                    * 1_000,
+                ),
+                provider_ms=(time.monotonic() - provider_started) * 1_000,
+            )
         return None
 
     except (OSError, ValueError) as error:
@@ -1319,28 +1418,139 @@ def _execute_review_command(
         _print_failed_review(batch_id, first_observed_at, "provider response invalid")
         return None
 
+    if cancel_event is not None and cancel_event.is_set():
+        if output_mode == "json":
+            _print_operational_event("superseded", batch_id=batch_id)
+        else:
+            print(
+                f"{short_batch_id(batch_id)} superseded; obsolete provider result "
+                "discarded",
+                file=sys.stderr,
+            )
+        return None
+
     fresh_batch = fresh_findings(batch)
     if len(fresh_batch.findings) != len(batch.findings):
         print(
             "Discarded stale finding(s) because source changed during review.",
             file=sys.stderr,
         )
-    if lifecycle_tracker is not None:
-        fresh_batch = lifecycle_tracker.classify(fresh_batch)
-    published_batch = replace(fresh_batch, published_at=time.time())
-    (sink or ConsoleSink()).publish(published_batch)
-    return published_batch
+    published: list[ReviewBatch] = []
+
+    def publish() -> None:
+        classified = (
+            lifecycle_tracker.classify(fresh_batch)
+            if lifecycle_tracker is not None
+            else fresh_batch
+        )
+        published_batch = replace(classified, published_at=time.time())
+        (sink or ConsoleSink()).publish(published_batch)
+        published.append(published_batch)
+
+    if publication_guard is not None:
+        if not publication_guard(publish):
+            if output_mode == "json":
+                _print_operational_event("superseded", batch_id=batch_id)
+            else:
+                print(
+                    f"{short_batch_id(batch_id)} superseded; obsolete provider "
+                    "result discarded",
+                    file=sys.stderr,
+                )
+            return None
+    else:
+        publish()
+    return published[0]
 
 
 def _print_failed_review(
-    batch_id: str, first_observed_at: float | None, reason: str
+    batch_id: str,
+    first_observed_at: float | None,
+    reason: str,
+    *,
+    queue_ms: float | None = None,
+    provider_ms: float | None = None,
 ) -> None:
     started_at = first_observed_at or time.time()
     elapsed = max(0.0, time.time() - started_at)
+    stages = ""
+    if queue_ms is not None or provider_ms is not None:
+        stages = (
+            f" [queue {queue_ms or 0.0:.1f}ms, "
+            f"provider {provider_ms or 0.0:.1f}ms]"
+        )
     print(
-        f"{short_batch_id(batch_id)} failed after {elapsed:.2f}s: {reason}",
+        f"{short_batch_id(batch_id)} failed after {elapsed:.2f}s: "
+        f"{reason}{stages}",
         file=sys.stderr,
     )
+
+
+def _print_operational_event(status: str, **details: object) -> None:
+    """Write one source-free machine diagnostic without polluting JSON stdout."""
+    print(
+        json.dumps(
+            {
+                "schema_version": OPERATIONAL_EVENT_SCHEMA_REVISION,
+                "status": status,
+                **details,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+
+
+class LatestPathQueue:
+    """A thread-safe FIFO with one bounded entry per canonical path."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: dict[Path, int] = {}
+
+    def put(self, path: Path) -> None:
+        with self._condition:
+            self._pending[path] = self._pending.get(path, 0) + 1
+            self._condition.notify()
+
+    def get_with_count(self, timeout: float | None = None) -> tuple[Path, int]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while not self._pending:
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._condition.wait(remaining)
+            path = next(iter(self._pending))
+            return path, self._pending.pop(path)
+
+    def get(self, timeout: float | None = None) -> Path:
+        return self.get_with_count(timeout)[0]
+
+    def get_nowait(self) -> Path:
+        return self.get(timeout=0)
+
+    def empty(self) -> bool:
+        with self._condition:
+            return not self._pending
+
+    def qsize(self) -> int:
+        with self._condition:
+            return len(self._pending)
+
+
+def _get_changed_path(
+    changes: queue.Queue[Path] | LatestPathQueue,
+    timeout: float | None = None,
+) -> tuple[Path, int]:
+    if isinstance(changes, LatestPathQueue):
+        return changes.get_with_count(timeout)
+    return changes.get(timeout=timeout), 1
 
 
 class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -1348,7 +1558,7 @@ class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
 
     def __init__(
         self,
-        changes: queue.Queue[Path],
+        changes: queue.Queue[Path] | LatestPathQueue,
         *,
         root: Path,
         exclude_patterns: Sequence[str],
@@ -1393,7 +1603,9 @@ class ChangeHandler(FileSystemEventHandler):  # type: ignore[misc]
         self.changes.put(changed_path)
 
 
-def next_batch(changes: queue.Queue[Path], debounce: float) -> set[Path]:
+def next_batch(
+    changes: queue.Queue[Path] | LatestPathQueue, debounce: float
+) -> set[Path]:
     """Block for one change, then collect changes until the quiet period expires."""
     return next_triggered_batch(changes, debounce).paths
 
@@ -1403,6 +1615,357 @@ class TriggeredBatch:
     paths: set[Path]
     flush_hint: FlushHint | None
     suppressed_paths: set[Path]
+    event_count: int = 0
+
+
+@dataclass
+class ScheduledReview:
+    """One immutable-at-dispatch review plus its cancellation boundary."""
+
+    path_digests: dict[Path, str | None]
+    first_observed_at: float
+    batch_flushed_at: float
+    agent_session_id: str | None
+    session_generation: int | None
+    marker: Path | None
+    priority_paths: set[Path] = dataclass_field(default_factory=set)
+    coalesced_events: int = 0
+    cancel_event: threading.Event = dataclass_field(default_factory=threading.Event)
+    superseded: bool = False
+    finishing: bool = False
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return tuple(sorted(self.path_digests))
+
+
+class CoalescingReviewScheduler:
+    """Run one provider call at a time and retain only one latest follow-up."""
+
+    def __init__(
+        self,
+        run_review: Callable[[ScheduledReview], None],
+        *,
+        review_timeout: float,
+        spool_sink: SpoolSink | None = None,
+        refresh_digests: (
+            Callable[[Sequence[Path]], Mapping[Path, str | None]] | None
+        ) = None,
+        output_mode: str = DEFAULT_OUTPUT_MODE,
+    ) -> None:
+        self._run_review = run_review
+        self._review_timeout = review_timeout
+        self._spool_sink = spool_sink
+        self._refresh_digests = refresh_digests
+        self._output_mode = output_mode
+        self._condition = threading.Condition()
+        self._pending: ScheduledReview | None = None
+        self._active: ScheduledReview | None = None
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._worker_main,
+            name="quodet-provider-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        triggered: TriggeredBatch,
+        *,
+        path_digests: Mapping[Path, str | None],
+        first_observed_at: float,
+        batch_flushed_at: float,
+    ) -> None:
+        incoming = {
+            path: path_digests.get(path)
+            for path in triggered.paths
+        }
+        if not incoming:
+            return
+        duplicate_events = max(0, triggered.event_count - len(incoming))
+        superseded_now = False
+        priority_paths: set[Path] = set()
+        marker: Path | None = None
+        agent_session_id = (
+            triggered.flush_hint.agent_session_id
+            if triggered.flush_hint is not None
+            else None
+        )
+        session_generation = (
+            self._spool_sink.capture_session_generation()
+            if self._spool_sink is not None
+            else None
+        )
+
+        with self._condition:
+            if self._stopping:
+                return
+            active = (
+                self._active
+                if self._active is not None and not self._active.finishing
+                else None
+            )
+            if active is not None:
+                priority_paths.update(set(incoming) - set(active.path_digests))
+                unchanged_overlap = {
+                    path
+                    for path, digest in incoming.items()
+                    if path in active.path_digests
+                    and digest is not None
+                    and digest == active.path_digests[path]
+                }
+                changed_overlap = {
+                    path
+                    for path, digest in incoming.items()
+                    if path in active.path_digests
+                    and (
+                        digest is None
+                        or active.path_digests[path] is None
+                        or digest != active.path_digests[path]
+                    )
+                }
+                duplicate_events += len(unchanged_overlap)
+                for path in unchanged_overlap:
+                    incoming.pop(path)
+                if changed_overlap:
+                    if not active.superseded:
+                        active.superseded = True
+                        active.cancel_event.set()
+                        superseded_now = True
+                    for path, digest in active.path_digests.items():
+                        incoming.setdefault(path, digest)
+                    priority_paths.update(
+                        set(active.path_digests) - changed_overlap
+                    )
+                    if agent_session_id is None:
+                        agent_session_id = active.agent_session_id
+
+            if not incoming:
+                if self._spool_sink is not None and agent_session_id is not None:
+                    marker = self._spool_sink.begin_review(
+                        agent_session_id=agent_session_id,
+                        review_timeout=self._review_timeout,
+                        flush_hint=triggered.flush_hint,
+                    )
+                    if active is not None and active.marker is None:
+                        active.marker = marker
+                        active.agent_session_id = agent_session_id
+                        if active.session_generation is None:
+                            active.session_generation = session_generation
+                    else:
+                        self._spool_sink.finish_review(marker)
+                return
+
+            if self._pending is None:
+                self._pending = ScheduledReview(
+                    path_digests={},
+                    first_observed_at=first_observed_at,
+                    batch_flushed_at=batch_flushed_at,
+                    agent_session_id=agent_session_id,
+                    session_generation=session_generation,
+                    marker=None,
+                )
+            pending = self._pending
+            for path, digest in incoming.items():
+                if path in pending.path_digests and pending.path_digests[path] == digest:
+                    duplicate_events += 1
+                pending.path_digests[path] = digest
+            pending.first_observed_at = min(
+                pending.first_observed_at, first_observed_at
+            )
+            pending.batch_flushed_at = max(
+                pending.batch_flushed_at, batch_flushed_at
+            )
+            pending.coalesced_events += duplicate_events
+            pending.priority_paths.update(priority_paths & set(incoming))
+            if pending.agent_session_id is None and agent_session_id is not None:
+                pending.agent_session_id = agent_session_id
+            if pending.session_generation is None:
+                pending.session_generation = session_generation
+
+            if self._spool_sink is not None and agent_session_id is not None:
+                marker = self._spool_sink.begin_review(
+                    agent_session_id=agent_session_id,
+                    # A scheduled follow-up can wait behind one bounded active call.
+                    review_timeout=(2 * self._review_timeout) + 5.0,
+                    flush_hint=triggered.flush_hint,
+                )
+                if pending.marker is None:
+                    pending.marker = marker
+                    marker = None
+            self._condition.notify()
+
+        if marker is not None and self._spool_sink is not None:
+            self._spool_sink.finish_review(marker)
+        if superseded_now:
+            if self._output_mode == "json":
+                _print_operational_event(
+                    "superseded",
+                    reviewed_file_count=len(incoming),
+                    coalesced_events=duplicate_events,
+                    follow_up_scheduled=True,
+                )
+            else:
+                print(
+                    "Superseded active review; cancelled obsolete work and queued "
+                    f"one latest follow-up ({len(incoming)} files, "
+                    f"{duplicate_events} coalesced events).",
+                    file=sys.stderr,
+                )
+
+    def publish_if_current(
+        self, work: ScheduledReview, publish: Callable[[], None]
+    ) -> bool:
+        """Serialize the final supersession check with event submission."""
+        with self._condition:
+            if (
+                self._stopping
+                or self._active is not work
+                or work.cancel_event.is_set()
+            ):
+                return False
+            publish()
+            return True
+
+    def record_snapshots(
+        self, work: ScheduledReview, snapshots: Sequence[SourceSnapshot]
+    ) -> None:
+        """Bind active generations to the exact bytes handed to the provider."""
+        with self._condition:
+            if self._active is not work or work.cancel_event.is_set():
+                return
+            for snapshot in snapshots:
+                work.path_digests[snapshot.path] = snapshot.sha256
+
+    def state(self) -> tuple[int, int, bool]:
+        """Return bounded source-free state for diagnostics and tests."""
+        with self._condition:
+            return (
+                len(self._active.path_digests) if self._active is not None else 0,
+                len(self._pending.path_digests) if self._pending is not None else 0,
+                bool(self._active and self._active.superseded),
+            )
+
+    def wait_idle(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active is not None or self._pending is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def close(self, *, join_timeout: float = 1.0) -> bool:
+        markers: list[Path] = []
+        with self._condition:
+            self._stopping = True
+            if self._active is not None:
+                self._active.cancel_event.set()
+                if self._active.marker is not None:
+                    markers.append(self._active.marker)
+                    self._active.marker = None
+            if self._pending is not None:
+                self._pending.cancel_event.set()
+                if self._pending.marker is not None:
+                    markers.append(self._pending.marker)
+                self._pending = None
+            self._condition.notify_all()
+        if self._spool_sink is not None:
+            for marker in markers:
+                self._spool_sink.finish_review(marker)
+        self._thread.join(join_timeout)
+        return not self._thread.is_alive()
+
+    def _take_pending_locked(self) -> ScheduledReview:
+        pending = self._pending
+        assert pending is not None
+        priority = pending.priority_paths & set(pending.path_digests)
+        if priority and priority != set(pending.path_digests):
+            # Keep the route-owned marker on the remainder rather than doing
+            # filesystem I/O from the provider worker to mint a replacement.
+            # The marker already has enough lifetime for an active call plus
+            # one follow-up, and it continues to represent the aggregate
+            # in-flight review while the fair-priority slice runs first.
+            work = ScheduledReview(
+                path_digests={
+                    path: pending.path_digests.pop(path)
+                    for path in sorted(priority)
+                },
+                first_observed_at=pending.first_observed_at,
+                batch_flushed_at=pending.batch_flushed_at,
+                agent_session_id=pending.agent_session_id,
+                session_generation=pending.session_generation,
+                marker=None,
+            )
+            pending.priority_paths.difference_update(priority)
+            return work
+        self._pending = None
+        return pending
+
+    def _worker_main(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopping:
+                    self._condition.wait()
+                if self._stopping:
+                    return
+                work = self._take_pending_locked()
+                pending = self._pending
+                if (
+                    pending is not None
+                    and pending.marker is not None
+                    and self._spool_sink is not None
+                    and pending.agent_session_id is not None
+                ):
+                    try:
+                        replacement_marker = self._spool_sink.begin_review(
+                            agent_session_id=pending.agent_session_id,
+                            # The renewed marker starts after the previous
+                            # active review and covers the fair-priority slice
+                            # plus the one retained remainder.
+                            review_timeout=(2 * self._review_timeout) + 5.0,
+                        )
+                    except Exception as error:
+                        safe_error, _ = redact_sensitive_values(str(error))
+                        print(
+                            "Could not renew in-flight review marker; "
+                            "provider worker will continue: "
+                            f"{type(error).__name__}: {safe_error[:500]}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        if replacement_marker is not None:
+                            work.marker = pending.marker
+                            pending.marker = replacement_marker
+                self._active = work
+            assert work is not None
+            try:
+                if self._refresh_digests is not None:
+                    refreshed = self._refresh_digests(work.paths)
+                    with self._condition:
+                        if self._active is work and not work.cancel_event.is_set():
+                            work.path_digests.update(refreshed)
+                self._run_review(work)
+            except Exception as error:
+                safe_error, _ = redact_sensitive_values(str(error))
+                print(
+                    f"Review worker failed safely: {type(error).__name__}: "
+                    f"{safe_error[:500]}",
+                    file=sys.stderr,
+                )
+            finally:
+                with self._condition:
+                    work.finishing = True
+                    marker = work.marker
+                    work.marker = None
+                if marker is not None and self._spool_sink is not None:
+                    self._spool_sink.finish_review(marker)
+                with self._condition:
+                    if self._active is work:
+                        self._active = None
+                    self._condition.notify_all()
 
 
 def consume_first_observed_at(
@@ -1470,7 +2033,7 @@ class MaterializedPathSuppression:
 
 
 def next_triggered_batch(
-    changes: queue.Queue[Path],
+    changes: queue.Queue[Path] | LatestPathQueue,
     debounce: float,
     *,
     hint_source: SpoolSink | None = None,
@@ -1481,6 +2044,7 @@ def next_triggered_batch(
 ) -> TriggeredBatch:
     """Collect a filesystem batch or a bounded group of direct agent edits."""
     suppressed_paths: set[Path] = set()
+    event_count = 0
 
     def materialize_hint(hint: FlushHint, batch: set[Path]) -> TriggeredBatch:
         hinted_paths = {
@@ -1497,6 +2061,7 @@ def next_triggered_batch(
             hinted_paths,
             hint,
             suppressed_paths,
+            max(event_count, len(hinted_paths)),
         )
 
     while True:
@@ -1509,17 +2074,20 @@ def next_triggered_batch(
             if hint is not None:
                 return materialize_hint(hint, set())
             try:
-                first = changes.get(timeout=0.025)
+                first, observed_events = _get_changed_path(changes, timeout=0.025)
             except queue.Empty:
                 continue
         else:
-            first = changes.get()
+            first, observed_events = _get_changed_path(changes)
         if suppression is not None and suppression.matches(first):
             suppressed_paths.add(first)
+            event_count += observed_events
             continue
         batch = {first}
+        event_count += observed_events
         break
     deadline = time.monotonic() + debounce
+    maximum_deadline = time.monotonic() + (2 * debounce)
 
     while True:
         hint = (
@@ -1534,12 +2102,13 @@ def next_triggered_batch(
         )
         if hint is not None:
             return materialize_hint(hint, batch)
-        remaining = deadline - time.monotonic()
+        remaining = min(deadline, maximum_deadline) - time.monotonic()
         if remaining <= 0:
-            return TriggeredBatch(batch, None, suppressed_paths)
+            return TriggeredBatch(batch, None, suppressed_paths, event_count)
         try:
             wait = min(remaining, 0.025) if hint_source is not None else remaining
-            path = changes.get(timeout=wait)
+            path, observed_events = _get_changed_path(changes, timeout=wait)
+            event_count += observed_events
             if suppression is not None and suppression.matches(path):
                 suppressed_paths.add(path)
             else:
@@ -1547,7 +2116,7 @@ def next_triggered_batch(
                 deadline = time.monotonic() + debounce
         except queue.Empty:
             if hint_source is None:
-                return TriggeredBatch(batch, None, suppressed_paths)
+                return TriggeredBatch(batch, None, suppressed_paths, event_count)
 
 
 def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
@@ -1555,6 +2124,27 @@ def bounded_review_batches(paths: Iterable[Path]) -> Iterable[tuple[Path, ...]]:
     ordered = sorted(set(paths))
     for index in range(0, len(ordered), MAX_REVIEWED_FILES):
         yield tuple(ordered[index : index + MAX_REVIEWED_FILES])
+
+
+def current_path_digests(
+    paths: Iterable[Path], *, root: Path, max_bytes: int
+) -> dict[Path, str | None]:
+    """Read source-safe digests used only to collapse duplicate notifications."""
+    digests: dict[Path, str | None] = {}
+    for path in set(paths):
+        canonical = path.resolve(strict=False)
+        relative = relative_to_root(canonical, root)
+        if relative is None:
+            continue
+        try:
+            digests[canonical] = _sha256_inside_root(
+                root, relative.as_posix(), max_bytes=max_bytes
+            )
+        except (OSError, ValueError):
+            # A deletion or unreadable transition is still a real generation.
+            # Never equate two unknown generations as identical.
+            digests[canonical] = None
+    return digests
 
 
 def _listed_model_entries(output: str) -> dict[str, str]:
@@ -1708,7 +2298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.spool_dir, root=root, session_id=args.session_id
         )
         sink = CompositeSink((sink, spool_sink))
-    changes: queue.Queue[Path] = queue.Queue()
+    changes = LatestPathQueue()
     observed_at: dict[Path, float] = {}
     observed_at_lock = threading.Lock()
     observer_class = PollingObserver if args.poll else Observer
@@ -1732,6 +2322,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         root, ttl_seconds=min(5.0, max(1.0, args.debounce))
     )
     lifecycle_tracker = FindingLifecycleTracker()
+
+    scheduler: CoalescingReviewScheduler
+
+    def run_scheduled_review(work: ScheduledReview) -> None:
+        measured_debounce_ms = max(
+            0.0, (work.batch_flushed_at - work.first_observed_at) * 1_000
+        )
+        for review_batch in bounded_review_batches(work.paths):
+            if work.cancel_event.is_set():
+                break
+            review_files(
+                review_batch,
+                root=root,
+                exclude_patterns=args.exclude,
+                max_bytes=args.max_bytes,
+                model=args.model,
+                prompt=args.prompt,
+                log=args.log,
+                review_timeout=args.review_timeout,
+                reasoning_effort=resolve_reasoning_effort(
+                    args.model, args.reasoning_effort
+                ),
+                evaluation_events=args.evaluation_events,
+                sink=sink,
+                session_id=args.session_id,
+                debounce_ms=measured_debounce_ms,
+                first_observed_at=work.first_observed_at,
+                session_generation=work.session_generation,
+                batch_flushed_at=work.batch_flushed_at,
+                review_coordinator=spool_sink,
+                agent_session_id=work.agent_session_id,
+                model_run_config=model_run_config,
+                lifecycle_tracker=lifecycle_tracker,
+                cancel_event=work.cancel_event,
+                publication_guard=lambda publish: scheduler.publish_if_current(
+                    work, publish
+                ),
+                review_marker_managed_externally=True,
+                coalesced_events=work.coalesced_events,
+                snapshot_observer=lambda snapshots: scheduler.record_snapshots(
+                    work, snapshots
+                ),
+                output_mode=args.output,
+            )
+
+    scheduler = CoalescingReviewScheduler(
+        run_scheduled_review,
+        review_timeout=args.review_timeout,
+        spool_sink=spool_sink,
+        refresh_digests=lambda paths: current_path_digests(
+            paths, root=root, max_bytes=args.max_bytes
+        ),
+        output_mode=args.output,
+    )
     try:
         while True:
             triggered = next_triggered_batch(
@@ -1751,60 +2395,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     observed_at,
                     fallback=batch_flushed_at,
                 )
-            measured_debounce_ms = max(
-                0.0, (batch_flushed_at - first_observed_at) * 1_000
+            scheduler.submit(
+                triggered,
+                path_digests=current_path_digests(
+                    event_batch, root=root, max_bytes=args.max_bytes
+                ),
+                first_observed_at=first_observed_at,
+                batch_flushed_at=batch_flushed_at,
             )
-            agent_session_id = (
-                triggered.flush_hint.agent_session_id
-                if triggered.flush_hint is not None
-                else None
-            )
-            marker = (
-                spool_sink.begin_review(
-                    agent_session_id=agent_session_id,
-                    review_timeout=args.review_timeout,
-                    flush_hint=triggered.flush_hint,
-                )
-                if spool_sink is not None and triggered.flush_hint is not None
-                else None
-            )
-            try:
-                for review_batch in bounded_review_batches(event_batch):
-                    review_files(
-                        review_batch,
-                        root=root,
-                        exclude_patterns=args.exclude,
-                        max_bytes=args.max_bytes,
-                        model=args.model,
-                        prompt=args.prompt,
-                        log=args.log,
-                        review_timeout=args.review_timeout,
-                        reasoning_effort=resolve_reasoning_effort(
-                            args.model, args.reasoning_effort
-                        ),
-                        evaluation_events=args.evaluation_events,
-                        sink=sink,
-                        session_id=args.session_id,
-                        debounce_ms=measured_debounce_ms,
-                        first_observed_at=first_observed_at,
-                        batch_flushed_at=batch_flushed_at,
-                        review_coordinator=spool_sink,
-                        agent_session_id=agent_session_id,
-                        model_run_config=model_run_config,
-                        lifecycle_tracker=lifecycle_tracker,
-                    )
-            finally:
-                if triggered.flush_hint is not None:
-                    suppression.record(triggered.flush_hint)
-                if spool_sink is not None:
-                    spool_sink.finish_review(marker)
     except KeyboardInterrupt:
         print("\nStopping watcher.", file=sys.stderr)
     finally:
+        worker_stopped = scheduler.close()
         observer.stop()
         observer.join()
-        if spool_sink is not None:
+        if spool_sink is not None and worker_stopped:
             spool_sink.close()
+        elif not worker_stopped:
+            print(
+                "Provider shutdown is still pending; its result is superseded "
+                "and cannot be published.",
+                file=sys.stderr,
+            )
     return 0
 
 

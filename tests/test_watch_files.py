@@ -10,6 +10,7 @@ import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -268,7 +269,7 @@ class WatchFilesTests(unittest.TestCase):
         self.assertEqual(args.debounce, 3.0)
         self.assertEqual(args.agent_edit_max_age, 1.0)
         self.assertEqual(args.agent_turn_max_age, 3.0)
-        self.assertEqual(args.review_timeout, 60.0)
+        self.assertEqual(args.review_timeout, 180.0)
         self.assertEqual(args.model, "gpt-5.6-luna")
         self.assertEqual(
             watch_files.resolve_reasoning_effort(args.model, args.reasoning_effort),
@@ -282,6 +283,48 @@ class WatchFilesTests(unittest.TestCase):
             watch_files.next_batch(changes, debounce=0.001),
             {Path("src/service.py"), Path("tests/test_service.py")},
         )
+
+    def test_continuous_filesystem_writes_flush_at_bounded_maximum_age(self) -> None:
+        class FakeClock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        class ContinuouslyBusyQueue:
+            def __init__(self, clock: FakeClock) -> None:
+                self.clock = clock
+                self.calls = 0
+
+            def get(self, timeout: float | None = None) -> Path:
+                self.calls += 1
+                if timeout is not None:
+                    self.clock.now += 0.6
+                return Path("src/hot.py")
+
+        clock = FakeClock()
+        changes = ContinuouslyBusyQueue(clock)
+        with mock.patch("watch_files.time.monotonic", side_effect=clock.monotonic):
+            batch = watch_files.next_triggered_batch(
+                changes, debounce=1.0
+            )
+
+        self.assertEqual(batch.paths, {Path("src/hot.py")})
+        self.assertGreater(batch.event_count, 1)
+        self.assertLessEqual(clock.now, 2.4)
+
+    def test_latest_path_queue_bounds_duplicate_events_before_debounce(self) -> None:
+        changes = watch_files.LatestPathQueue()
+        hot = Path("/project/hot.py")
+        stable = Path("/project/stable.py")
+        for _ in range(10_000):
+            changes.put(hot)
+        changes.put(stable)
+
+        self.assertEqual(changes.qsize(), 2)
+        self.assertEqual(changes.get_with_count(), (hot, 10_000))
+        self.assertEqual(changes.get_with_count(), (stable, 1))
+        self.assertTrue(changes.empty())
 
     def test_debounce_must_be_finite_and_positive(self) -> None:
         for value in ("0", "-1", "nan", "inf"):
@@ -1185,6 +1228,41 @@ class WatchFilesTests(unittest.TestCase):
             ):
                 self.assertIsNone(watch_files.review_files(**common))
 
+    def test_json_mode_emits_structured_timeout_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            errors = io.StringIO()
+            with (
+                mock.patch(
+                    "watch_files.run_bounded_command",
+                    side_effect=subprocess.TimeoutExpired("llm", 60),
+                ),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="test-model",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort=None,
+                    output_mode="json",
+                )
+
+            self.assertIsNone(result)
+            event = json.loads(errors.getvalue().splitlines()[-1])
+            self.assertEqual(
+                event["schema_version"], "quodet-operational-event-v1"
+            )
+            self.assertEqual(event["status"], "timeout")
+            self.assertIn("queue_ms", event)
+            self.assertIn("provider_ms", event)
+
     def test_review_returns_typed_batch_and_drops_finding_if_file_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
@@ -1240,6 +1318,48 @@ class WatchFilesTests(unittest.TestCase):
             self.assertEqual(batch.findings, ())
             sink.publish.assert_called_once_with(batch)
 
+    def test_superseded_provider_result_is_never_published(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            source = root / "app.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            cancel = threading.Event()
+            sink = mock.Mock()
+            result = type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": '{"findings": []}',
+                    "stderr": "",
+                    "output_exceeded": False,
+                },
+            )()
+
+            def finish_obsolete_call(*_: object, **__: object) -> object:
+                cancel.set()
+                return result
+
+            with mock.patch(
+                "watch_files.run_bounded_command", side_effect=finish_obsolete_call
+            ):
+                batch = watch_files.review_files(
+                    [source],
+                    root=root,
+                    exclude_patterns=[],
+                    max_bytes=2_000_000,
+                    model="test-model",
+                    prompt="review",
+                    log=False,
+                    review_timeout=60,
+                    reasoning_effort=None,
+                    sink=sink,
+                    cancel_event=cancel,
+                )
+
+            self.assertIsNone(batch)
+            sink.publish.assert_not_called()
+
     def test_provider_output_is_bounded_before_memory_buffering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             result = watch_files.run_bounded_command(
@@ -1277,6 +1397,503 @@ class WatchFilesTests(unittest.TestCase):
         self.assertIn("partial-err", raised.exception.stderr)
         self.assertLessEqual(len(raised.exception.stdout.encode("utf-8")), 1_025)
         self.assertLessEqual(len(raised.exception.stderr.encode("utf-8")), 1_025)
+
+    def test_provider_process_is_killed_when_review_is_superseded(self) -> None:
+        cancel = threading.Event()
+        timer = threading.Timer(0.05, cancel.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with (
+                tempfile.TemporaryDirectory() as temporary_directory,
+                self.assertRaises(watch_files.ReviewSuperseded),
+            ):
+                watch_files.run_bounded_command(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    cwd=Path(temporary_directory),
+                    timeout=5,
+                    output_limit=1_024,
+                    cancel_event=cancel,
+                )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_rewrite_burst_keeps_only_active_and_one_latest_follow_up(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        follow_up_done = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        published: list[tuple[Path, ...]] = []
+        scheduler: watch_files.CoalescingReviewScheduler
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+            if scheduler.publish_if_current(
+                work, lambda: published.append(work.paths)
+            ):
+                follow_up_done.set()
+
+        scheduler = watch_files.CoalescingReviewScheduler(run, review_timeout=1)
+        self.addCleanup(scheduler.close)
+        source = Path("/project/hot.py")
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "generation-0"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+
+        for generation in range(1, 201):
+            scheduler.submit(
+                watch_files.TriggeredBatch({source}, None, set(), 2),
+                path_digests={source: f"generation-{generation}"},
+                first_observed_at=2 + generation,
+                batch_flushed_at=3 + generation,
+            )
+
+        self.assertEqual(scheduler.state(), (1, 1, True))
+        release_first.set()
+        self.assertTrue(follow_up_done.wait(1))
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].path_digests[source], "generation-200")
+        self.assertEqual(published, [(source,)])
+
+    def test_json_mode_emits_structured_supersession_diagnostic(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def run(_: watch_files.ScheduledReview) -> None:
+            started.set()
+            release.wait(1)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=1, output_mode="json"
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/hot.py")
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "one"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(started.wait(1))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            scheduler.submit(
+                watch_files.TriggeredBatch({source}, None, set(), 2),
+                path_digests={source: "two"},
+                first_observed_at=2,
+                batch_flushed_at=3,
+            )
+
+        event = json.loads(errors.getvalue())
+        self.assertEqual(event["status"], "superseded")
+        self.assertEqual(event["coalesced_events"], 1)
+        self.assertTrue(event["follow_up_scheduled"])
+        release.set()
+        self.assertTrue(scheduler.wait_idle(1))
+
+    def test_same_digest_notifications_do_not_schedule_provider_retry(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            started.set()
+            release.wait(1)
+
+        scheduler = watch_files.CoalescingReviewScheduler(run, review_timeout=1)
+        self.addCleanup(scheduler.close)
+        source = Path("/project/stable.py")
+        initial = watch_files.TriggeredBatch({source}, None, set(), 1)
+        scheduler.submit(
+            initial,
+            path_digests={source: "same"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(started.wait(1))
+        for _ in range(100):
+            scheduler.submit(
+                watch_files.TriggeredBatch({source}, None, set(), 1),
+                path_digests={source: "same"},
+                first_observed_at=2,
+                batch_flushed_at=3,
+            )
+
+        self.assertEqual(scheduler.state(), (1, 0, False))
+        release.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(len(calls), 1)
+
+    def test_follow_up_refreshes_digest_before_same_content_event(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        follow_up_started = threading.Event()
+        release_follow_up = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        current = {Path("/project/hot.py"): "A"}
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+            elif len(calls) == 2:
+                follow_up_started.set()
+                release_follow_up.wait(2)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run,
+            review_timeout=1,
+            refresh_digests=lambda paths: {path: current[path] for path in paths},
+        )
+        self.addCleanup(scheduler.close)
+        source = next(iter(current))
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "A"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "B"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+        current[source] = "A"
+        release_first.set()
+        self.assertTrue(follow_up_started.wait(1))
+
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "A"},
+            first_observed_at=3,
+            batch_flushed_at=4,
+        )
+        self.assertEqual(scheduler.state(), (1, 0, False))
+        release_follow_up.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(len(calls), 2)
+
+    def test_hot_path_cannot_starve_stable_unrelated_change(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        stable_started = threading.Event()
+        release_stable = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        published: list[tuple[Path, ...]] = []
+        scheduler: watch_files.CoalescingReviewScheduler
+        hot = Path("/project/hot.py")
+        stable = Path("/project/stable.py")
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+            elif work.paths == (stable,):
+                stable_started.set()
+                release_stable.wait(2)
+                scheduler.publish_if_current(
+                    work, lambda: published.append(work.paths)
+                )
+
+        scheduler = watch_files.CoalescingReviewScheduler(run, review_timeout=1)
+        self.addCleanup(scheduler.close)
+        scheduler.submit(
+            watch_files.TriggeredBatch({hot}, None, set(), 1),
+            path_digests={hot: "hot-1"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch({stable}, None, set(), 1),
+            path_digests={stable: "stable"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+        scheduler.submit(
+            watch_files.TriggeredBatch({hot}, None, set(), 1),
+            path_digests={hot: "hot-2"},
+            first_observed_at=3,
+            batch_flushed_at=4,
+        )
+
+        release_first.set()
+        self.assertTrue(stable_started.wait(1))
+        for generation in range(3, 103):
+            scheduler.submit(
+                watch_files.TriggeredBatch({hot}, None, set(), 1),
+                path_digests={hot: f"hot-{generation}"},
+                first_observed_at=generation,
+                batch_flushed_at=generation + 1,
+            )
+        self.assertEqual(scheduler.state(), (1, 1, False))
+        release_stable.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(calls[1].paths, (stable,))
+        self.assertEqual(published, [(stable,)])
+
+    def test_scheduled_follow_up_keeps_a_bounded_in_flight_marker(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls: list[watch_files.ScheduledReview] = []
+        spool = mock.Mock()
+        spool.capture_session_generation.return_value = 7
+        marker_one = Path("/private/spool/in-flight/one.json")
+        marker_two = Path("/private/spool/in-flight/two.json")
+        spool.begin_review.side_effect = [marker_one, marker_two]
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            calls.append(work)
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/hot.py")
+
+        def hint(name: str) -> watch_files.FlushHint:
+            path = Path(f"/private/spool/flush-hints/{name}.json")
+            return watch_files.FlushHint(
+                "agent-session",
+                1,
+                path,
+                (watch_files.ReviewedFile("hot.py", "0" * 64, 100),),
+                (path,),
+            )
+
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, hint("one"), set(), 1),
+            path_digests={source: "one"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, hint("two"), set(), 1),
+            path_digests={source: "two"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        self.assertEqual(scheduler.state(), (1, 1, True))
+        self.assertEqual(spool.begin_review.call_count, 2)
+        self.assertEqual(
+            spool.begin_review.call_args_list[1].kwargs["review_timeout"], 25,
+        )
+        release_first.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertCountEqual(
+            [call.args[0] for call in spool.finish_review.call_args_list],
+            [marker_one, marker_two],
+        )
+
+    def test_fairness_split_marker_failure_does_not_kill_worker(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        reviewed: list[tuple[Path, ...]] = []
+        spool = mock.Mock()
+        spool.capture_session_generation.return_value = 3
+        marker = Path("/private/spool/in-flight/combined.json")
+        spool.begin_review.side_effect = [marker, OSError("marker write failed")]
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            reviewed.append(work.paths)
+            if len(reviewed) == 1:
+                first_started.set()
+                release_first.wait(2)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        hot = Path("/project/hot.py")
+        stable = Path("/project/stable.py")
+        scheduler.submit(
+            watch_files.TriggeredBatch({hot}, None, set(), 1),
+            path_digests={hot: "hot-1"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(first_started.wait(1))
+        hint_path = Path("/private/spool/flush-hints/combined.json")
+        hint = watch_files.FlushHint(
+            "agent-session",
+            1,
+            hint_path,
+            (
+                watch_files.ReviewedFile("hot.py", "0" * 64, 100),
+                watch_files.ReviewedFile("stable.py", "1" * 64, 100),
+            ),
+            (hint_path,),
+        )
+        scheduler.submit(
+            watch_files.TriggeredBatch({hot, stable}, hint, set(), 2),
+            path_digests={hot: "hot-2", stable: "stable"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        release_first.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(
+            reviewed,
+            [(hot,), (stable,), (hot,)],
+        )
+        self.assertEqual(spool.begin_review.call_count, 2)
+        self.assertEqual(
+            spool.begin_review.call_args_list[1].kwargs["review_timeout"], 25,
+        )
+        spool.finish_review.assert_called_once_with(marker)
+        self.assertTrue(scheduler._thread.is_alive())
+
+    def test_direct_hint_attaches_marker_to_matching_filesystem_review(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        spool = mock.Mock()
+        spool.capture_session_generation.return_value = 4
+        marker = Path("/private/spool/in-flight/current.json")
+        spool.begin_review.return_value = marker
+
+        def run(_: watch_files.ScheduledReview) -> None:
+            started.set()
+            release.wait(1)
+
+        scheduler = watch_files.CoalescingReviewScheduler(
+            run, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/app.py")
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "same"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(started.wait(1))
+        hint_path = Path("/private/spool/flush-hints/current.json")
+        direct_hint = watch_files.FlushHint(
+            "agent-session",
+            2,
+            hint_path,
+            (watch_files.ReviewedFile("app.py", "0" * 64, 100),),
+        )
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, direct_hint, set(), 1),
+            path_digests={source: "same"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        self.assertEqual(scheduler.state(), (1, 0, False))
+        spool.begin_review.assert_called_once_with(
+            agent_session_id="agent-session",
+            review_timeout=10,
+            flush_hint=direct_hint,
+        )
+        release.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        spool.finish_review.assert_called_once_with(marker)
+
+    def test_hint_during_marker_teardown_cannot_attach_to_finished_work(self) -> None:
+        finish_started = threading.Event()
+        release_finish = threading.Event()
+        spool = mock.Mock()
+        spool.capture_session_generation.return_value = 4
+        marker_one = Path("/private/spool/in-flight/one.json")
+        marker_two = Path("/private/spool/in-flight/two.json")
+        spool.begin_review.side_effect = [marker_one, marker_two]
+
+        def finish(marker: Path | None) -> None:
+            if marker == marker_one:
+                finish_started.set()
+                release_finish.wait(2)
+
+        spool.finish_review.side_effect = finish
+        scheduler = watch_files.CoalescingReviewScheduler(
+            lambda _: None, review_timeout=10, spool_sink=spool
+        )
+        self.addCleanup(scheduler.close)
+        source = Path("/project/app.py")
+
+        def hint(name: str) -> watch_files.FlushHint:
+            path = Path(f"/private/spool/flush-hints/{name}.json")
+            return watch_files.FlushHint(
+                "agent-session",
+                1,
+                path,
+                (watch_files.ReviewedFile("app.py", "0" * 64, 100),),
+            )
+
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, hint("one"), set(), 1),
+            path_digests={source: "same"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(finish_started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, hint("two"), set(), 1),
+            path_digests={source: "same"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        self.assertEqual(scheduler.state(), (1, 1, False))
+        release_finish.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertCountEqual(
+            [call.args[0] for call in spool.finish_review.call_args_list],
+            [marker_one, marker_two],
+        )
+
+    def test_shutdown_discards_dirty_work_without_publication(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        published: list[str] = []
+        scheduler: watch_files.CoalescingReviewScheduler
+
+        def run(work: watch_files.ScheduledReview) -> None:
+            started.set()
+            release.wait(1)
+            scheduler.publish_if_current(work, lambda: published.append("published"))
+
+        scheduler = watch_files.CoalescingReviewScheduler(run, review_timeout=1)
+        source = Path("/project/hot.py")
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "one"},
+            first_observed_at=1,
+            batch_flushed_at=2,
+        )
+        self.assertTrue(started.wait(1))
+        scheduler.submit(
+            watch_files.TriggeredBatch({source}, None, set(), 1),
+            path_digests={source: "two"},
+            first_observed_at=2,
+            batch_flushed_at=3,
+        )
+
+        scheduler.close(join_timeout=0.01)
+        release.set()
+        self.assertTrue(scheduler.wait_idle(1))
+        self.assertEqual(published, [])
 
     def test_change_handler_uses_destination_for_move(self) -> None:
         changes: queue.Queue[Path] = queue.Queue()
