@@ -125,7 +125,7 @@ Stop the watcher with Ctrl-C. Useful options include:
                      Safety cap for one identified agent turn (default: 3)
 --exclude GLOB      Ignore matching paths; may be repeated
 --max-bytes BYTES   Skip larger individual files
---review-timeout S  Stop a stalled provider review (default: 60 seconds)
+--review-timeout S  Stop a stalled provider review (default: 180 seconds)
 --poll              Poll when native filesystem events are unavailable
 --spool-dir PATH    Also publish validated feedback to a private runtime spool
 --session-id ID     Explicit agent owner required with --spool-dir
@@ -179,6 +179,29 @@ Set `QUODET_OUTPUT=json` in a shell or service environment to persist the mode.
 An explicit `--output human` or `--output json` takes precedence over that
 configuration. Quodet rejects unknown configured modes instead of silently
 changing formats.
+
+Provider work is single-flight. While one snapshot is under review, Quodet
+coalesces watchdog notifications at ingress and continues draining them into
+one latest-dirty entry per canonical path. Repeated rewrites therefore consume
+constant queue space for that path and produce at most the active review
+plus one follow-up containing the newest observed bytes. A changed path
+supersedes its active snapshot: Quodet stops a cancellable local `llm` process,
+or discards the eventual result from an uncancellable runtime, before any
+console or agent publication. Stable unrelated files are retained in the next
+review, and duplicate notifications whose sanitized digest is unchanged do not
+start another provider call. Continuous ordinary filesystem activity is
+flushed after at most twice the configured quiet window so a hot file cannot
+indefinitely postpone another file.
+
+The 180-second default is deliberately bounded but gives larger generated
+source files more time than the earlier 60-second policy. Use
+`--review-timeout SECONDS` to select a smaller or larger explicit ceiling for
+the configured provider. Increasing the timeout does not disable coalescing or
+permit obsolete results to publish. Progress diagnostics distinguish provider
+timeouts from superseded work and report only counts and timings, never source
+contents. In JSON mode, a superseded review emits no completed review document;
+the source-free timeout or supersession diagnostic is a versioned
+`quodet-operational-event-v1` JSON object on stderr.
 
 By default, requests are not saved to the local `llm` history. Common VCS,
 dependency, cache, virtual-environment, and build directories are ignored.
@@ -658,8 +681,11 @@ review indefinitely or add a longer default delay. This safety cap is
 configurable with `--agent-turn-max-age`. Older or custom adapters without a
 turn identity retain the 250 ms quiet window and one-second max age.
 Ordinary shell and watcher events without authenticated hints retain the
-normal debounce. Before provider invocation Quodet publishes an expiring
-in-flight marker for the exact route.
+normal debounce and bounded maximum batch age. Before provider invocation
+Quodet publishes an expiring in-flight marker for the exact route. If an agent
+edit is scheduled behind an active review, its marker remains live while that
+single follow-up is pending; superseded, timed-out, cancelled, completed, and
+shutdown work clears its marker.
 
 When no feedback is ready, `Stop` first asks the watcher to flush that
 session's already-pending edit group, then waits up to the route's
