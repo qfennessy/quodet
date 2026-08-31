@@ -307,8 +307,99 @@ TTL cache and a lock-protected inventory update. Quodet returned:
 {"findings": []}
 ```
 
+## Repeated challenge qualification
+
+On August 30, 2026, Quodet also ran a separate repeated challenge evaluation
+against the frozen `gpt-5.6-luna` baseline with
+`reasoning_effort=high`. This was not another pass over examples 1–7. It used
+eight additional, repository-neutral defects designed to require more
+multi-step or cross-file reasoning.
+
+The challenge covered failure patterns such as stale state overwriting newer
+state, cache or identity drift, swallowed retry signals, invalid lifecycle or
+time values, and asynchronous side effects that outlive cleanup. Every defect
+had:
+
+- an executable oracle that failed for the defective code and passed after the
+  minimal correction;
+- all files needed to trace the trigger, failure path, and observable impact;
+- a separately reviewed clean twin containing only the correction; and
+- independent verification before any model result was scored.
+
+The eight defects were split into four development cases and four sealed
+holdout cases. The development split could be used to debug the evaluation
+harness. The holdout split was not used to change the model, prompt, schema, or
+threshold before the run. A defective case and its clean twin were never shown
+in the same review batch.
+
+Each of the 16 variants—eight defective and eight clean—was reviewed three
+times, producing 48 independent provider calls:
+
+| Split | Defective attempts | Clean attempts | Result |
+| --- | ---: | ---: | --- |
+| Development | 12 | 12 | 12 true positives, 2 false positives, 0 false negatives |
+| Sealed holdout | 12 | 12 | 12 true positives, 0 false positives, 0 false negatives |
+| **Combined** | **24** | **24** | **24 true positives, 2 false positives, 0 false negatives** |
+
+In plain English, Quodet identified the intended defect on all 24 defective
+reviews. It stayed quiet on 22 of 24 corrected reviews. The two false positives
+both came from the same development clean twin: the model alleged that a
+caller could mutate a returned value, but no such caller or mutation appeared
+in the supplied code. The adjudicator therefore rejected the findings as
+hypothetical.
+
+This corresponds to 100% defect recall, 92.31% finding precision, and an 8.33%
+clean-twin false-positive rate across the two splits. All 48 responses were
+valid JSON, cited an exact reviewed path, and completed without a timeout,
+provider error, malformed response, or retry.
+
+### How a finding was scored
+
+A filename match was not enough. After the frozen run completed, semantic
+adjudication checked whether each finding identified the real trigger, traced
+the complete failure path, and described the observable impact demonstrated by
+the executable oracle.
+
+- A **true positive** met that semantic standard for the planted defect.
+- A **false positive** alleged a defect not supported by the supplied code,
+  including findings against a corrected clean twin.
+- A **false negative** was a valid review that failed to identify the planted
+  defect.
+- An invalid response, provider error, or timeout would have been recorded
+  separately rather than counted as a reasoning miss. None occurred in the
+  completed 48-call run.
+
+Detection and delivery were measured separately. Quodet's recommendation
+grounding validator accepted 22 of the 26 returned recommendations. Four
+semantically correct holdout findings referred to a test by its basename
+instead of its complete provider-visible path, so Quodet would have discarded
+those recommendations before delivering them to a coding agent. This leaves an
+important product distinction: the model detected all tested defects, but the
+end-to-end feedback path delivered only recommendations that survived the
+stricter grounding boundary.
+
+### What the result means
+
+The proposed challenge-set qualification rule required the frozen baseline to
+miss a defect in three valid attempts. It did not miss any of these eight
+defects even once. The fixtures remain useful regression tests, but none
+qualifies as evidence of a current baseline weakness. A future challenge set
+must contain verified defects that the frozen baseline actually fails to
+explain, while retaining paired clean controls to measure restraint.
+
+The fresh completed run cost $0.0488784. Including an earlier stopped partial
+run, total paid inference was $0.0541268, well below the authorized $20 cap.
+The sealed holdout calls had a median latency of 7.25 seconds and completed
+without infrastructure failures. The run used Quodet commit `f2f82c1`; later
+code changes must not be described as having produced these results.
+
 Run the complete evaluation yourself with:
 
 ```sh
 uv run python -m evals.agent_changes.live_eval all
 ```
+
+Challenge qualification additionally requires an exact frozen model-run
+configuration and a split-bound benchmark plan. See the challenge evaluation
+section in [`README.md`](README.md) before running it; ordinary benchmark plans
+do not authorize uploading challenge fixture bytes.
